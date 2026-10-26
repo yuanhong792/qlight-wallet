@@ -79,17 +79,20 @@ const TOPIC_REG: &str = "qlx/reg/v1";
 const TOPIC_TX: &str = "qlx/tx/v1";
 const TOPIC_BLOCK: &str = "qlx/block/v1";
 const TOPIC_SYNC: &str = "qlx/sync/v1";
+/// 世界实体中继（M0「彼此看见」）：对方造了一个方块，我的小窗里当场显形
+const TOPIC_ENT: &str = "qlx/ent/v1";
 /// 门票消息前缀（签名域隔离）
 const TICKET_PREFIX: &[u8] = b"QL-TICKET-V1";
 
 // ---------------------------------------------------------------- 网络消息
 
 /// 交易在网络上的形态
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-pub struct TxWire {
-    pub envelope: crate::tx::TxEnvelope,
-    pub sig_hex: String,
-}
+/// 上网的交易载体 = 块内原件（envelope + 签名 + 公钥 + 地址盐）。
+///
+/// 带上公钥与盐是有意的：收方必须能**独立**复算「这个地址确实由这把公钥派生」并验签，
+/// 而不是先等对方把 `地址↔公钥` 注册广播过来（旧实现依赖注册表，先到交易后到注册
+/// 就被丢弃，等于让邻居用消息顺序卡住你的交易）。
+type TxWire = crate::simchain::BlockWire;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub enum NetMsg {
@@ -120,6 +123,9 @@ pub enum NetMsg {
         /// base64(gzip(blocks.jsonl))——整链快照压完再上网
         snap: String,
     },
+    /// 实体记录中继：一批（本机新签的那条，或应答对端索要的历史）。
+    /// 对端**逐条独立验签验链**后才落盘，所以这一批不需要被信任。
+    Entity(Vec<crate::world::EntityRecord>),
 }
 
 #[derive(NetworkBehaviour)]
@@ -144,6 +150,7 @@ struct Topics {
     tx: gossipsub::IdentTopic,
     block: gossipsub::IdentTopic,
     sync: gossipsub::IdentTopic,
+    ent: gossipsub::IdentTopic,
 }
 
 // ---------------------------------------------------------------- 出块轮状态机
@@ -190,6 +197,8 @@ impl Default for MachineState {
 /// 联邦网络句柄（与 AppState 共享 chain / core_slot）
 pub struct Net {
     pub chain: Arc<SimChain>,
+    /// 世界实体账本（与 AppState 同一个 Arc）：邻居中继来的记录合并到这里
+    pub entities: Arc<crate::world::EntityLedger>,
     /// 与 AppState 共用的解锁核心槽（同槽 Arc：unlock/lock 两侧自动同步，无需两处写）
     pub core_slot: Arc<RwLock<Option<Arc<WalletCore>>>>,
     /// 注册表：bech32 地址 → (pk 原始字节, addr_salt)
@@ -203,7 +212,8 @@ pub struct Net {
 }
 
 enum NetCmd {
-    BroadcastTx(crate::tx::TxEnvelope, Vec<u8>),
+    BroadcastTx(TxWire),
+    BroadcastEntity(Vec<crate::world::EntityRecord>),
 }
 
 fn now_ms() -> u64 {
@@ -243,12 +253,14 @@ impl Net {
     pub fn start(
         app: AppHandle,
         chain: Arc<SimChain>,
+        entities: Arc<crate::world::EntityLedger>,
         core_slot: Arc<RwLock<Option<Arc<WalletCore>>>>,
         boot_path: PathBuf,
     ) -> Arc<Net> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<NetCmd>();
         let net = Arc::new(Net {
             chain,
+            entities,
             core_slot,
             registry: Mutex::new(HashMap::new()),
             cmd_tx,
@@ -259,9 +271,14 @@ impl Net {
         net
     }
 
-    /// 本机发出的交易广播给联邦（入池成功后调用）
-    pub fn broadcast_tx(&self, envelope: crate::tx::TxEnvelope, sig: Vec<u8>) {
-        let _ = self.cmd_tx.send(NetCmd::BroadcastTx(envelope, sig));
+    /// 本机新签的实体记录广播给联邦（落盘成功后调用；DESIGN.md §9.15 M0）
+    pub fn broadcast_entity(&self, rec: crate::world::EntityRecord) {
+        let _ = self.cmd_tx.send(NetCmd::BroadcastEntity(vec![rec]));
+    }
+
+    /// 本机发出的交易广播给联邦（入池成功后调用；原件自带公钥与地址盐，对端无需注册表）
+    pub fn broadcast_tx(&self, wire: crate::simchain::BlockWire) {
+        let _ = self.cmd_tx.send(NetCmd::BroadcastTx(wire));
     }
 
     /// 已发现邻居数（UI 联邦 chip）
@@ -505,21 +522,55 @@ impl Net {
                 self.accept_registry(&pk_hex, &salt_hex);
             }
 
-            NetMsg::Tx(TxWire { envelope, sig_hex }) => {
-                let Ok(sig) = hex::decode(&sig_hex) else { return };
-                let from = crate::crypto::to_bech32_ql(&envelope.from_addr);
-                let Some(pk) = self.registry_pk(&from) else {
-                    eprintln!("[QLight] 交易来自未注册地址 {}…（跳过，等其注册广播）", short_addr(&from));
-                    return;
-                };
-                match chain.accept_remote_tx(envelope, sig, &pk) {
-                    Ok(_) => eprintln!("[QLight] 联邦交易入池 {}…（验签通过，等下块打包）", short_addr(&from)),
+            NetMsg::Tx(w) => {
+                let from = crate::crypto::to_bech32_ql(&w.envelope.from_addr);
+                match chain.accept_remote_tx(w) {
+                    Ok(_) => eprintln!("[QLight] 联邦交易入池 {}…（原件独立验签通过，等下块打包）", short_addr(&from)),
                     Err(e) => eprintln!("[QLight] 拒收联邦交易（{}…）：{e}", short_addr(&from)),
                 }
             }
 
             NetMsg::Block { header, txs } => {
                 self.on_block_wire(header, txs, swarm, ms, topics, app, chain)
+            }
+
+            NetMsg::Entity(list) => {
+                // 一条 gossip 最多带这么多条：合并要整本重放并逐条验签，
+                // 无上限的列表等于给对端一个 CPU/磁盘放大器
+                const ENTITY_BATCH_MAX: usize = 256;
+                if list.len() > ENTITY_BATCH_MAX {
+                    eprintln!(
+                        "[QLight] 拒收超量实体批次：{} 条 > 上限 {}",
+                        list.len(),
+                        ENTITY_BATCH_MAX
+                    );
+                    return;
+                }
+                // v3 记录必须指到一笔本机链上已确认的销毁付款；链是最终裁判，
+                // 所以合并时现读一遍 blocks.jsonl 作 ChainView（读不到就是空视图 → 全拒）
+                let view = crate::world::ChainView::load(&chain.blocks_path_pub());
+                match self.entities.merge(&list, &view) {
+                    Ok(rep) => {
+                        if rep.accepted > 0 {
+                            eprintln!(
+                                "[QLight] 邻居造了 {} 个方块（合并：收下 {}，已见过 {}，拒收 {}）",
+                                list.len(),
+                                rep.accepted,
+                                rep.known,
+                                rep.rejected
+                            );
+                            let _ = app.emit(
+                                "world_entity",
+                                serde_json::json!({
+                                    "accepted": rep.accepted,
+                                    "known": rep.known,
+                                    "rejected": rep.rejected,
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("[QLight] 实体合并失败：{e}"),
+                }
             }
 
             NetMsg::Ticket {
@@ -656,18 +707,9 @@ impl Net {
             return;
         }
 
-        // —— 高度衔接：解析注册公钥并整块真验 ——
-        let mut wires = Vec::with_capacity(txs.len());
-        for TxWire { envelope, sig_hex } in txs {
-            let Ok(sig) = hex::decode(&sig_hex) else { return };
-            let from = crate::crypto::to_bech32_ql(&envelope.from_addr);
-            let Some(pk) = self.registry_pk(&from) else {
-                eprintln!("[QLight] 块内交易来自未注册地址 {}… → 拒收（等其注册广播）", short_addr(&from));
-                return;
-            };
-            wires.push((envelope, sig, pk));
-        }
-        match chain.apply_remote_block(&header, wires) {
+        // —— 高度衔接：整块真验（原件逐笔验签 + 凭据对照 + 块哈希重算）——
+        // 不再先查注册表：块自带公钥与地址盐，验证不需要"对方先注册过"。
+        match chain.apply_remote_block(&header, txs) {
             Ok(mut event) => {
                 event.balance = self
                     .core_slot
@@ -783,15 +825,8 @@ impl Net {
                 },
             );
             let wires = chain.mempool_wires_pub();
-            for (envelope, sig) in wires {
-                pub_msg(
-                    swarm,
-                    &topics.tx,
-                    &NetMsg::Tx(TxWire {
-                        envelope,
-                        sig_hex: hex::encode(&sig),
-                    }),
-                );
+            for wire in wires {
+                pub_msg(swarm, &topics.tx, &NetMsg::Tx(wire));
             }
         }
 
@@ -926,16 +961,16 @@ fn pub_block(
     swarm: &mut libp2p::Swarm<QlBehaviour>,
     topic: &gossipsub::IdentTopic,
     header: &BlockHeader,
-    wires: &[(crate::tx::TxEnvelope, Vec<u8>)],
+    wires: &[TxWire],
 ) {
-    let txs: Vec<TxWire> = wires
-        .iter()
-        .map(|(e, s)| TxWire {
-            envelope: e.clone(),
-            sig_hex: hex::encode(s),
-        })
-        .collect();
-    pub_msg(swarm, topic, &NetMsg::Block { header: header.clone(), txs });
+    pub_msg(
+        swarm,
+        topic,
+        &NetMsg::Block {
+            header: header.clone(),
+            txs: wires.to_vec(),
+        },
+    );
 }
 
 /// 快照尾部解析：最后一行非空块头 → (height, tip)
@@ -1027,8 +1062,9 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
         tx: gossipsub::IdentTopic::new(TOPIC_TX),
         block: gossipsub::IdentTopic::new(TOPIC_BLOCK),
         sync: gossipsub::IdentTopic::new(TOPIC_SYNC),
+        ent: gossipsub::IdentTopic::new(TOPIC_ENT),
     };
-    for t in [&topics.reg, &topics.tx, &topics.block, &topics.sync] {
+    for t in [&topics.reg, &topics.tx, &topics.block, &topics.sync, &topics.ent] {
         if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(t) {
             eprintln!("[QLight] 订阅失败：{e}");
         }
@@ -1095,15 +1131,11 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
                 }
             }
             cmd = cmd_rx.recv() => match cmd {
-                Some(NetCmd::BroadcastTx(envelope, sig)) => {
-                    pub_msg(
-                        &mut swarm,
-                        &topics.tx,
-                        &NetMsg::Tx(TxWire {
-                            envelope,
-                            sig_hex: hex::encode(&sig),
-                        }),
-                    );
+                Some(NetCmd::BroadcastEntity(list)) => {
+                    pub_msg(&mut swarm, &topics.ent, &NetMsg::Entity(list));
+                }
+                Some(NetCmd::BroadcastTx(wire)) => {
+                    pub_msg(&mut swarm, &topics.tx, &NetMsg::Tx(wire));
                 }
                 None => break,
             },

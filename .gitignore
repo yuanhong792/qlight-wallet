@@ -23,3 +23,6 @@ node_modules/
 *.ledger.json
 blocks.jsonl
 ledger.json
+
+# ---- 本机 UI 对拍/截图用的临时预览页（含假 __TAURI__ 桩，不入库）----
+desktop-wallet/ui/__preview.html

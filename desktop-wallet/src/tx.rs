@@ -31,6 +31,9 @@ use crate::crypto;
 /// 模拟链 chain_id（"QL" 的 ASCII，作为 regtest 标识）
 pub const CHAIN_ID: u64 = 0x0051_4C;
 
+/// 交易信封版本（canonical CBOR 顶层第一字段）
+pub const TX_VERSION: u8 = 1;
+
 const MAJOR_UINT: u8 = 0x00;
 const MAJOR_BYTES: u8 = 0x40;
 const MAJOR_ARRAY: u8 = 0x80;

@@ -51,9 +51,11 @@ pub fn run() {
                 Arc::new(RwLock::new(None));
             // 引导注册表放公共根目录：所有实例（根目录 + node-N）都读写同一份，
             // 互相读到对方的「节点号 + 监听地址」就 TCP 直连（macOS 同机组播不通的替代正路）
+            let entities = Arc::new(world::EntityLedger::new(entities_path));
             let net = net::Net::start(
                 app.handle().clone(),
                 chain.clone(),
+                entities.clone(),
                 core_slot.clone(),
                 base_dir.join("peers-registry.json"),
             );
@@ -63,7 +65,7 @@ pub fn run() {
                 keystore_path,
                 ledger_path,
                 blocks_path,
-                entities: Arc::new(world::EntityLedger::new(entities_path)),
+                entities: entities.clone(),
                 chain: chain.clone(),
                 core: core_slot,
                 net,
@@ -90,6 +92,7 @@ pub fn run() {
             commands::world_rename,
             commands::world_move,
             commands::world_release,
+            commands::world_mine_once,
             commands::world_proof,
         ])
         .run(tauri::generate_context!())

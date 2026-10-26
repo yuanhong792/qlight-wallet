@@ -25,6 +25,13 @@
   var SKY = [0.55, 0.72, 0.92];
   var FOG_NEAR = 12, FOG_FAR = REGION / 2 + 1;
 
+  // 《我的世界》最值钱的东西不是方块，是"世界活着"：太阳会落、天会黑、雾会变。
+  // 这里用一个块 = 2 秒的真实节奏做昼夜：600 块 = 20 分钟一天（与 MC 同量级）。
+  var DAY_BLOCKS = 600;
+  var SKY_DAY = [0.55, 0.72, 0.92], SKY_DUSK = [0.96, 0.53, 0.32], SKY_NIGHT = [0.03, 0.05, 0.14];
+  var TINT_DAY = [1, 1, 1], TINT_DUSK = [1.0, 0.82, 0.68], TINT_NIGHT = [0.46, 0.56, 0.82];
+
+
   // 与 world.js 的像素分类一一对应（blk 低 3 位）——俯视图的像素与走进去的方块不可能对不上
   var PAL = [
     [18, 54, 118],   // 0 水
@@ -43,12 +50,26 @@
   var N_UP = [0, 1, 0], N_DOWN = [0, -1, 0], N_N = [0, 0, -1], N_S = [0, 0, 1], N_E = [1, 0, 0], N_W = [-1, 0, 0];
 
   var VS = 'attribute vec3 a_p;attribute vec3 a_c;uniform mat4 u_vp;uniform vec3 u_eye;' +
-    'varying vec3 v_c;varying float v_d;' +
-    'void main(){v_c=a_c;v_d=distance(a_p,u_eye);gl_Position=u_vp*vec4(a_p,1.0);}';
-  var FS = 'precision mediump float;varying vec3 v_c;varying float v_d;' +
+    'varying vec3 v_c;varying vec3 v_w;varying float v_d;' +
+    'void main(){v_c=a_c;v_w=a_p;v_d=distance(a_p,u_eye);gl_PointSize=3.0;gl_Position=u_vp*vec4(a_p,1.0);}';
+  // 大地也吃一层 8×8 的程序化颗粒：没有贴图，但每个方块表面不再是纯色塑料片。
+  var FS = 'precision mediump float;varying vec3 v_c;varying vec3 v_w;varying float v_d;' +
     'uniform vec4 u_tint;uniform vec3 u_fog;uniform vec2 u_fog_r;' +
     'void main(){float f=clamp((v_d-u_fog_r.x)/(u_fog_r.y-u_fog_r.x),0.0,1.0);f*=f;' +
-    'gl_FragColor=vec4(mix(v_c*u_tint.rgb,u_fog,f),1.0);}';
+    'float h=fract(sin(dot(floor(v_w*8.0),vec3(12.9898,78.233,37.719)))*43758.5453);' +
+    'vec3 base=v_c*(0.92+0.08*h);' +
+    'gl_FragColor=vec4(mix(base*u_tint.rgb,u_fog,f),1.0);}';
+
+  // 贴图管线：像素图集 + alpha 裁剪（树叶/花/活物不需要混合排序，直接 discard）
+  var VS2 = 'attribute vec3 a_p;attribute vec2 a_uv;attribute float a_s;uniform mat4 u_vp;uniform vec3 u_eye;' +
+    'varying vec2 v_uv;varying float v_s;varying float v_d;' +
+    'void main(){v_uv=a_uv;v_s=a_s;v_d=distance(a_p,u_eye);gl_Position=u_vp*vec4(a_p,1.0);}';
+  var FS2 = 'precision mediump float;uniform sampler2D u_tex;uniform vec4 u_tint;uniform vec3 u_fog;uniform vec2 u_fog_r;' +
+    'varying vec2 v_uv;varying float v_s;varying float v_d;' +
+    'void main(){vec4 t=texture2D(u_tex,v_uv);if(t.a<0.5)discard;' +
+    'float f=clamp((v_d-u_fog_r.x)/(u_fog_r.y-u_fog_r.x),0.0,1.0);f*=f;' +
+    'gl_FragColor=vec4(mix(t.rgb*v_s*u_tint.rgb,u_fog,f),1.0);}';
+
 
   function perspective(fovy, aspect, near, far) {
     var f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
@@ -84,38 +105,70 @@
     var gl = canvas.getContext('webgl', { antialias: false, alpha: false });
     if (!gl) { hooks.onUnsupported && hooks.onUnsupported(); return null; }
 
-    var prog = gl.createProgram();
-    function shader(type, src) {
+    var prog = gl.createProgram(), progT = gl.createProgram();
+    function shader(prog, type, src) {
       var s = gl.createShader(type);
       gl.shaderSource(s, src); gl.compileShader(s);
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
       gl.attachShader(prog, s); return s;
     }
-    shader(gl.VERTEX_SHADER, VS); shader(gl.FRAGMENT_SHADER, FS);
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    function link(prog, vs, fs) {
+      shader(prog, gl.VERTEX_SHADER, vs); shader(prog, gl.FRAGMENT_SHADER, fs);
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    }
+    link(prog, VS, FS); link(progT, VS2, FS2);
     gl.useProgram(prog);
     var A_P = gl.getAttribLocation(prog, 'a_p'), A_C = gl.getAttribLocation(prog, 'a_c');
-    var U_VP = gl.getUniformLocation(prog, 'u_vp'), U_TINT = gl.getUniformLocation(prog, 'u_tint');
-    var U_EYE = gl.getUniformLocation(prog, 'u_eye'), U_FOG = gl.getUniformLocation(prog, 'u_fog');
-    var U_FOGR = gl.getUniformLocation(prog, 'u_fog_r');
+    var AT_P = gl.getAttribLocation(progT, 'a_p'), AT_UV = gl.getAttribLocation(progT, 'a_uv'), AT_S = gl.getAttribLocation(progT, 'a_s');
+    var U = {
+      vp: gl.getUniformLocation(prog, 'u_vp'), tint: gl.getUniformLocation(prog, 'u_tint'),
+      eye: gl.getUniformLocation(prog, 'u_eye'), fog: gl.getUniformLocation(prog, 'u_fog'),
+      fogr: gl.getUniformLocation(prog, 'u_fog_r'),
+    };
+    var UT = {
+      vp: gl.getUniformLocation(progT, 'u_vp'), tint: gl.getUniformLocation(progT, 'u_tint'),
+      eye: gl.getUniformLocation(progT, 'u_eye'), fog: gl.getUniformLocation(progT, 'u_fog'),
+      fogr: gl.getUniformLocation(progT, 'u_fog_r'), tex: gl.getUniformLocation(progT, 'u_tex'),
+    };
     gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
     gl.clearColor(SKY[0], SKY[1], SKY[2], 1);
-    gl.uniform3f(U_FOG, SKY[0], SKY[1], SKY[2]);
-    gl.uniform2f(U_FOGR, FOG_NEAR, FOG_FAR);
+    gl.uniform3f(U.fog, SKY[0], SKY[1], SKY[2]);
+    gl.uniform2f(U.fogr, FOG_NEAR, FOG_FAR);
+
+    // 像素图集：NEAREST + CLAMP，放大到多大都是硬边方块画
+    var atlasTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (global.QLSprites) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, global.QLSprites.atlas());
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+    }
+
 
     var st = {
       heights: null, blocks: null, entities: [], byCell: {}, address: '',
-      slot: 0, colors: [], maxLayer: MAX_LAYER,
+      slot: 0, slots: 16, colors: [], maxLayer: MAX_LAYER,
       x: 128.5, z: 128.5, y: 30, yaw: 0.6, pitch: -0.45,
       keys: {}, dirty: true, regionKey: '', target: null, locked: false, drag: false,
+      height: 0, heightAt: performance.now(), day: null, lastYaw: 1e9, lastAnim: 0,
+      bob: 0, bobPhase: 0, stepMark: 0, parts: [], entAt: 0,
       bufT: gl.createBuffer(), nT: 0, bufE: gl.createBuffer(), nE: 0, bufH: gl.createBuffer(), nH: 0,
+      bufP: gl.createBuffer(), nP: 0, bufS: gl.createBuffer(), nS: 0, bufStar: gl.createBuffer(), nStar: 0,
       // 缓冲区按 12 面/格预算（平均只有约 2.4 面：树只占林地的 ~12%）。
       // 真写满了 quad() 会直接停笔——最坏结果是区域最后几行（雾里那几格）缺面，
       // 不会越界写坏内存，也不会影响任何一条链上判定。
       arrT: new Float32Array(REGION * REGION * 12 * 6 * 6),
       arrE: new Float32Array(2048 * 36 * 6),
       arrH: new Float32Array(2 * 24 * 6),
+      arrP: new Float32Array(512 * 6),
+      arrS: new Float32Array(2 * 6 * 6),
+      arrStar: new Float32Array(140 * 6),
       fps: 0, frames: 0, fpsMark: 0,
     };
 
@@ -180,6 +233,49 @@
       quad([x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0], c, 0.65, N_E);      // 东 +x
       quad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], c, 0.65, N_W);      // 西 -x
     }
+
+    // —— 贴图顶点写入：pos3 + uv2 + shade1（stride 24，和颜色管线同宽）
+    var COLS = 8, ROWS = 8, UV_E = 0.03;
+    var tarr = null, tvp = 0;
+    function tvert(x, y, z, u, v, s) {
+      if (tvp + 6 > tarr.length) return;
+      tarr[tvp++] = x; tarr[tvp++] = y; tarr[tvp++] = z;
+      tarr[tvp++] = u; tarr[tvp++] = v; tarr[tvp++] = s;
+    }
+    function uvOf(tile, u, v) {
+      var col = tile % COLS, row = (tile / COLS) | 0;
+      return [(col + UV_E + u * (1 - 2 * UV_E)) / COLS, (row + UV_E + v * (1 - 2 * UV_E)) / ROWS];
+    }
+    /** 贴图四边形：p 四点顺序与 uv 一一对应，绕向按几何法线自动翻（同 quad） */
+    function tquad(p, tile, shade, n) {
+      if (tvp + 36 > tarr.length) return;
+      var ax = p[3] - p[0], ay = p[4] - p[1], az = p[5] - p[2];
+      var bx = p[6] - p[0], by = p[7] - p[1], bz = p[8] - p[2];
+      var dot = (ay * bz - az * by) * n[0] + (az * bx - ax * bz) * n[1] + (ax * by - ay * bx) * n[2];
+      var flip = dot < 0;
+      var uv = [[0, 1], [1, 1], [1, 0], [0, 0]];
+      function put(i) {
+        var q = uvOf(tile, uv[i][0], uv[i][1]);
+        tvert(p[i * 3], p[i * 3 + 1], p[i * 3 + 2], q[0], q[1], shade);
+      }
+      var i1 = flip ? 3 : 1, i3 = flip ? 1 : 3;
+      put(0); put(i1); put(2); put(0); put(2); put(i3);
+    }
+    function tcube(x0, y0, z0, x1, y1, z1, tile) {
+      tquad([x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1], tile, 1.0, N_UP);
+      tquad([x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0], tile, 0.5, N_DOWN);
+      tquad([x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0], tile, 0.8, N_N);
+      tquad([x1, y0, z1, x0, y0, z1, x0, y1, z1, x1, y1, z1], tile, 0.8, N_S);
+      tquad([x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0], tile, 0.65, N_E);
+      tquad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], tile, 0.65, N_W);
+    }
+    /** 十字交叉面（花、活物）：两个互相垂直的竖面，任何角度都看得到 */
+    function cross(cx, y0, cz, w, h, tile) {
+      var a = cx + 0.5 - w / 2, b = cz + 0.5 - w / 2, c = cx + 0.5 + w / 2, d = cz + 0.5 + w / 2;
+      tquad([a, y0, b, c, y0, d, c, y0 + h, d, a, y0 + h, b], tile, 1.0, N_S);
+      tquad([a, y0, d, c, y0, b, c, y0 + h, b, a, y0 + h, d], tile, 0.9, N_E);
+    }
+
     function upload(buf, count) {
       gl.bindBuffer(gl.ARRAY_BUFFER, buf);
       gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, vp), gl.DYNAMIC_DRAW);
@@ -221,27 +317,74 @@
       st.nT = upload(st.bufT, vp);
     }
 
-    /** 签过名的方块：按 layer 画完整立方体（叠塔因此成立），只画当前区域内的。
-     *  账本把行号叫 `y`（world.rs 的 Entity{x, y, layer}），三维里它就是 z——曾经按 `e.z`
-     *  去读，拿到 undefined → 坐标 NaN：签过的方块既不显形也不占格，看上去就是
-     *  "世界到处是洞、点了没反应"。 */
+    /** 签过名的方块：按 layer 画像素贴图实体（叠塔因此成立），只画当前区域内的。
+     *
+     *  16 种物件不是 16 个换色立方体：
+     *  - 石头/木屋/灯塔/桥/篱笆/篝火 = 贴图立方体拼出来的"建筑"；
+     *  - 树 = 树干 + 树叶；花 = 十字面；鹿/鸟/鱼/蝴蝶/兔/羊/旅人/狼 = 十字面活物。
+     *  全部共用 sprites.js 的 16×16 图集，2D 地图、物品栏、世界里看到的是同一张画。
+     */
     function buildEntities(x0, z0) {
-      arr = st.arrE; vp = 0;
+      tarr = st.arrE; tvp = 0;
+      var now = performance.now();
       for (var i = 0; i < st.entities.length; i++) {
         var e = st.entities[i];
         if (e.released) continue; // 断租不删除，但也不占格、不显形
         if (e.x < x0 || e.x >= x0 + REGION || e.y < z0 || e.y >= z0 + REGION) continue;
-        var c = st.colors[e.kind] || st.colors[0];
-        if (typeof c === 'string') c = hex2rgb(c);
-        // 贴地那层刻意抬高 0.002：否则方块底面与地形顶面严格共面，深度测试会闪噪点
-        var yb = e.layer + 0.002;
-        cube(e.x + 0.04, yb, e.y + 0.04, e.x + 0.96, e.layer + 1, e.y + 0.96, c);
-        // 顶面再压一层自己的颜色，让塔看起来是一块一块垒起来的
-        quad([e.x + 0.04, e.layer + 1.001, e.y + 0.04, e.x + 0.96, e.layer + 1.001, e.y + 0.04,
-              e.x + 0.96, e.layer + 1.001, e.y + 0.96, e.x + 0.04, e.layer + 1.001, e.y + 0.96], c, BLOCK_SHADE, N_UP);
+        // 活物轻微呼吸；蝴蝶/鸟再高一点，像悬在草尖上
+        var bob = e.kind >= 8 ? Math.sin(now * 0.0016 + (e.x * 7 + e.y * 13) % 63) * 0.045 : 0;
+        var y = e.layer + 0.002 + bob;
+        var x = e.x, z = e.y;
+        switch (e.kind) {
+          case 0: // 石头
+            tcube(x + 0.03, y, z + 0.03, x + 0.97, e.layer + 1, z + 0.97, 0);
+            break;
+          case 1: // 橡树：树干 + 树冠（略高于一格，像长出来的树而不是插在地上的块）
+            tcube(x + 0.37, y, z + 0.37, x + 0.63, y + 1.15, z + 0.63, 16);
+            tcube(x + 0.08, y + 0.95, z + 0.08, x + 0.92, y + 1.62, z + 0.92, 17);
+            break;
+          case 2: // 花丛
+            cross(x, y, z, 0.92, 0.95, 2);
+            break;
+          case 3: // 木屋：木板墙 + 瓦屋顶 + 烟囱
+            tcube(x + 0.04, y, z + 0.04, x + 0.96, y + 0.62, z + 0.96, 18);
+            tcube(x + 0.0, y + 0.62, z + 0.0, x + 1.0, y + 0.8, z + 1.0, 19);
+            tcube(x + 0.72, y + 0.6, z + 0.18, x + 0.9, y + 0.98, z + 0.36, 0);
+            break;
+          case 4: // 木桥：桥面 + 四根桩 + 两道栏杆
+            tcube(x + 0.02, y + 0.14, z + 0.1, x + 0.98, y + 0.26, z + 0.9, 18);
+            var px = [0.08, 0.84], pz = [0.16, 0.76];
+            for (var a = 0; a < 2; a++) for (var b = 0; b < 2; b++)
+              tcube(x + px[a], y, z + pz[b], x + px[a] + 0.08, y + 0.62, z + pz[b] + 0.08, 16);
+            tcube(x + 0.02, y + 0.52, z + 0.14, x + 0.98, y + 0.58, z + 0.2, 16);
+            tcube(x + 0.02, y + 0.52, z + 0.8, x + 0.98, y + 0.58, z + 0.86, 16);
+            break;
+          case 5: // 灯塔：条纹塔身 + 灯室 + 顶
+            tcube(x + 0.28, y, z + 0.28, x + 0.72, y + 1.38, z + 0.72, 5);
+            tcube(x + 0.24, y + 1.38, z + 0.24, x + 0.76, y + 1.58, z + 0.76, 21);
+            tcube(x + 0.26, y + 1.58, z + 0.26, x + 0.74, y + 1.72, z + 0.74, 19);
+            break;
+          case 6: // 篝火：交叉木柴 + 火苗
+            tcube(x + 0.12, y + 0.02, z + 0.4, x + 0.88, y + 0.16, z + 0.6, 16);
+            tcube(x + 0.4, y + 0.04, z + 0.12, x + 0.6, y + 0.18, z + 0.88, 16);
+            cross(x, y + 0.08, z, 0.78, 0.82, 20);
+            break;
+          case 7: // 篱笆：三根柱子 + 两道横杆
+            for (var f = 0; f < 3; f++)
+              tcube(x + 0.12 + f * 0.32, y, z + 0.44, x + 0.24 + f * 0.32, y + 0.85, z + 0.56, 16);
+            tcube(x + 0.06, y + 0.28, z + 0.44, x + 0.94, y + 0.36, z + 0.56, 16);
+            tcube(x + 0.06, y + 0.6, z + 0.44, x + 0.94, y + 0.68, z + 0.56, 16);
+            break;
+          default: // 8..15 活物：鹿、鸟、鱼、蝴蝶、兔、绵羊、旅人、狼
+            cross(x, y, z, 0.9, 0.95, e.kind);
+            break;
+        }
       }
-      st.nE = upload(st.bufE, vp);
+      st.nE = tvp / 6;
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufE);
+      gl.bufferData(gl.ARRAY_BUFFER, tarr.subarray(0, tvp), gl.DYNAMIC_DRAW);
     }
+
 
     /** 线框：白 = 正在看的实心体素，金 = 松手就落下去的空体素 */
     function wire(x0, y0, z0, x1, y1, z1, col) {
@@ -274,7 +417,7 @@
       var cp = Math.cos(st.pitch);
       return [Math.sin(st.yaw) * cp, Math.sin(st.pitch), Math.cos(st.yaw) * cp];
     }
-    function eye() { return [st.x, st.y, st.z]; }
+    function eye() { return [st.x, st.y + st.bob, st.z]; }
 
     /** 准星 → 逐体素步进：命中哪个体素、应当在哪个空体素落下方块 */
     function pick() {
@@ -307,19 +450,146 @@
       return null;
     }
 
+    // —— 昼夜与天空（只用块高推时间，不读墙钟：同一高度在任何机器上都是同一个天色）——
+    function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+    function smooth(a, b, x) { var t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); }
+    function mix3(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]; }
+    function dayState(now) {
+      var frac = Math.max(0, (now - st.heightAt) / 2000); // 2 秒一个块
+      var phase = ((((st.height + frac) % DAY_BLOCKS) + DAY_BLOCKS) % DAY_BLOCKS) / DAY_BLOCKS;
+      var ang = phase * Math.PI * 2;
+      var sh = Math.sin(ang);
+      var day = smooth(-0.1, 0.26, sh);
+      var dusk = Math.exp(-Math.pow(sh / 0.17, 2));
+      var sky = mix3(SKY_NIGHT, SKY_DAY, day);
+      sky = mix3(sky, SKY_DUSK, dusk * 0.62);
+      var tint = mix3(TINT_NIGHT, TINT_DAY, day);
+      tint = mix3(tint, TINT_DUSK, dusk * 0.44);
+      return {
+        day: day, dusk: dusk, sky: sky, tint: tint,
+        sun: [Math.cos(ang), Math.sin(ang), 0.28], // 归一化在 draw 里做
+      };
+    }
+
+    // 星空：固定 140 个方向（简单 LCG，实现间可复现）
+    var STARS = (function () {
+      var out = [], s = 20261026;
+      for (var i = 0; i < 140; i++) {
+        s = (s * 1664525 + 1013904223) >>> 0;
+        var u = s / 4294967296;
+        s = (s * 1664525 + 1013904223) >>> 0;
+        var v = s / 4294967296;
+        s = (s * 1664525 + 1013904223) >>> 0;
+        var w = s / 4294967296;
+        var th = u * Math.PI * 2, y = v * 1.6 - 0.2, r = Math.sqrt(Math.max(0, 1 - y * y));
+        out.push([Math.cos(th) * r, y, Math.sin(th) * r, 0.45 + w * 0.55]);
+      }
+      return out;
+    })();
+
+    function skyBodies(ds, e0, d) {
+      var rx = d[2], rz = -d[0], rl = Math.hypot(rx, rz) || 1; rx /= rl; rz /= rl;
+      var ux = d[1] * rz, uy = d[2] * rx - d[0] * rz, uz = -d[1] * rx;
+      var ul = Math.hypot(ux, uy, uz) || 1; ux /= ul; uy /= ul; uz /= ul;
+      var sl = Math.hypot(ds.sun[0], ds.sun[1], ds.sun[2]) || 1;
+      var sx = ds.sun[0] / sl, sy = ds.sun[1] / sl, sz = ds.sun[2] / sl;
+
+      // 直接写顶点，省掉中间数组
+      arr = st.arrS; vp = 0;
+      function tri(ax, ay, az, bx, by, bz, cx2, cy2, cz2, col) {
+        vert(ax, ay, az, col, 1); vert(bx, by, bz, col, 1); vert(cx2, cy2, cz2, col, 1);
+      }
+      function quadS(cx, cy, cz, size, col) {
+        var x0 = cx - rx * size - ux * size, y0 = cy - uy * size, z0 = cz - rz * size - uz * size;
+        var x1 = cx + rx * size - ux * size, y1 = cy - uy * size, z1 = cz + rz * size - uz * size;
+        var x2 = cx + rx * size + ux * size, y2 = cy + uy * size, z2 = cz + rz * size + uz * size;
+        var x3 = cx - rx * size + ux * size, y3 = cy + uy * size, z3 = cz - rz * size + uz * size;
+        tri(x0, y0, z0, x1, y1, z1, x2, y2, z2, col);
+        tri(x0, y0, z0, x2, y2, z2, x3, y3, z3, col);
+      }
+      // 太阳在白天可见，月亮在夜里可见；都带一点"像素方块"的硬边
+      if (ds.day > 0.08) quadS(e0[0] + sx * 180, e0[1] + sy * 180, e0[2] + sz * 180, 9, [255, 243, 186]);
+      if (ds.day < 0.92) quadS(e0[0] - sx * 178, e0[1] - sy * 178, e0[2] - sz * 178, 6, [226, 233, 255]);
+      var nS = vp / 6;
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufS);
+      gl.bufferData(gl.ARRAY_BUFFER, st.arrS.subarray(0, vp), gl.DYNAMIC_DRAW);
+      return nS;
+    }
+
+    // 星空点：只在夜里出现，和太阳月亮同一套颜色管线
+    function starPoints(e0, ds) {
+      if (ds.day > 0.72) return 0;
+      var arr2 = st.arrStar, n = 0, bright = 1 - ds.day;
+      for (var i = 0; i < STARS.length; i++) {
+        var s = STARS[i];
+        arr2[n++] = e0[0] + s[0] * 176; arr2[n++] = e0[1] + s[1] * 176; arr2[n++] = e0[2] + s[2] * 176;
+        var c = s[3] * bright * 0.9;
+        arr2[n++] = c; arr2[n++] = c; arr2[n++] = c * 1.05;
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufStar);
+      gl.bufferData(gl.ARRAY_BUFFER, arr2.subarray(0, n), gl.DYNAMIC_DRAW);
+      return n / 6;
+    }
+
+    // —— 粒子：放置/拆除时爆一小把同色像素点（MC 的"手感"有一半来自这个）
+    function burst(cx, layer, cz, kind) {
+      var c = global.QLSprites ? global.QLSprites.avgColor(kind) : [200, 200, 200];
+      for (var i = 0; i < 16; i++) {
+        var a = Math.random() * Math.PI * 2, sp = 0.6 + Math.random() * 1.8;
+        st.parts.push({
+          x: cx + 0.5 + (Math.random() - 0.5) * 0.4,
+          y: layer + 0.35 + Math.random() * 0.3,
+          z: cz + 0.5 + (Math.random() - 0.5) * 0.4,
+          vx: Math.cos(a) * sp * 0.5, vy: 1.2 + Math.random() * 2.2, vz: Math.sin(a) * sp * 0.5,
+          life: 0.55 + Math.random() * 0.35, rgb: c,
+        });
+      }
+      if (st.parts.length > 400) st.parts.splice(0, st.parts.length - 400);
+    }
+    function stepParts(dt) {
+      if (!st.parts.length) { st.nP = 0; return; }
+      for (var i = st.parts.length - 1; i >= 0; i--) {
+        var p = st.parts[i];
+        p.life -= dt;
+        if (p.life <= 0) { st.parts.splice(i, 1); continue; }
+        p.vy -= 9.5 * dt;
+        p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+        if (p.y < (st.heights ? level(p.x | 0, p.z | 0) + 1 : 0)) { p.y = level(p.x | 0, p.z | 0) + 1.01; p.vy = -p.vy * 0.3; }
+      }
+      var a = st.arrP, n = 0;
+      for (var j = 0; j < st.parts.length; j++) {
+        var q = st.parts[j];
+        a[n++] = q.x; a[n++] = q.y; a[n++] = q.z;
+        a[n++] = q.rgb[0] / 255; a[n++] = q.rgb[1] / 255; a[n++] = q.rgb[2] / 255;
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufP);
+      gl.bufferData(gl.ARRAY_BUFFER, a.subarray(0, n), gl.DYNAMIC_DRAW);
+      st.nP = n / 6;
+    }
+
     function draw() {
       if (!st.heights) return;
       var w = canvas.clientWidth | 0, h = canvas.clientHeight | 0;
       if (!w || !h) return;
       if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
       gl.viewport(0, 0, w, h);
+      var now = performance.now();
+      var ds = dayState(now);
+      gl.clearColor(ds.sky[0], ds.sky[1], ds.sky[2], 1);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
       var d = dir(), e0 = eye();
       var m = mul(perspective(1.22, w / h, 0.1, 400), lookAt(e0, [e0[0] + d[0], e0[1] + d[1], e0[2] + d[2]], [0, 1, 0]));
-      gl.uniformMatrix4fv(U_VP, false, m);
-      gl.uniform3f(U_EYE, e0[0], e0[1], e0[2]);
-      gl.uniform4f(U_TINT, 1, 1, 1, 1);
+      var fogFar = FOG_FAR * (0.58 + 0.42 * ds.day);
 
+      function colorUse() {
+        gl.useProgram(prog);
+        gl.uniformMatrix4fv(U.vp, false, m);
+        gl.uniform3f(U.eye, e0[0], e0[1], e0[2]);
+        gl.uniform4f(U.tint, ds.tint[0], ds.tint[1], ds.tint[2], 1);
+        gl.uniform3f(U.fog, ds.sky[0], ds.sky[1], ds.sky[2]);
+        gl.uniform2f(U.fogr, FOG_NEAR, fogFar);
+      }
       function drawBuf(buf, n, mode) {
         if (!n) return;
         gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -327,12 +597,55 @@
         gl.enableVertexAttribArray(A_C); gl.vertexAttribPointer(A_C, 3, gl.FLOAT, false, 24, 12);
         gl.drawArrays(mode, 0, n);
       }
+
+      colorUse();
       drawBuf(st.bufT, st.nT, gl.TRIANGLES);
-      drawBuf(st.bufE, st.nE, gl.TRIANGLES);
+
+      // 天空：太阳/月亮/星星不吃雾（否则它们会被自己的"远处"吃掉）
+      gl.disable(gl.CULL_FACE);
+      gl.uniform2f(U.fogr, 100000, 100001);
+      gl.uniform4f(U.tint, 1, 1, 1, 1);
+      var nS = skyBodies(ds, e0, d);
+      drawBuf(st.bufS, nS, gl.TRIANGLES);
+      var nStar = starPoints(e0, ds);
+      drawBuf(st.bufStar, nStar, gl.POINTS);
+      gl.enable(gl.CULL_FACE);
+
+      // 贴图实体（花/活物是十字面，不能剔除背面）
+      gl.useProgram(progT);
+      gl.uniformMatrix4fv(UT.vp, false, m);
+      gl.uniform3f(UT.eye, e0[0], e0[1], e0[2]);
+      gl.uniform4f(UT.tint, ds.tint[0], ds.tint[1], ds.tint[2], 1);
+      gl.uniform3f(UT.fog, ds.sky[0], ds.sky[1], ds.sky[2]);
+      gl.uniform2f(UT.fogr, FOG_NEAR, fogFar);
+      gl.uniform1i(UT.tex, 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+      gl.disable(gl.CULL_FACE);
+      if (st.nE) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, st.bufE);
+        gl.enableVertexAttribArray(AT_P); gl.vertexAttribPointer(AT_P, 3, gl.FLOAT, false, 24, 0);
+        gl.enableVertexAttribArray(AT_UV); gl.vertexAttribPointer(AT_UV, 2, gl.FLOAT, false, 24, 12);
+        gl.enableVertexAttribArray(AT_S); gl.vertexAttribPointer(AT_S, 1, gl.FLOAT, false, 24, 20);
+        gl.drawArrays(gl.TRIANGLES, 0, st.nE);
+      }
+      gl.enable(gl.CULL_FACE);
+
+      // 粒子（放置/拆除反馈）
+      if (st.nP) {
+        colorUse();
+        gl.uniform2f(U.fogr, 100000, 100001);
+        gl.uniform4f(U.tint, 1, 1, 1, 1);
+        drawBuf(st.bufP, st.nP, gl.POINTS);
+      }
+
+      // 准星线框
+      colorUse();
       gl.disable(gl.CULL_FACE);
       drawBuf(st.bufH, st.nH, gl.LINES);
       gl.enable(gl.CULL_FACE);
     }
+
 
     // —— 主循环
     var raf = 0, last = 0;
@@ -340,12 +653,18 @@
       raf = global.requestAnimationFrame(tick);
       var dt = Math.min(0.1, (now - last) / 1000 || 0); last = now;
       move(dt);
+      stepParts(dt);
       var x0 = Math.max(0, Math.min(W - REGION, Math.floor(st.x) - (REGION >> 1)));
       var z0 = Math.max(0, Math.min(H - REGION, Math.floor(st.z) - (REGION >> 1)));
       var key = x0 + ',' + z0;
       if (key !== st.regionKey || st.dirty) {
         st.regionKey = key; st.dirty = false;
         buildTerrain(x0, z0);
+        buildEntities(x0, z0);
+        st.entAt = now;
+      } else if (now - st.entAt > 90) {
+        // 活物呼吸/走动：约 11Hz 重算实体网格。比每帧上传便宜，也够让画面不再"定格"。
+        st.entAt = now;
         buildEntities(x0, z0);
       }
       st.target = pick();
@@ -358,9 +677,11 @@
     function state() {
       var cx = Math.max(0, Math.min(W - 1, st.x | 0)), cz = Math.max(0, Math.min(H - 1, st.z | 0));
       var t = st.target;
+      var ds = dayState(performance.now());
       return {
         x: cx, z: cz, layer: Math.floor(st.y - EYE + 0.01), surface: level(cx, cz),
         block: blk(cx, cz), target: t, fps: st.fps, locked: st.locked,
+        day: ds.day, dusk: ds.dusk, height: st.height, slots: st.slots,
       };
     }
 
@@ -375,6 +696,7 @@
       if (k['d'] || k['arrowright']) { dx -= fz; dz += fx; }
       var n = Math.hypot(dx, dz);
       if (n > 0) { dx = dx / n * sp; dz = dz / n * sp; }
+      var ox = st.x, oz = st.z;
       st.x = Math.max(0.5, Math.min(W - 0.5, st.x + dx));
       st.z = Math.max(0.5, Math.min(H - 0.5, st.z + dz));
       if (k[' ']) st.y += sp;
@@ -382,6 +704,20 @@
       var ground = support(st.x | 0, st.z | 0) + EYE;
       if (st.y < ground) st.y = ground;
       if (st.y > st.maxLayer + 8) st.y = st.maxLayer + 8;
+
+      // 走路时视线轻微起伏 + 脚步音：MC 的"在场感"一大半来自这两件小事
+      var moved = Math.hypot(st.x - ox, st.z - oz);
+      if (moved > 1e-4 && st.y <= ground + 0.01) {
+        st.bobPhase += moved * 2.2;
+        st.bob = Math.sin(st.bobPhase) * 0.055;
+        if (st.bobPhase - st.stepMark > Math.PI) {
+          st.stepMark = st.bobPhase;
+          if (global.QLSfx) global.QLSfx.step();
+        }
+      } else {
+        st.bob *= Math.max(0, 1 - dt * 10);
+        if (Math.abs(st.bob) < 0.001) st.bob = 0;
+      }
     }
 
     // —— 输入：指针锁定可用就是真 Minecraft 手感；不可用（比如某些 WebView）自动退化成
@@ -395,8 +731,16 @@
       if (key === 'e') { st.yaw -= 0.14; ev.preventDefault(); return; }
       if (key === 'f') { ev.preventDefault(); act(2); return; }
       if (key === 'x' || key === 'delete' || key === 'backspace') { ev.preventDefault(); act(0); return; }
-      var n = Number(key);
-      if (n >= 1 && n <= 8) { hooks.onSlot && hooks.onSlot(n - 1); return; }
+      if (key === 'm') {
+        var on = global.QLSfx ? global.QLSfx.toggle() : false;
+        hooks.onSound && hooks.onSound(on);
+        ev.preventDefault();
+        return;
+      }
+      if (key >= '0' && key <= '9' && key.length === 1) {
+        var idx = key === '0' ? 9 : Number(key) - 1;
+        if (idx < st.slots) { hooks.onSlot && hooks.onSlot(idx); ev.preventDefault(); return; }
+      }
       st.keys[key] = true;
       if (key === ' ') ev.preventDefault();
     }
@@ -414,7 +758,8 @@
     }
     function onWheel(ev) {
       ev.preventDefault();
-      hooks.onSlot && hooks.onSlot((st.slot + (ev.deltaY > 0 ? 1 : -1) + 8) % 8);
+      var d = ev.deltaY > 0 ? 1 : -1;
+      hooks.onSlot && hooks.onSlot((st.slot + d + st.slots) % st.slots);
     }
     function onDown(ev) {
       if (ev.button === 1) return;
@@ -494,7 +839,10 @@
       },
       setColors: function (c) { st.colors = c; st.dirty = true; },
       setSlot: function (i) { st.slot = i; },
+      setSlots: function (n) { st.slots = Math.max(1, Math.min(16, n | 0 || 1)); if (st.slot >= st.slots) st.slot = 0; },
+      setTime: function (height) { st.height = Math.max(0, height | 0); st.heightAt = performance.now(); },
       setMaxLayer: function (n) { if (n > 0) st.maxLayer = n; },
+      burst: burst,
       spawn: function (cx, cz) {
         st.x = cx + 0.5; st.z = cz + 0.5;
         st.y = Math.max(st.y, support(cx, cz) + EYE);

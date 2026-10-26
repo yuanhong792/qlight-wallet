@@ -264,8 +264,9 @@ pub fn send_qlx(
 
     // 提交：链内真 ML-DSA-65 验签 + nonce/可支配余额/过期校验 → 入交易池（不改状态）
     let tx_hash = state.chain.submit(&core, envelope.clone(), sig_bytes.clone())?;
-    // 联邦中继：把这笔交易撒给对端（对端走同一套验签入池，下一块全网打包同一批交易）
-    state.net.broadcast_tx(envelope, sig_bytes);
+    // 联邦中继：交易原件（含公钥与地址盐）撒给对端——对端不靠注册表也能独立验签入池
+    let wire = crate::simchain::BlockWire::new(&envelope, &sig_bytes, &core.pk_bytes, &core.addr_salt);
+    state.net.broadcast_tx(wire);
 
     Ok(SendResult {
         tx_hash: hex::encode(tx_hash),
@@ -434,6 +435,31 @@ pub fn net_status(state: AppCtx) -> serde_json::Value {
 
 // ---------------------------------------------------------------- 世界实体（DESIGN.md §9.11）
 
+/// 本机链的「已确认转账」索引（唯一数据来源是 blocks.jsonl）
+fn chain_view(state: &AppState) -> world::ChainView {
+    world::ChainView::load(&state.blocks_path)
+}
+
+/// 免费写入：签名 → 用重放同一套判据试算 → 追加 → 立刻广播。
+///
+/// v4 起建造不再和币相关（§9.14）：没有付款、没有"等确认"的中间态。
+/// 唯一的代价是链高窗口配额（`FREE_QUOTA_MAX` / 1024 块），它是确定性的、
+/// 第三方可复算的，也是脚本唯一会撞上的墙。
+fn commit_record(
+    state: &AppState,
+    core: &Arc<WalletCore>,
+    d: &world::Draft,
+) -> Result<world::EntityRecord, String> {
+    let view = chain_view(state);
+    let rec = state
+        .entities
+        .commit_as(&world::signer_pk_hash(core), &view, |seq, prev| {
+            world::sign_record(core, seq, &prev, d)
+        })?;
+    publish_entity(state, &rec);
+    Ok(rec)
+}
+
 /// 世界快照：渲染与查询所需的全部输入。
 ///
 /// 分工口径（§9.8）：**链只给坐标与归属，像素全部在本地算**。本命令不返回任何
@@ -456,6 +482,29 @@ pub struct WorldSnapshot {
     pub report: world::Report,
     pub address: String,
     pub unlocked: bool,
+    /// —— 矿脉（§9.13「世界即矿场」；挖矿不是第二个模块，它就是这个世界）——
+    /// 矿脉规则版本，与 `tools/world/world.py`、`world.js`、`src/world/ore.rs` 同值
+    pub ore_rule: String,
+    /// 当前块高的矿脉配额（24 位种子空间里允许的命中数；随块高按 2 的幂减半）
+    pub ore_quota: u32,
+    /// 本回合还能挖的矿格数（扫描上限 512 之内；一个块重画一次）
+    pub ore_candidates: usize,
+    /// 本机地址名下活着的方块数（建造 + 挖矿都算）
+    pub owned_by_me: usize,
+    /// —— 免费写入的软限额（§9.14；v4 起建造不花币，防刷靠这张窗口表）——
+    pub free_quota_window: u64,
+    pub free_quota_max: u32,
+    /// 本机在当前块高窗口内已写的条数
+    pub my_writes_in_window: u32,
+    /// —— 挖矿结算（§9.13）——
+    /// 两笔挖矿发行之间至少间隔的块数
+    pub mine_cooldown_blocks: u64,
+    /// 上一笔挖矿发行所在的块高（0 = 从未）
+    pub last_claim_height: u64,
+    /// 下一笔挖矿最早能结算的块高
+    pub next_claim_height: u64,
+    /// 若此刻挖中一格，下一个块会发行多少（最小单位，已按硬顶截断）
+    pub mine_reward: u64,
 }
 
 /// 逐块读出 VRF 序列（世界的历史即种子；创世行的 VRF 是全零，异或进去不改变种子）
@@ -476,12 +525,43 @@ fn vrf_sequence(blocks_path: &std::path::Path) -> Vec<String> {
 #[tauri::command]
 pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
     let records = state.entities.load();
-    let (state_map, report) = world::replay(&records);
+    let view = chain_view(&state);
+    let (state_map, report) = world::replay(&records, &view);
     let core = state.core.read().unwrap().clone();
+    let address = core.as_ref().map(|c| c.address.clone()).unwrap_or_default();
+    let vrfs = vrf_sequence(&state.blocks_path);
+    let height = state.chain.height();
+
+    // 矿脉：与渲染器用同一份大地/地表，所以钱包算出的矿和网页上那片土地是同一片
+    let words = world::terrain::seed_words(&simchain::genesis_hash_hex(), &vrfs);
+    let taken = ore_taken(&state_map);
+    let candidates = world::ore::scan(&words, height, &taken, 512).len();
+    let owned_by_me = state_map
+        .values()
+        .filter(|e| !e.released && e.owner == address)
+        .count();
+    let my_writes_in_window = core.as_ref().map_or(0, |c| {
+        let pk = world::signer_pk_hash(c);
+        let window = height / world::FREE_QUOTA_WINDOW;
+        records
+            .iter()
+            .filter(|r| {
+                r.v == "QL-ENTREC-v4"
+                    && r.pk_hash_hex == pk
+                    && r.height / world::FREE_QUOTA_WINDOW == window
+            })
+            .count() as u32
+    });
+    let next_claim = state.chain.next_claim_height();
+    let mine_reward = simchain::claim_reward(
+        height + 1,
+        state.chain.total_minted(),
+    );
+
     WorldSnapshot {
         genesis_hash_hex: simchain::genesis_hash_hex(),
-        vrfs: vrf_sequence(&state.blocks_path),
-        height: state.chain.height(),
+        vrfs,
+        height,
         world_w: world::WORLD_W,
         world_h: world::WORLD_H,
         chunk: world::CHUNK,
@@ -491,10 +571,112 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
         chunks: world::chunk_roots(&state_map),
         entities: state_map.into_values().collect(),
         report,
-        address: core.as_ref().map(|c| c.address.clone()).unwrap_or_default(),
+        address,
         unlocked: core.is_some(),
+        ore_rule: world::ore::ORE_RULE_VERSION.into(),
+        ore_quota: world::ore::ore_quota(height),
+        ore_candidates: candidates,
+        owned_by_me,
+        free_quota_window: world::FREE_QUOTA_WINDOW,
+        free_quota_max: world::FREE_QUOTA_MAX,
+        my_writes_in_window,
+        mine_cooldown_blocks: simchain::MINE_COOLDOWN_BLOCKS,
+        last_claim_height: state.chain.last_claim_height(),
+        next_claim_height: next_claim,
+        mine_reward,
     }
 }
+
+/// 已占用的格子（`released` 的不算：断租即让位，与 `world::live_at` 同一判据）
+fn ore_taken(map: &std::collections::BTreeMap<String, world::Entity>) -> world::ore::Taken {
+    let mut t = world::ore::Taken::new();
+    for e in map.values() {
+        if !e.released {
+            t.insert((e.x as u32, e.y as u32, e.layer as u32));
+        }
+    }
+    t
+}
+
+/// 一次挖矿的产物：世界里的方块（立即落账）+ 等待进块的发行凭据。
+#[derive(serde::Serialize)]
+pub struct MineResult {
+    pub record: world::EntityRecord,
+    /// 发行凭据的交易摘要（下一个块若收下它，奖励进本机余额）
+    pub claim_tx_hex: String,
+    pub x: u16,
+    pub y: u16,
+    pub layer: u16,
+    /// 预计结算块高与发行量（最小单位）
+    pub claim_height: u64,
+    pub reward: u64,
+}
+
+/// ⛏️ 挖一回合：在本回合的矿脉里按湿度从高到低取第一个还可挖的格子，
+/// 在世界里落一个贴地方块（免费），同时提交一张**发行凭据**——
+/// 下一个块收下它，`reward_at(h) × 50` 才进本机余额。
+///
+/// **没有造出来的方块，就没有发行**：币不是计时器印出来的，是世界里多了一格
+/// 别人可复算的坐标换来的（§9.13「世界即矿场」）。两次发行至少隔 50 个块，
+/// 所以脚本刷得再快也快不过世界自己重画地表的节奏。
+#[tauri::command]
+pub fn world_mine_once(state: AppCtx, kind: u8) -> Result<MineResult, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    let map = live_world(&state)?;
+    let vrfs = vrf_sequence(&state.blocks_path);
+    let height = state.chain.height();
+    let ready_at = state.chain.next_claim_height();
+    if ready_at > height + 1 {
+        return Err(format!(
+            "本回合已结算：下一笔挖矿发行在块高 {ready_at}（约 {} 秒后）",
+            (ready_at - height - 1) * simchain::BLOCK_INTERVAL_SECS
+        ));
+    }
+    let words = world::terrain::seed_words(&simchain::genesis_hash_hex(), &vrfs);
+    let taken = ore_taken(&map);
+    let hits = world::ore::scan(&words, height, &taken, 8);
+    let (x, y, layer) = *hits.first().ok_or_else(|| {
+        format!(
+            "本回合无矿可挖：配额 {}／{}，{} 格扫描内没有空闲矿脉——等下一个块重画地表",
+            world::ore::ore_quota(height),
+            world::ore::ORE_SEED_SPACE,
+            world::ore::SCAN_CAP
+        )
+    })?;
+    let kind = kind.min(world::SLOT_COUNT - 1);
+
+    // 先提交发行凭据：被拒就不该在世界里落方块（否则会造出一格"挖不出发行"的矿）
+    let (wire, digest) = state.chain.submit_claim(&core, x, y, layer)?;
+    state.net.broadcast_tx(wire);
+
+    let name = format!("矿·{}_{}_{}", x, y, layer);
+    let record = commit_record(
+        &state,
+        &core,
+        &world::Draft {
+            op: world::op::CLAIM,
+            entity_id_hex: "",
+            parent_hex: "",
+            name: &name,
+            x,
+            y,
+            layer,
+            kind,
+            height,
+            ts: now_unix(),
+        },
+    )?;
+    Ok(MineResult {
+        record,
+        claim_tx_hex: hex::encode(digest),
+        x,
+        y,
+        layer,
+        claim_height: height + 1,
+        reward: simchain::claim_reward(height + 1, state.chain.total_minted()),
+    })
+}
+
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -519,7 +701,7 @@ fn check_coords(x: u16, y: u16, layer: u16, kind: u8) -> Result<(), String> {
 /// 写操作前的统一前置：整本重放必须完好。一条语义非法的记录一旦落盘，
 /// 世界就从那条起再也重放不过去——所以宁可在这里就把话说明白。
 fn live_world(state: &AppState) -> Result<std::collections::BTreeMap<String, world::Entity>, String> {
-    let (map, report) = world::replay(&state.entities.load());
+    let (map, report) = world::replay(&state.entities.load(), &chain_view(state));
     if !report.ok {
         return Err(format!(
             "实体账本第 {} 条起校验失败：{}。先排查账本再继续写入",
@@ -556,7 +738,10 @@ fn check_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// 铸造一个方块：坐标 + 高度层 + 槽位 + 名字，由本机 ML-DSA-65 私钥签名后追加进实体账本
+/// 创造一格世界：**免费、当场生效**（§9.14）。
+///
+/// 不付钱、不等确认——创造不该被币控制。防刷是确定性的窗口配额：
+/// 同一归属者每 1024 个块高最多 4096 条，正常建造永远碰不到。
 #[tauri::command]
 pub fn world_place(
     state: AppCtx,
@@ -580,21 +765,22 @@ pub fn world_place(
             None => return Err("父实体不存在".into()),
         }
     }
-    let height = state.chain.height();
-    let ts = now_unix();
-    let draft = world::Draft {
-        op: world::op::CLAIM,
-        entity_id_hex: "",
-        parent_hex: &parent_hex,
-        name: &name,
-        x,
-        y,
-        layer,
-        kind,
-        height,
-        ts,
-    };
-    state.entities.commit(|seq, prev| world::sign_record(&core, seq, &prev, &draft))
+    commit_record(
+        &state,
+        &core,
+        &world::Draft {
+            op: world::op::CLAIM,
+            entity_id_hex: "",
+            parent_hex: &parent_hex,
+            name: &name,
+            x,
+            y,
+            layer,
+            kind,
+            height: state.chain.height(),
+            ts: now_unix(),
+        },
+    )
 }
 
 /// 三条改写操作共用的前置检查：目标存在、未释放、且签名者就是当前归属者。
@@ -617,7 +803,7 @@ fn owned_for(
     Ok(e)
 }
 
-/// 对非 claim 操作，记录里仍要带一个合法名字（名字本身参与哈希链）
+/// 改写操作与创造同一条路：签名即生效，不花币、不等确认。
 fn op_record(
     state: &AppState,
     core: &Arc<WalletCore>,
@@ -628,19 +814,28 @@ fn op_record(
     layer: u16,
     name: &str,
 ) -> Result<world::EntityRecord, String> {
-    let draft = world::Draft {
-        op,
-        entity_id_hex: &e.entity_id_hex,
-        parent_hex: "",
-        name,
-        x,
-        y,
-        layer,
-        kind: e.kind,
-        height: state.chain.height(),
-        ts: now_unix(),
-    };
-    state.entities.commit(|seq, prev| world::sign_record(core, seq, &prev, &draft))
+    commit_record(
+        state,
+        core,
+        &world::Draft {
+            op,
+            entity_id_hex: &e.entity_id_hex,
+            parent_hex: "",
+            name,
+            x,
+            y,
+            layer,
+            kind: e.kind,
+            height: state.chain.height(),
+            ts: now_unix(),
+        },
+    )
+}
+
+/// 落盘的实体记录立刻上联邦网络：别人的小窗里当场显形（DESIGN.md §9.15 M0）。
+/// 单机（网络起不来）时这里只是没人应答，不影响本机记账。
+fn publish_entity(state: &AppState, rec: &world::EntityRecord) {
+    state.net.broadcast_entity(rec.clone());
 }
 
 #[tauri::command]

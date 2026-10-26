@@ -164,7 +164,10 @@ async function refreshAll() {
   // 挖矿页
   const capPct = (cs.total_minted / cs.hard_cap) * 100;
   $("mine-earned").textContent = `${fmtAmt(cs.balance)} QLX`;
-  $("stat-reward").textContent = `${(cs.reward_per_block / 1e9).toFixed(2)} QLX`;
+  // 实际发行 = reward_at(h) × 50，只有挖到矿才发；这里展示单次上限（按硬顶截断）
+  const oneClaim = BigInt(cs.reward_per_block) * 50n;
+  const remain = BigInt(cs.hard_cap) - BigInt(cs.total_minted);
+  $("stat-reward").textContent = `${fmtAmt(oneClaim < remain ? oneClaim : (remain > 0n ? remain : 0n))} QLX`;
   $("stat-minted").textContent = `${fmtAmt(cs.total_minted)} QLX`;
   $("stat-cap").textContent = `${capPct.toFixed(6)}%`;
   $("cap-bar").style.width = `${Math.max(capPct, 0.0000002)}%`;
@@ -304,7 +307,17 @@ $("btn-restore-dat").addEventListener("click", async () => {
 // world.js 从「创世哈希 ⊕ 全部区块 VRF 折叠」算出来。钱包不下载地图、不存贴图，
 // 任何一台机器拿同一份 blocks.jsonl 都必须渲染出逐位相同的大陆（对拍指纹为证）。
 
-const KIND_COLORS = ["#9AA7BD", "#FF6A2A", "#2FBF71", "#29B6F6", "#F06292", "#00E0C8", "#B388FF", "#FFD23F"];
+// 16 种物件的代表色直接取自同一张像素图：地图上的点、物品栏图标、世界里
+// 贴图不可能再"看起来是另一个东西"。
+const KIND_COLORS = (() => {
+  const out = [];
+  for (let i = 0; i < 16; i++) {
+    const [r, g, b] = QLSprites.avgColor(i);
+    out.push(`rgb(${r},${g},${b})`);
+  }
+  return out;
+})();
+const KIND_ICON = (i, size = 32) => QLSprites.dataUrl(Math.max(0, Math.min(15, i | 0)), size);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 const wcvs = $("world-canvas");
@@ -347,30 +360,42 @@ function surfaceLayer(x, z) {
   return t.heights[z * QLWorld.W + x] >> QLWorld3D.LEVEL_SHIFT;
 }
 
+const KIND_CANVAS = [];
+function kindCanvas(kind) {
+  const k = Math.max(0, Math.min(15, kind | 0));
+  if (!KIND_CANVAS[k]) KIND_CANVAS[k] = QLSprites.icon(k, 16);
+  return KIND_CANVAS[k];
+}
+const kdIcon = (kind, released) =>
+  released
+    ? `<i class="kd" style="background:#9AA7BD"></i>`
+    : `<i class="kd" style="background-image:url('${KIND_ICON(kind, 32)}')"></i>`;
+
 function paintWorld() {
   if (!worldSnap) return;
   const s = worldSnap;
   QLWorld.paint(wctx, buildTerrain(s).rgb);
+  wctx.imageSmoothingEnabled = false;
   for (const e of s.entities) {
     if (e.released) continue; // 断租不删除，但也不再显形/占格（与 world.rs live_at 同判据）
-    wctx.fillStyle = KIND_COLORS[e.kind] || KIND_COLORS[0];
-    wctx.fillRect(e.x - 1, e.y - 1, 3, 3);
+    // 地图上的物件不再是 3×3 色点：画同一张 16×16 像素图，俯视图和走进去看到的是同一个东西
+    wctx.drawImage(kindCanvas(e.kind), e.x - 5, e.y - 5, 11, 11);
     if (s.address && e.owner === s.address) {
       wctx.strokeStyle = "#E3B54A";
-      wctx.strokeRect(e.x - 2.5, e.y - 2.5, 6, 6);
+      wctx.strokeRect(e.x - 5.5, e.y - 5.5, 12, 12);
     }
   }
   const sel = entById(wSel);
   if (sel) {
     wctx.strokeStyle = "#FFFFFF";
-    wctx.strokeRect(sel.x - 4.5, sel.y - 4.5, 9, 9);
+    wctx.strokeRect(sel.x - 8.5, sel.y - 8.5, 17, 17);
     wctx.strokeStyle = "#12161F";
-    wctx.strokeRect(sel.x - 5.5, sel.y - 5.5, 11, 11);
+    wctx.strokeRect(sel.x - 9.5, sel.y - 9.5, 19, 19);
   }
 }
 
 function buildHotbar() {
-  const n = worldSnap ? worldSnap.slot_count : 8;
+  const n = worldSnap ? worldSnap.slot_count : 16;
   const bar = $("world-hotbar");
   bar.innerHTML = "";
   for (let i = 0; i < n; i++) {
@@ -378,11 +403,19 @@ function buildHotbar() {
     b.className = "hs" + (i === wSlot ? " active" : "");
     b.dataset.slot = String(i);
     b.type = "button";
-    b.title = t(`world.kind.${i}`);
-    b.innerHTML = `<i class="kd" style="background:${KIND_COLORS[i]}"></i><b>${i + 1}</b>`;
+    b.title = `${i + 1} · ${t(`world.kind.${i}`)}`;
+    b.innerHTML = `<i class="kd" style="background-image:url('${KIND_ICON(i, 32)}')"></i><b class="hs-n">${esc(t(`world.kind.${i}`))}</b><em class="hs-k">${i + 1}</em>`;
     bar.appendChild(b);
   }
   $("world-slot-tag").textContent = `slot ${wSlot + 1} · ${t(`world.kind.${wSlot}`)}`;
+  renderHeld();
+}
+
+/** 第一人称右下角的手持物：图标 + 名字 + 数字键 */
+function renderHeld() {
+  const el = $("w3d-held");
+  if (!el) return;
+  el.innerHTML = `<img src="${KIND_ICON(wSlot, 64)}" alt=""><div><div>${esc(t(`world.kind.${wSlot}`))}</div><div class="wh-k">${wSlot + 1} / 16</div></div>`;
 }
 
 function renderF3() {
@@ -434,7 +467,7 @@ function renderEntList() {
   box.innerHTML = sorted
     .map(
       (e) => `<div class="ent-row${e.entity_id_hex === wSel ? " active" : ""}" data-id="${e.entity_id_hex}">
-        <i class="kd" style="background:${e.released ? "#9AA7BD" : KIND_COLORS[e.kind] || KIND_COLORS[0]}"></i>
+        ${kdIcon(e.kind, e.released)}
         <div class="er-main">
           <div class="er-n">${esc(e.name)}${e.era === 1 ? ` <span class="tag era1">${t("world.sel.era1")}</span>` : ""}${e.released ? ` <span class="tag">${t("world.unowned")}</span>` : ""}</div>
           <div class="er-m">X ${e.x} · Z ${e.y} · Y ${e.layer} · ${t(`world.kind.${e.kind}`)} · #${e.last_height}</div>
@@ -483,7 +516,7 @@ function renderSelected() {
   }
   acts.push(btn("proof", t("world.btn.proof")));
   box.innerHTML = `
-    <div class="es-name"><i class="kd" style="background:${e.released ? "#9AA7BD" : KIND_COLORS[e.kind] || KIND_COLORS[0]}"></i>${esc(e.name)}</div>
+    <div class="es-name">${kdIcon(e.kind, e.released)}${esc(e.name)}</div>
     <dl class="f3">
       ${r(t("world.sel.id"), `<span class="cpy mono" data-copy="${e.entity_id_hex}" title="${t("hist.copy")}">${idShort(e.entity_id_hex)}</span>`)}
       ${r("X · Z · Y", `${e.x} · ${e.y} · ${e.layer}`)}
@@ -503,13 +536,54 @@ function renderWorld() {
   renderParentSelect();
   renderEntList();
   renderSelected();
+  renderStatus();
   paintWorld();
   syncWorld3D();
+  // 3D 覆盖层开着时切语言，物品栏与提示也要立刻换文字
+  if (!$("w3d").hidden) { buildW3Hotbar(); w3Hint(); }
+}
+
+/** 免费建造窗口 + 挖矿结算：把"现在能不能写、下一笔币什么时候到"讲清楚 */
+function renderStatus() {
+  const s = worldSnap;
+  if (!s) return;
+  const used = s.my_writes_in_window || 0;
+  const max = s.free_quota_max || 1;
+  $("pending-count").textContent = `${used} / ${max}`;
+  const pct = Math.min(100, (used / max) * 100);
+  const ready = (s.next_claim_height || 0) <= s.height + 1;
+  const mine = ready
+    ? `<span class="ok-inline">${t("world.status.mine.ready")}</span> · +${fmtAmt(s.mine_reward)} QLX`
+    : t("world.status.mine.wait", { h: s.next_claim_height, left: Math.max(0, s.next_claim_height - s.height) });
+  $("world-fee-line").textContent = t("world.status.free", { max, win: s.free_quota_window });
+  $("world-ore-note").textContent = t("world.status.ore", { n: s.ore_candidates, q: s.ore_quota, m: s.owned_by_me });
+  $("world-pending").innerHTML = `
+    <div class="ent-row"><div class="er-main">
+      <div class="er-n">${t("world.status.quota", { used, max, win: s.free_quota_window })}</div>
+      <div class="quota-bar"><i style="width:${pct}%"></i></div>
+    </div></div>
+    <div class="ent-row"><div class="er-main">
+      <div class="er-n">${t("world.status.mine")}</div>
+      <div class="er-m">${mine}</div>
+    </div></div>`;
 }
 
 async function loadWorld() {
   worldSnap = await invoke("world_snapshot");
   renderWorld();
+}
+
+/** 免费写入的即时回执：签名即落账，不存在"等一个块"的第二阶段 */
+function paidMsg(p) {
+  return t("world.ok.written", { op: t(`world.op.${p.op}`), name: p.name });
+}
+
+/** 挖矿回执：世界里的方块立刻落了，币要等下一个块收下发行凭据 */
+function mineMsg(p) {
+  return t("world.ok.mine", {
+    x: p.x, z: p.y, y: p.layer,
+    reward: fmtAmt(p.reward), h: p.claim_height,
+  });
 }
 
 // —— 交互：物品栏、地图、编辑器
@@ -519,6 +593,7 @@ $("world-hotbar").addEventListener("click", (e) => {
   if (!b) return;
   wSlot = Number(b.dataset.slot);
   buildHotbar();
+  if (w3) w3.setSlot(wSlot);
 });
 
 document.addEventListener("keydown", (e) => {
@@ -526,10 +601,13 @@ document.addEventListener("keydown", (e) => {
   if (!worldActive() || $("view-main").classList.contains("hidden")) return;
   const tag = (e.target.tagName || "").toLowerCase();
   if (tag === "input" || tag === "select" || tag === "textarea") return;
-  const n = Number(e.key);
-  if (n >= 1 && n <= (worldSnap ? worldSnap.slot_count : 8)) {
-    wSlot = n - 1;
+  if (!(e.key >= "0" && e.key <= "9" && e.key.length === 1)) return;
+  const total = worldSnap ? worldSnap.slot_count : 16;
+  const idx = e.key === "0" ? 9 : Number(e.key) - 1;
+  if (idx < total) {
+    wSlot = idx;
     buildHotbar();
+    if (w3) w3.setSlot(wSlot);
   }
 });
 
@@ -584,22 +662,40 @@ $("btn-place").addEventListener("click", async () => {
   if (!worldSnap || !worldSnap.unlocked) { worldErr(t("world.err.locked")); return; }
   $("btn-place").disabled = true;
   try {
-    const rec = await invoke("world_place", {
+    const x = Number($("ent-x").value), y = Number($("ent-z").value), layer = Number($("ent-layer").value);
+    const p = await invoke("world_place", {
       name,
-      x: Number($("ent-x").value),
-      y: Number($("ent-z").value),
-      layer: Number($("ent-layer").value),
+      x,
+      y,
+      layer,
       kind: wSlot,
       parentHex: $("ent-parent").value,
     });
-    wSel = rec.entity_id_hex;
     $("ent-name").value = "";
-    worldOk(t("world.ok.placed", { name: rec.name, id: idShort(rec.entity_id_hex) }));
+    QLSfx.place();
+    if (w3) w3.burst(x, layer, y, wSlot);
+    worldOk(paidMsg(p));
     await loadWorld();
   } catch (e) {
     worldErr(String(e));
   }
   $("btn-place").disabled = false;
+});
+
+$("btn-mine-ore").addEventListener("click", async () => {
+  worldErr("");
+  if (!worldSnap || !worldSnap.unlocked) { worldErr(t("world.err.locked")); return; }
+  $("btn-mine-ore").disabled = true;
+  try {
+    const p = await invoke("world_mine_once", { kind: wSlot });
+    QLSfx.claim();
+    if (w3) w3.burst(p.x, p.layer, p.y, wSlot);
+    worldOk(mineMsg(p));
+    await loadWorld();
+  } catch (e) {
+    worldErr(String(e));
+  }
+  $("btn-mine-ore").disabled = false;
 });
 
 $("ent-list").addEventListener("click", (e) => {
@@ -626,16 +722,16 @@ $("ent-sel").addEventListener("click", async (e) => {
     if (act === "rename") {
       const name = $("ent-name").value.trim();
       if (!name) { worldErr(t("world.err.noname")); return; }
-      await invoke("world_rename", { entityIdHex: wSel, name });
-      worldOk(t("world.ok.renamed", { name }));
+      const p = await invoke("world_rename", { entityIdHex: wSel, name });
+      worldOk(paidMsg(p));
     } else if (act === "move") {
       const x = Number($("ent-x").value), y = Number($("ent-z").value), layer = Number($("ent-layer").value);
-      await invoke("world_move", { entityIdHex: wSel, x, y, layer });
-      worldOk(t("world.ok.moved", { x, y, layer }));
+      const p = await invoke("world_move", { entityIdHex: wSel, x, y, layer });
+      worldOk(paidMsg(p));
     } else if (act === "release") {
       if (!confirm(t("world.confirm.release", { name: e0.name }))) return;
-      await invoke("world_release", { entityIdHex: wSel });
-      worldOk(t("world.ok.released", { name: e0.name }));
+      const p = await invoke("world_release", { entityIdHex: wSel });
+      worldOk(paidMsg(p));
     } else if (act === "proof") {
       if (wProof.id === wSel && wProof.json) { wProof = { id: "", json: "" }; } // 再点一次收起
       else wProof = { id: wSel, json: await invoke("world_proof", { entityIdHex: wSel }) };
@@ -699,10 +795,11 @@ function ensureWorld3D() {
   try {
     w3 = QLWorld3D.create($("w3d-canvas"), {
       onUnsupported: () => { w3Toast(t("world3d.unsupported"), true); closeWorld3D(); },
-      onSlot: (i) => { wSlot = i; buildHotbar(); buildW3Hotbar(); if (w3) w3.setSlot(i); },
+      onSlot: (i) => { wSlot = i; buildHotbar(); buildW3Hotbar(); if (w3) w3.setSlot(i); QLSfx.chop(); },
       onPlace: (x, z, layer) => w3Place(x, z, layer, wSlot),
       onBreak: (x, z, layer, ent) => w3Break(ent),      onBlocked: () => w3Toast(t("world3d.err.blocked"), true),
       onEmpty: () => w3Toast(t("world3d.err.notarget"), true),
+      onSound: (on) => w3Toast(on ? t("world3d.sound.on") : t("world3d.sound.off")),
       onLock: (on) => { $("w3d-cross").classList.toggle("locked", on); w3Hint(); },
       onFrame: (s) => { const n = performance.now(); if (n - w3HudAt > 120) { w3HudAt = n; renderW3Hud(s); } },
       onClose: () => closeWorld3D(),
@@ -724,11 +821,14 @@ function syncWorld3D() {
   w3.setMaxLayer(worldSnap.max_layer || QLWorld3D.MAX_LAYER);
   w3.setColors(KIND_COLORS);
   w3.setEntities(worldSnap.entities, worldSnap.address);
+  w3.setSlots(worldSnap.slot_count || 16);
+  w3.setTime(worldSnap.height || 0);
   w3.setSlot(wSlot);
+  renderHeld();
 }
 
 function buildW3Hotbar() {
-  const n = worldSnap ? worldSnap.slot_count : 8;
+  const n = worldSnap ? worldSnap.slot_count : 16;
   const bar = $("w3d-hotbar");
   bar.innerHTML = "";
   for (let i = 0; i < n; i++) {
@@ -736,10 +836,15 @@ function buildW3Hotbar() {
     b.className = "hs" + (i === wSlot ? " active" : "");
     b.dataset.slot = String(i);
     b.type = "button";
-    b.title = t(`world.kind.${i}`);
-    b.innerHTML = `<i class="kd" style="background:${KIND_COLORS[i]}"></i><b>${i + 1}</b>`;
+    // 只有 1–9 与 0 是真实快捷键，第 11–16 格靠滚轮，别在角上标一个按不出的数字
+    const keyLab = i < 9 ? String(i + 1) : i === 9 ? "0" : "";
+    b.title = keyLab
+      ? `${keyLab} · ${t(`world.kind.${i}`)}`
+      : t(`world.kind.${i}`);
+    b.innerHTML = `<i class="kd" style="background-image:url('${KIND_ICON(i, 32)}')"></i><b class="hs-n">${esc(t(`world.kind.${i}`))}</b><em class="hs-k">${keyLab}</em>`;
     bar.appendChild(b);
   }
+  renderHeld();
 }
 
 function w3Hint() {
@@ -756,11 +861,13 @@ function renderW3Hud(s) {
   const surf = row(t("world3d.f3.surface"), `${s.surface} · ${t(`world3d.biome.${s.block & 7}`)}`);
   const tgt = row(t("world3d.f3.target"), tg ? `${tg.cx}, ${tg.layer}, ${tg.cz}${tg.entity ? ` · ${esc(tg.entity.name)}` : ""}` : "—", tg && tg.entity && tg.entity.owner === s0.address ? "gold" : "");
   const plc = row(t("world3d.f3.place"), tg ? (tg.place ? `${tg.place.cx}, ${tg.place.layer}, ${tg.place.cz}` : t("world3d.f3.nospace")) : "—");
-  const slot = row(t("world3d.f3.slot"), `${wSlot + 1} · ${t(`world.kind.${wSlot}`)}`);
+  const slot = row(t("world3d.f3.slot"), `${wSlot + 1} / ${s.slots || 16} · ${t(`world.kind.${wSlot}`)}`);
+  const tod = s.day > 0.72 ? t("world3d.time.day") : s.dusk > 0.4 ? t("world3d.time.dusk") : t("world3d.time.night");
+  const time = row(t("world3d.f3.time"), `${tod} · #${s.height}`);
   const chn = row(t("world3d.f3.chunk"), ch ? `${ch.count} · ${ch.root_hex.slice(0, 8)}…` : "0");
   const fp = row(t("world3d.f3.fp"), `<span class="mono gold">${terrain.fp}</span>`);
   const fps = row("FPS", `${s.fps}${s.locked ? "" : " · " + t("world3d.f3.unlocked")}`);
-  $("w3d-f3").innerHTML = [pos, surf, tgt, plc, slot, chn, fp, fps].join("");
+  $("w3d-f3").innerHTML = [pos, surf, tgt, plc, slot, time, chn, fp, fps].join("");
 }
 
 async function w3Place(x, z, layer, slot) {
@@ -768,11 +875,12 @@ async function w3Place(x, z, layer, slot) {
   if (!worldSnap || !worldSnap.unlocked) { w3Toast(t("world.err.locked"), true); return; }
   w3Busy = true;
   try {
-    const rec = await invoke("world_place", {
+    const p = await invoke("world_place", {
       name: w3Name(slot, x, z, layer), x, y: z, layer, kind: slot, parentHex: "",
     });
-    wSel = rec.entity_id_hex;
-    w3Toast(t("world.ok.placed", { name: rec.name, id: idShort(rec.entity_id_hex) }));
+    QLSfx.place();
+    if (w3) w3.burst(x, layer, z, slot);
+    w3Toast(paidMsg(p));
     await loadWorld();
   } catch (e) {
     w3Toast(String(e), true);
@@ -786,8 +894,10 @@ async function w3Break(ent) {
   if (ent.owner !== worldSnap.address) { w3Toast(t("world3d.err.notown"), true); return; }
   if (!confirm(t("world.confirm.release", { name: ent.name }))) return;
   try {
-    await invoke("world_release", { entityIdHex: ent.entity_id_hex });
-    w3Toast(t("world.ok.released", { name: ent.name }));
+    const p = await invoke("world_release", { entityIdHex: ent.entity_id_hex });
+    QLSfx.break();
+    if (w3) w3.burst(ent.x, ent.layer, ent.y, ent.kind);
+    w3Toast(paidMsg(p));
     await loadWorld();
   } catch (e) {
     w3Toast(String(e), true);

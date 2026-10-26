@@ -304,18 +304,27 @@ body {
   background: #0B1220; cursor: crosshair;
   box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
 }
-.hotbar { display: flex; gap: 6px; margin-top: 12px; flex-wrap: wrap; }
+.hotbar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-top: 12px; }
 .hs {
-  width: 42px; height: 42px; border-radius: 9px; cursor: pointer;
+  position: relative; width: 100%; min-width: 0; height: 50px; padding: 4px 3px; border-radius: 9px; cursor: pointer;
   background: #FAFBFC; border: 1px solid var(--line);
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
   transition: transform .06s ease, border-color .12s;
 }
 .hs:hover { border-color: var(--gold); }
 .hs.active { border-color: var(--gold); background: #FFFDF4; box-shadow: 0 0 0 3px rgba(227,181,74,.15); transform: translateY(-2px); }
-.hs .kd { width: 14px; height: 14px; border-radius: 3px; box-shadow: 0 0 0 1px rgba(0,0,0,.18); }
+.hs .kd { width: 22px; height: 22px; border-radius: 3px; box-shadow: 0 0 0 1px rgba(0,0,0,.18); flex: none; background-size: cover; image-rendering: pixelated; }
 .hs b { font-size: 10px; color: var(--muted); font-weight: 600; font-family: "SF Mono", Menlo, monospace; }
-.hs.active b { color: var(--gold-dk); }
+.hs .hs-n {
+  font-size: 11px; color: #3A4456; font-weight: 600; font-family: inherit;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.1;
+}
+.hs .hs-k {
+  position: absolute; top: 1px; right: 4px; font-style: normal; font-size: 8.5px;
+  color: #A8B0BE; font-family: "SF Mono", Menlo, monospace;
+}
+.hs.active b, .hs.active .hs-n { color: var(--gold-dk); }
+.hs.active .hs-k { color: var(--gold-dk); }
 .world-cursor {
   margin-top: 10px; font-size: 11.5px; color: #5A6274;
   font-family: "SF Mono", Menlo, monospace; user-select: text;
@@ -363,6 +372,14 @@ body {
 
 /* 实体列表 */
 .ent-list { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; }
+.how-list { margin: 0 0 10px; padding: 0; list-style: none; counter-reset: how; display: flex; flex-direction: column; gap: 7px; }
+.how-list li { counter-increment: how; position: relative; padding-left: 26px; font-size: 12.5px; line-height: 1.5; color: #3A4456; }
+.how-list li::before {
+  content: counter(how); position: absolute; left: 0; top: 1px;
+  width: 18px; height: 18px; border-radius: 50%; text-align: center;
+  font-size: 11px; line-height: 18px; font-weight: 700;
+  background: #FFF4D6; color: var(--gold-dk); border: 1px solid #EFD9A2;
+}
 .ent-row {
   display: flex; align-items: center; gap: 10px; padding: 8px 6px; cursor: pointer;
   border-bottom: 1px solid #F1F3F6;
@@ -401,15 +418,35 @@ body {
 .w3d-f3 .f3v { color: #E6EAF2; text-align: right; word-break: break-all; }
 .w3d-f3 .f3v.gold { color: var(--gold-lt); }
 
-.w3d-hotbar { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); margin: 0; gap: 8px; }
-.w3d-hotbar .hs { background: rgba(10,14,20,.6); border-color: rgba(255,255,255,.2); }
+.w3d-hotbar { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); margin: 0; gap: 6px; grid-template-columns: repeat(8, 54px); }
+.w3d-hotbar .hs { background: rgba(10,14,20,.6); border-color: rgba(255,255,255,.2); width: 54px; height: 44px; gap: 1px; }
+.w3d-hotbar .hs .kd { width: 20px; height: 20px; }
+.w3d-hotbar .hs .hs-n { font-size: 9.5px; }
 .w3d-hotbar .hs b { color: #C7D0DE; }
+.w3d-hotbar .hs .hs-n { color: #E6EAF2; }
+.w3d-hotbar .hs .hs-k { color: rgba(230,234,242,.55); }
 .w3d-hotbar .hs.active { background: rgba(227,181,74,.22); border-color: var(--gold); box-shadow: 0 0 0 3px rgba(227,181,74,.2); }
 
+/* 手持物：第一人称"手里拿着什么"——MC 的物件永远在你视野右下角 */
+.w3d-held {
+  position: absolute; right: 26px; bottom: 26px; display: flex; align-items: center; gap: 9px;
+  padding: 8px 12px 8px 8px; border-radius: 12px; pointer-events: none;
+  background: rgba(10,14,20,.5); border: 1px solid rgba(255,255,255,.18);
+  color: #E6EAF2; font-size: 12.5px; font-weight: 600;
+}
+.w3d-held img { width: 34px; height: 34px; image-rendering: pixelated; }
+.w3d-held .wh-k { font-size: 10px; color: rgba(230,234,242,.55); font-family: "SF Mono", Menlo, monospace; font-weight: 400; }
+
+/* 免费写入配额条：用多少一目了然 */
+.quota-bar { height: 6px; border-radius: 999px; background: #EEF1F5; overflow: hidden; margin-top: 7px; }
+.quota-bar i { display: block; height: 100%; background: linear-gradient(90deg, #E3B54A, #C9922A); border-radius: inherit; }
+
 .w3d-hint {
-  position: absolute; left: 50%; bottom: 6px; transform: translateX(-50%); pointer-events: none;
-  font-size: 11px; color: rgba(230,234,242,.72); font-family: "SF Mono", Menlo, monospace;
-  max-width: 92%; text-align: center;
+  /* 两行物品栏高约 95px + 底距 22px，提示必须压在它上面，否则会被盖住 */
+  position: absolute; left: 50%; bottom: 126px; transform: translateX(-50%); pointer-events: none;
+  font-size: 11px; line-height: 1.5; color: rgba(230,234,242,.72); font-family: "SF Mono", Menlo, monospace;
+  max-width: min(92%, 760px); text-align: center;
+  text-shadow: 0 1px 2px rgba(0,0,0,.65);
 }
 .w3d-toast {
   position: absolute; left: 50%; top: 18px; transform: translateX(-50%); max-width: 70%;

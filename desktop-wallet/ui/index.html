@@ -131,6 +131,7 @@
         <div class="panel-title"><span data-i18n="mine.progress">排放进度</span> <span class="tag" data-i18n="mine.tag">每 2s 出块</span></div>
         <div class="bar"><i id="cap-bar" style="width:0.0000002%"></i></div>
         <div class="muted small" data-i18n="mine.note">210,000,000 QLX 硬顶 · 第 0 纪元（31.5M 块 ≈ 2 年后首次减半）</div>
+        <div class="muted small" data-i18n="mine.auto"></div>
       </div>
       <div class="panel">
         <div class="panel-title"><span data-i18n="mine.vrf">VRF 存活心跳</span> <span class="tag">SHAKE-256</span></div>
@@ -176,6 +177,20 @@
           </div>
 
           <div class="panel">
+            <div class="panel-title">
+              <span data-i18n="world.how.title">怎么挖矿</span>
+              <span class="tag" data-i18n="world.how.tag">4 步</span>
+            </div>
+            <ol class="how-list">
+              <li><span data-i18n="world.how.s1"></span></li>
+              <li><span data-i18n="world.how.s2"></span></li>
+              <li><span data-i18n="world.how.s3"></span></li>
+              <li><span data-i18n="world.how.s4"></span></li>
+            </ol>
+            <div class="muted small" data-i18n="world.how.vs"></div>
+          </div>
+
+          <div class="panel">
             <div class="panel-title"><span data-i18n="world.editor">世界编辑器</span> <span class="tag" id="world-slot-tag">slot 0</span></div>
             <input id="ent-name" type="text" maxlength="64" data-i18n-ph="world.name.ph" placeholder="给它起个名字" spellcheck="false">
             <div class="send-grid3">
@@ -186,6 +201,9 @@
             <div class="muted small" data-i18n="world.y.note"></div>
             <select id="ent-parent" class="w-select"></select>
             <button id="btn-place" class="btn-primary inline" data-i18n="world.btn.place">签名并放置</button>
+            <div class="muted small" id="world-fee-line"></div>
+            <button id="btn-mine-ore" class="btn-primary inline" data-i18n="world.btn.mine">⛏ 挖本回合矿脉</button>
+            <div class="muted small" id="world-ore-note"></div>
             <div class="error" id="err-world"></div>
             <div class="ok" id="ok-world" hidden></div>
             <div class="muted small" data-i18n="world.editor.note"></div>
@@ -197,6 +215,15 @@
               <span class="muted small" id="ent-sel-hint" data-i18n="world.sel.hint"></span>
             </div>
             <div id="ent-sel" class="ent-sel" hidden></div>
+          </div>
+
+          <div class="panel" id="panel-pending">
+            <div class="panel-title">
+              <span data-i18n="world.status.title">免费建造 · 挖矿结算</span>
+              <span class="muted small" id="pending-count"></span>
+            </div>
+            <div id="world-pending" class="ent-list"></div>
+            <div class="muted small" data-i18n="world.status.note"></div>
           </div>
 
           <div class="panel">
@@ -259,6 +286,7 @@
     <div id="w3d" class="w3d" hidden>
       <canvas id="w3d-canvas"></canvas>
       <div class="w3d-cross" id="w3d-cross"></div>
+      <div class="w3d-held" id="w3d-held"></div>
       <dl class="w3d-f3" id="w3d-f3"></dl>
       <div class="hotbar w3d-hotbar" id="w3d-hotbar"></div>
       <div class="w3d-hint" id="w3d-hint"></div>
@@ -269,6 +297,8 @@
 </div>
 
 <script src="i18n.js"></script>
+<script src="sprites.js"></script>
+<script src="sfx.js"></script>
 <script src="world.js"></script>
 <script src="world3d.js"></script>
 <script src="app.js"></script>

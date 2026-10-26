@@ -168,7 +168,6 @@ mod real_crypto_tests {
     /// 从 1952 字节公钥还原验证密钥并验签（对应网络传输路径）
     #[test]
     fn mldsa65_pubkey_roundtrip() {
-        use ml_dsa::Keypair;
         let (sk, vk) = keypair_from_seed(&[9u8; 32]);
         let pk = encode_pk(&vk);
         let vk2 = decode_pk(&pk).expect("1952B 公钥应可还原");

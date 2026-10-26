@@ -165,10 +165,55 @@
     return out;
   }
 
+  // ————————————————————— 矿脉谓词 QL-ORE-v1（§9.13；与 ore.rs / world.py 同构）
+  // 24 位均匀配额命中，不用湿度绝对阈值（湿度分布不可预算，配额的才能当难度用）。
+  var ORE_SEED_SPACE = 1 << 24;
+  var ORE_QUOTA_BASE = ORE_SEED_SPACE / 8;
+  var ORE_QUOTA_MIN = ORE_SEED_SPACE / 128;
+  var ORE_DECAY_INTERVAL = 50;
+  var ORE_SCAN_CAP = 4096;
+  var MAX_LAYER = 64;
+
+  function oreQuota(h) {
+    var halvings = Math.min(8, Math.floor(h / ORE_DECAY_INTERVAL));
+    return Math.max(ORE_QUOTA_MIN, ORE_QUOTA_BASE >> halvings);
+  }
+  function oreSeed(x, y, words) {
+    return (hash2(x * 3 + 17, y * 5 + 31, words[4]) >>> 8) & (ORE_SEED_SPACE - 1);
+  }
+  function isOre(x, y, words, h) {
+    var era = (hash2(x + 7919, y + 104729, words[0]) >>> 24) & 0xFF;
+    return era === 0 && oreSeed(x, y, words) < oreQuota(h);
+  }
+  function oreLayer(x, y, words) {
+    return Math.min(MAX_LAYER - 1, fbm(x, y, words, 0) >> 3);
+  }
+  function oreCells(words, h, limit, taken) {
+    var hits = [], m, key;
+    for (var y = 0; y < H; y++) {
+      for (var x = 0; x < W; x++) {
+        if (!isOre(x, y, words, h)) continue;
+        var l = oreLayer(x, y, words);
+        key = x + ',' + y + ',' + l;
+        if (taken && taken[key]) continue;
+        m = fbm(x, y, words, 4);
+        hits.push([m, x, y, l]);
+        if (hits.length >= ORE_SCAN_CAP) break;
+      }
+      if (hits.length >= ORE_SCAN_CAP) break;
+    }
+    // 湿度降序（富矿先挖），并列按坐标：三边同序才对得起「同一个列表」
+    hits.sort(function (a, b) { return b[0] - a[0] || a[1] - b[1] || a[2] - b[2]; });
+    return hits.slice(0, limit).map(function (r) { return [r[1], r[2], r[3]]; });
+  }
+
   global.QLWorld = {
     W: W, H: H, GENESIS_HASH: GENESIS_HASH, RULES_VERSION: RULES_VERSION,
     setRulesSeed: setRulesSeed, seedWords: seedWords, render: render,
     fingerprint: fingerprint, hash2: hash2, fbm: fbm,
+    oreQuota: oreQuota, oreSeed: oreSeed, isOre: isOre,
+    oreLayer: oreLayer, oreCells: oreCells, ORE_RULE_VERSION: 'QL-ORE-v1',
+    ORE_SEED_SPACE: ORE_SEED_SPACE, ORE_SCAN_CAP: ORE_SCAN_CAP,
     RULES: { SEA: SEA, SAND: SAND, SNOW: SNOW }
   };
 

@@ -157,6 +157,62 @@ def render(words):
     return bytes(px), era1, ents, bytes(hg), bytes(bk)
 
 
+# ---------------------------------------------------------------- 矿脉谓词 QL-ORE-v1
+# §9.13「世界即矿场」的第二份实现（第一份 desktop-wallet/src/world/ore.rs，第三份 world.js）。
+# 三份必须对同一个 (创世哈希, VRF 序列, 块高) 吐出**同一个有序列表**——
+# 基准由 tools/world/test_ore_v1.py 现场对拍，Rust 侧再拿 ore_golden.json 复核。
+# 三条自洽要求：不可预挖（矿签混历史）/ 越来越难（配额减半 + 占用递减）/ 必须贴地。
+#
+# 命中用 24 位均匀配额，不用湿度绝对阈值：上一版拿「湿度 ≥ 240」当门槛，
+# 结果整片世界扫不出一个矿——湿度分布谁也说不准，可预算的配额才谈得上难度。
+ORE_SEED_SPACE = 1 << 24
+ORE_QUOTA_BASE = ORE_SEED_SPACE // 8
+ORE_QUOTA_MIN = ORE_SEED_SPACE // 128
+ORE_DECAY_INTERVAL = 50
+SCAN_CAP = 4096
+MAX_LAYER = 64
+
+
+def ore_quota(h):
+    halvings = min(8, h // ORE_DECAY_INTERVAL)
+    return max(ORE_QUOTA_MIN, ORE_QUOTA_BASE >> halvings)
+
+
+def ore_seed(x, y, words):
+    """矿签：由地表种子（含全部历史 VRF）派生的 24 位均匀值——下一块的 VRF 还不存在，算不出未来"""
+    return (hash2(x * 3 + 17, y * 5 + 31, words[4]) >> 8) & (ORE_SEED_SPACE - 1)
+
+
+def is_ore(x, y, words, h):
+    """矿 = 创世纪元格（大地给的稀土地基）∩ 矿签中配额（历史决定，不可预挖）"""
+    era = (hash2(x + 7919, y + 104729, words[0]) >> 24) & 0xFF
+    return era == 0 and ore_seed(x, y, words) < ore_quota(h)
+
+
+def ore_layer(x, y, words):
+    """贴地层：挖矿必须把方块放到地上，不许悬空刷满 64 层"""
+    return min(MAX_LAYER - 1, fbm(x, y, words[:4]) >> 3)
+
+
+def ore_cells(words, h, limit, taken=()):
+    """湿度降序（富矿先挖），并列按 (x, y) 字典序——三边同序才能对成同一个列表"""
+    hits = []
+    for y in range(H):
+        for x in range(W):
+            if not is_ore(x, y, words, h):
+                continue
+            cell = (x, y, ore_layer(x, y, words))
+            if cell in taken:
+                continue
+            hits.append((fbm(x, y, words[4:]), x, y, cell))
+            if len(hits) >= SCAN_CAP:
+                break
+        if len(hits) >= SCAN_CAP:
+            break
+    hits.sort(key=lambda r: (-r[0], r[1], r[2]))
+    return [r[3] for r in hits[:limit]]
+
+
 def fingerprint(buf):
     """双 FNV-1a 32 位指纹 → 64 个十六进制位，证明逐位一致"""
     out = ""
