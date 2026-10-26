@@ -6,7 +6,7 @@
 铁律（违反即视为实现不合格）：
   - 全程整数，无一处浮点；缩放一律 2 的幂右移，不用除法
   - 无平台数学库、无内置 PRNG
-  - 随机一律由链派生：种子 = 创世哈希 ⊕ 各块 VRF 的 XOR 折叠
+  - 随机一律由链派生：大地 = 创世哈希，地表 = 创世哈希 ⊕ 各块 VRF 的 XOR 折叠
   - 同一 (seed, rules_version, history) 必须与 world.js 产出逐位一致的像素
 
 用法：
@@ -15,17 +15,21 @@
 import argparse, hashlib, json, os, struct, sys, zlib
 
 W = H = 256
-RULES_VERSION = "QL-WORLD-RULES-v1"
+RULES_VERSION = "QL-WORLD-RULES-v2"
 SEA, SAND, SNOW = 86, 98, 190
 M_FOREST, M_DESERT = 120, 60
 DENS_FOREST, DENS_DESERT, DENS_GRASS = 225, 240, 232
+# 种子分道（v2 的全部改动就在这一行）：前 4 个字只由创世哈希决定 → 大地；
+# 后 4 个字才混入链历史 → 地表。高度场一旦随块漂移，(x, z, layer) 就没有意义，
+# 签了名的塔会被埋进地里或悬在半空——世界必须先是稳定的舞台，才谈得上在上面创造。
+SEED_SPLIT = 4
 
 # 创世哈希：与 simchain.rs 的 GENESIS_HASH_HEX 同一个锚定值（公开常量）
 GENESIS_HASH = "5dc2205a8f0153a05f84e26ab94086009796bb68fdfddff439f97ebfd2aa3104"
 
 # 规则参数表：全部写进版本哈希——动任何一个阈值都会换出另一个世界（DESIGN.md §9.6）
 PARAMS = ",".join(map(str, [W, H, SEA, SAND, SNOW, M_FOREST, M_DESERT,
-                            DENS_FOREST, DENS_DESERT, DENS_GRASS]))
+                            DENS_FOREST, DENS_DESERT, DENS_GRASS, SEED_SPLIT]))
 RULES_CANON = RULES_VERSION + "|" + PARAMS
 RULES_SEED = int.from_bytes(hashlib.shake_256(RULES_CANON.encode()).digest(4), "big")
 
@@ -77,17 +81,31 @@ def fbm(x, y, words):
 
 
 def seed_words(genesis_hex, vrfs):
-    """种子 = 创世哈希 ⊕ 全部块 VRF 的 XOR 折叠（链即世界的历史）"""
+    """种子 = 创世哈希（大地）⊕ 链历史（地表）
+
+    前 4 个字 = 创世哈希前 16 字节，**不混历史**：高度场与天然实体因此永久稳定，
+    一格一层的坐标 (x, z, layer) 才是可以被签名、被第三方复算的承诺。
+    后 4 个字 = 创世哈希后 16 字节 ⊕ 全部块 VRF 的 XOR 折叠：湿度场随链生长，
+    同一台机器、同一条链，历史长一格地表就重画一次。
+    """
     raw = bytes.fromhex(genesis_hex)
+    folded = bytearray(raw)
     for v in vrfs:
         b = bytes.fromhex(v)
-        raw = bytes(a ^ b for a, b in zip(raw, b))
-    return [int.from_bytes(raw[i * 4:i * 4 + 4], "big") for i in range(8)]
+        folded = bytearray(a ^ c for a, c in zip(folded, b))
+    stage = raw[:16] + folded[16:]
+    return [int.from_bytes(stage[i * 4:i * 4 + 4], "big") for i in range(8)]
 
 
 def render(words):
-    """→ (rgb bytes, era1_count, entity_count)"""
+    """→ (rgb bytes, era1_count, entity_count, heights, blocks)
+
+    blocks 编码（与 JS 侧同一套，第一人称体素视图靠它）：
+    0 水 1 沙 2 雪 3 森林 4 荒漠 5 草原；+8 天然树，+16 创世纪元格。
+    像素与方块在**同一趟循环**里分类，杜绝两套判定分叉。"""
     px = bytearray(W * H * 3)
+    hg = bytearray(W * H)
+    bk = bytearray(W * H)
     era1 = ents = 0
     for y in range(H):
         for x in range(W):
@@ -100,17 +118,17 @@ def render(words):
 
             if h < SEA:                              # 水域：深度决定蓝
                 d = (SEA - h) >> 2
-                r, g, b = 10, 34 + ((60 - d) >> 1), 74 + (120 - d)
+                r, g, b, blk = 10, 34 + ((60 - d) >> 1), 74 + (120 - d), 0
             elif h < SAND:                           # 滩涂
-                r, g, b = 196, 176, 122
+                r, g, b, blk = 196, 176, 122, 1
             elif h > SNOW:                           # 雪线
-                r, g, b = 226, 232, 240
+                r, g, b, blk = 226, 232, 240, 2
             elif m > M_FOREST:                       # 森林
-                r, g, b = 44, 96 - ((h - SAND) >> 2), 52
+                r, g, b, blk = 44, 96 - ((h - SAND) >> 2), 52, 3
             elif m < M_DESERT:                       # 荒漠
-                r, g, b = 178, 152, 96
+                r, g, b, blk = 178, 152, 96, 4
             else:                                    # 草原
-                r, g, b = 104, 148 - ((h - SAND) >> 2), 74
+                r, g, b, blk = 104, 148 - ((h - SAND) >> 2), 74, 5
 
             # 实体：树 / 植物 / 走兽，由同一整数哈希确定性落位
             if SEA <= h <= SNOW:
@@ -118,6 +136,7 @@ def render(words):
                 dens = 225 if m > M_FOREST else (240 if m < M_DESERT else 232)
                 if t > dens:
                     ents += 1
+                    blk += 8
                     k = (e >> 4) & 3
                     if k == 0:
                         r, g, b = 26, 62, 30          # 乔木
@@ -129,10 +148,13 @@ def render(words):
                         r, g, b = 176, 146, 60        # 灵矿
             if era == 0:                             # 创世世代地标：实心描金
                 r, g, b = 248, 216, 104
+                blk += 16
 
-            o = (y * W + x) * 3
+            i = y * W + x
+            o = i * 3
             px[o], px[o + 1], px[o + 2] = r, g, b
-    return bytes(px), era1, ents
+            hg[i], bk[i] = h, blk
+    return bytes(px), era1, ents, bytes(hg), bytes(bk)
 
 
 def fingerprint(buf):
@@ -180,11 +202,12 @@ def main():
                 vrfs.append(v.lower())
 
     words = seed_words(genesis, vrfs)
-    rgb, era1, ents = render(words)
+    rgb, era1, ents, hg, bk = render(words)
     print("blocks      :", len(vrfs))
     print("seed words  :", " ".join("%08x" % w for w in words[:4]))
     print("era1 tiles  :", era1, " entities:", ents)
     print("fingerprint :", fingerprint(rgb))
+    print("terrain fp  :", fingerprint(hg + bk))
     if a.out:
         write_png(a.out, rgb, W, H)
         print("png         :", a.out)

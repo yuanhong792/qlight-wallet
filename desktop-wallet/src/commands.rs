@@ -449,6 +449,8 @@ pub struct WorldSnapshot {
     pub chunk: u16,
     pub era1_end_height: u64,
     pub slot_count: u8,
+    /// 可用高度层数（Minecraft 的 Y 上限；layer ∈ 0..max_layer）
+    pub max_layer: u16,
     pub entities: Vec<world::Entity>,
     pub chunks: Vec<world::Chunk>,
     pub report: world::Report,
@@ -485,6 +487,7 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
         chunk: world::CHUNK,
         era1_end_height: world::ERA1_END_HEIGHT,
         slot_count: world::SLOT_COUNT,
+        max_layer: world::MAX_LAYER,
         chunks: world::chunk_roots(&state_map),
         entities: state_map.into_values().collect(),
         report,
@@ -500,12 +503,44 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn check_coords(x: u16, y: u16, kind: u8) -> Result<(), String> {
+fn check_coords(x: u16, y: u16, layer: u16, kind: u8) -> Result<(), String> {
     if x >= world::WORLD_W || y >= world::WORLD_H {
         return Err(format!("坐标 ({x},{y}) 超出世界边界 {}×{}", world::WORLD_W, world::WORLD_H));
     }
+    if layer >= world::MAX_LAYER {
+        return Err(format!("高度层 {layer} 非法（0..{}）", world::MAX_LAYER - 1));
+    }
     if kind >= world::SLOT_COUNT {
         return Err(format!("物品栏槽位 {kind} 非法（0..{}）", world::SLOT_COUNT - 1));
+    }
+    Ok(())
+}
+
+/// 写操作前的统一前置：整本重放必须完好。一条语义非法的记录一旦落盘，
+/// 世界就从那条起再也重放不过去——所以宁可在这里就把话说明白。
+fn live_world(state: &AppState) -> Result<std::collections::BTreeMap<String, world::Entity>, String> {
+    let (map, report) = world::replay(&state.entities.load());
+    if !report.ok {
+        return Err(format!(
+            "实体账本第 {} 条起校验失败：{}。先排查账本再继续写入",
+            report.first_bad, report.reason
+        ));
+    }
+    Ok(map)
+}
+
+/// 那一格那一层是否已被活方块占用（`except_id` 允许"挪回原位"这类空操作）
+fn voxel_taken(
+    map: &std::collections::BTreeMap<String, world::Entity>,
+    x: u16,
+    y: u16,
+    layer: u16,
+    except_id: &str,
+) -> Result<(), String> {
+    if let Some(busy) = world::live_at(map, x, y, layer) {
+        if busy.entity_id_hex != except_id {
+            return Err(format!("({x},{y}) 第 {layer} 层已经有「{}」", busy.name));
+        }
     }
     Ok(())
 }
@@ -521,22 +556,24 @@ fn check_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// 铸造一个实体：坐标 + 槽位 + 名字，由本机 ML-DSA-65 私钥签名后追加进实体账本
+/// 铸造一个方块：坐标 + 高度层 + 槽位 + 名字，由本机 ML-DSA-65 私钥签名后追加进实体账本
 #[tauri::command]
 pub fn world_place(
     state: AppCtx,
     name: String,
     x: u16,
     y: u16,
+    layer: u16,
     kind: u8,
     parent_hex: String,
 ) -> Result<world::EntityRecord, String> {
     let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
     let name = check_name(&name)?;
-    check_coords(x, y, kind)?;
+    check_coords(x, y, layer, kind)?;
+    let map = live_world(&state)?;
+    voxel_taken(&map, x, y, layer, "")?;
     let parent_hex = parent_hex.trim().to_string();
     if !parent_hex.is_empty() {
-        let (map, _) = world::replay(&state.entities.load());
         match map.get(&parent_hex) {
             Some(p) if !p.released => {}
             Some(_) => return Err("父实体已无归属，不能再衍生".into()),
@@ -552,6 +589,7 @@ pub fn world_place(
         name: &name,
         x,
         y,
+        layer,
         kind,
         height,
         ts,
@@ -568,13 +606,7 @@ fn owned_for(
     entity_id_hex: &str,
     me: &str,
 ) -> Result<world::Entity, String> {
-    let (map, report) = world::replay(&state.entities.load());
-    if !report.ok {
-        return Err(format!(
-            "实体账本第 {} 条起校验失败：{}。先排查账本再继续写入",
-            report.first_bad, report.reason
-        ));
-    }
+    let map = live_world(state)?;
     let e = map.get(entity_id_hex).ok_or("实体不存在")?.clone();
     if e.released {
         return Err("该实体已释放归属，不可再改写".into());
@@ -593,6 +625,7 @@ fn op_record(
     e: &world::Entity,
     x: u16,
     y: u16,
+    layer: u16,
     name: &str,
 ) -> Result<world::EntityRecord, String> {
     let draft = world::Draft {
@@ -602,6 +635,7 @@ fn op_record(
         name,
         x,
         y,
+        layer,
         kind: e.kind,
         height: state.chain.height(),
         ts: now_unix(),
@@ -618,7 +652,7 @@ pub fn world_rename(
     let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
     let name = check_name(&name)?;
     let e = owned_for(&state, &entity_id_hex, &core.address)?;
-    op_record(&state, &core, world::op::RENAME, &e, e.x, e.y, &name)
+    op_record(&state, &core, world::op::RENAME, &e, e.x, e.y, e.layer, &name)
 }
 
 #[tauri::command]
@@ -627,11 +661,13 @@ pub fn world_move(
     entity_id_hex: String,
     x: u16,
     y: u16,
+    layer: u16,
 ) -> Result<world::EntityRecord, String> {
     let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
-    check_coords(x, y, 0)?;
+    check_coords(x, y, layer, 0)?;
     let e = owned_for(&state, &entity_id_hex, &core.address)?;
-    op_record(&state, &core, world::op::MOVE, &e, x, y, &e.name)
+    voxel_taken(&live_world(&state)?, x, y, layer, &e.entity_id_hex)?;
+    op_record(&state, &core, world::op::MOVE, &e, x, y, layer, &e.name)
 }
 
 /// 释放归属：实体永久留在账本里可查，只是不再有主人（§9.9 断租不删除）
@@ -642,7 +678,7 @@ pub fn world_release(
 ) -> Result<world::EntityRecord, String> {
     let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
     let e = owned_for(&state, &entity_id_hex, &core.address)?;
-    op_record(&state, &core, world::op::RELEASE, &e, e.x, e.y, &e.name)
+    op_record(&state, &core, world::op::RELEASE, &e, e.x, e.y, e.layer, &e.name)
 }
 
 /// 导出某条实体的原始记录（含公钥与签名）：任何人可离线重算 record_hash 并验签

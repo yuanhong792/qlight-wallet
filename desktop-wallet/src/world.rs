@@ -17,8 +17,16 @@
 //!   id 由铸造内容（名称/坐标/槽位/块高/父实体）一并派生：没有注册机构、没有
 //!   命名空间仲裁、没有白名单，谁先写谁得；创建者也无法事后自签改写这条历史。
 //!
-//! Minecraft 借来的三件事：格子坐标（点击即放置）、物品栏（kind 8 种方块/生灵）、
-//! chunk 16×16（每个 chunk 一个承诺根，实体"都可查"但不是每条都单独上链）。
+//! Minecraft 借来的四件事：格子坐标 + **高度层**（点击面即放置，可以叠塔）、
+//! 物品栏（kind 8 种方块/生灵）、chunk 16×16（每个 chunk 一个承诺根，实体
+//! "都可查"但不是每条都单独上链）、创造模式（站着看哪儿就能在那儿造东西）。
+
+/// 世界可用的最大高度层（layer ∈ 0..MAX_LAYER）。
+///
+/// 地形本身是算出来的：`layer = 高度场 >> 3`（`ui/world.js` 与 `tools/world/*`
+/// 同一口径），所以地表只到 31 层。留到 64 层是给玩家往天上造的——
+/// **地形不能被挖，能被造的只有签过名的方块**。
+pub const MAX_LAYER: u16 = 64;
 
 use crate::crypto;
 use serde::{Deserialize, Serialize};
@@ -36,8 +44,9 @@ pub const ERA1_END_HEIGHT: u64 = 100_000;
 pub const SLOT_COUNT: u8 = 8;
 pub const NAME_MAX: usize = 64;
 
-const REC_PREFIX: &[u8] = b"QL-ENTREC-v1";
+const REC_PREFIX: &[u8] = b"QL-ENTREC-v2";
 const REC_HASH_PREFIX: &[u8] = b"QL-ENTREC-H1";
+const RECORD_VERSION: &str = "QL-ENTREC-v2";
 const ID_PREFIX: &[u8] = b"QL-ENT-V1";
 const CHUNK_PREFIX: &[u8] = b"QL-CHUNK-V1";
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -51,6 +60,11 @@ pub mod op {
 }
 
 /// 一条实体记录（entities.jsonl 每行一条，字段全部参与哈希链，无冗余可篡改位）
+///
+/// 版本 `QL-ENTREC-v2` 相对 v1 多了 `layer`：v1 从未签名过任何一条记录
+/// （实体账本与钱包编辑器同批落地），所以这里不留兼容分支——历史上没有
+/// 需要继续验签的 v1 字节。将来再加字段时，v2 记录已经存在，那时才必须
+/// 按 §9.6 做版本分支。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EntityRecord {
     pub v: String,
@@ -64,6 +78,8 @@ pub struct EntityRecord {
     pub name: String,
     pub x: u16,
     pub y: u16,
+    /// 高度层（Minecraft 的 Y）：`layer = 地表高度 >> 3` 即贴地，往上叠塔
+    pub layer: u16,
     pub kind: u8,
     /// 写入时的块高——决定 era，也决定"谁先看见"
     pub height: u64,
@@ -100,6 +116,7 @@ fn canon(r: &EntityRecord) -> Vec<u8> {
     bytes(&mut out, r.name.as_bytes());
     out.extend_from_slice(&r.x.to_be_bytes());
     out.extend_from_slice(&r.y.to_be_bytes());
+    out.extend_from_slice(&r.layer.to_be_bytes());
     out.push(r.kind);
     u64b(&mut out, r.height);
     u64b(&mut out, r.ts);
@@ -129,7 +146,7 @@ pub fn record_hash(r: &EntityRecord) -> [u8; 32] {
 /// 内容寻址的实体 id：由「上一条哈希 ‖ 创建者公钥摘要 ‖ 序号 ‖ 铸造内容」算出，
 /// 不需要任何注册机构批准，也不可被抢注（同一 seq 位置只能有一条合法记录）。
 ///
-/// 内容（名称/坐标/槽位/块高）也进 id：否则事后改一条 claim 再自签一次，
+/// 内容（名称/坐标/高度层/槽位/块高）也进 id：否则事后改一条 claim 再自签一次，
 /// id 仍自洽，世界历史就能被创建者悄悄重写。
 pub fn derive_entity_id(prev_hash: &[u8; 32], pk_hash: &[u8; 32], r: &EntityRecord) -> [u8; 32] {
     let mut buf = Vec::with_capacity(96);
@@ -141,6 +158,7 @@ pub fn derive_entity_id(prev_hash: &[u8; 32], pk_hash: &[u8; 32], r: &EntityReco
     buf.extend_from_slice(&r.parent_hex.as_bytes());
     buf.extend_from_slice(&r.x.to_be_bytes());
     buf.extend_from_slice(&r.y.to_be_bytes());
+    buf.extend_from_slice(&r.layer.to_be_bytes());
     buf.push(r.kind);
     buf.extend_from_slice(&r.height.to_be_bytes());
     let d = crypto::shake256(ID_PREFIX, &buf, 32);
@@ -156,6 +174,7 @@ pub struct Entity {
     pub name: String,
     pub x: u16,
     pub y: u16,
+    pub layer: u16,
     pub kind: u8,
     pub owner: String,
     pub parent_hex: String,
@@ -185,6 +204,15 @@ pub struct Report {
     pub reason: String,
 }
 
+/// 某一格（含高度层）当前是否被**活着的**方块占着。
+///
+/// 已释放归属的实体不占格：断租不删除（记录永久可查），但那一格的空间重新
+/// 有人可以造。这条规则只在重放里判定一次，第三方独立验签得出同一结论；
+/// 命令层落盘前调的也是这同一个函数——绝不写两套判定。
+pub(crate) fn live_at(state: &BTreeMap<String, Entity>, x: u16, y: u16, layer: u16) -> Option<&Entity> {
+    state.values().find(|e| !e.released && e.x == x && e.y == y && e.layer == layer)
+}
+
 /// 重放整本实体账本，返回当前世界状态。
 ///
 /// 与 `validate_blocks_jsonl` 同一套纪律：**逐条严格重算**，任何一条签名/归属/
@@ -208,7 +236,7 @@ fn apply_record(
     i: usize,
     r: &EntityRecord,
 ) -> Result<(), String> {
-    if r.v != "QL-ENTREC-v1" {
+    if r.v != RECORD_VERSION {
         return Err(format!("未知记录版本 {}", r.v));
     }
     if r.seq != (i as u64) + 1 {
@@ -220,8 +248,11 @@ fn apply_record(
     if r.name.is_empty() || r.name.len() > NAME_MAX {
         return Err(format!("seq {} 名称长度为 {}，须为 1..={}", r.seq, r.name.len(), NAME_MAX));
     }
-    if r.x >= WORLD_W || r.y >= WORLD_H || r.kind >= SLOT_COUNT {
-        return Err(format!("seq {} 越界：坐标 ({},{}) 或槽位 {} 非法", r.seq, r.x, r.y, r.kind));
+    if r.x >= WORLD_W || r.y >= WORLD_H || r.layer >= MAX_LAYER || r.kind >= SLOT_COUNT {
+        return Err(format!(
+            "seq {} 越界：坐标 ({},{}) 高度层 {} 或槽位 {} 非法",
+            r.seq, r.x, r.y, r.layer, r.kind
+        ));
     }
     // —— 密码学四件套：公钥可解 → 摘要自洽 → 签名有效 → 归属可由公钥复算 ——
     let pk = match hex::decode(&r.pk_hex) {
@@ -264,6 +295,12 @@ fn apply_record(
             if !r.parent_hex.is_empty() && !state.contains_key(&r.parent_hex) {
                 return Err(format!("seq {} 的父实体不存在", r.seq));
             }
+            if let Some(busy) = live_at(state, r.x, r.y, r.layer) {
+                return Err(format!(
+                    "seq {} 想造的格子 ({},{}) 第 {} 层已经有「{}」",
+                    r.seq, r.x, r.y, r.layer, busy.name
+                ));
+            }
             state.insert(
                 r.entity_id_hex.clone(),
                 Entity {
@@ -271,6 +308,7 @@ fn apply_record(
                     name: r.name.clone(),
                     x: r.x,
                     y: r.y,
+                    layer: r.layer,
                     kind: r.kind,
                     owner: r.owner.clone(),
                     parent_hex: r.parent_hex.clone(),
@@ -283,6 +321,12 @@ fn apply_record(
             );
         }
         op::RENAME | op::MOVE | op::RELEASE => {
+            // 挪动前先记下目标格子的占用者：下面拿到 &mut e 以后就不能再读 state 了
+            let occupier = if r.op == op::MOVE {
+                live_at(state, r.x, r.y, r.layer).map(|o| (o.entity_id_hex.clone(), o.name.clone()))
+            } else {
+                None
+            };
             let Some(e) = state.get_mut(&r.entity_id_hex) else {
                 return Err(format!("seq {} 指向的实体不存在", r.seq));
             };
@@ -295,8 +339,17 @@ fn apply_record(
             match r.op.as_str() {
                 op::RENAME => e.name = r.name.clone(),
                 op::MOVE => {
+                    if let Some((id, name)) = &occupier {
+                        if id != &r.entity_id_hex {
+                            return Err(format!(
+                                "seq {} 要挪到的格子 ({},{}) 第 {} 层已经有「{}」",
+                                r.seq, r.x, r.y, r.layer, name
+                            ));
+                        }
+                    }
                     e.x = r.x;
                     e.y = r.y;
+                    e.layer = r.layer;
                 }
                 _ => {
                     // release：归属置空，实体永不删除（§9.9 断租不删除）
@@ -415,6 +468,7 @@ pub struct Draft<'a> {
     pub name: &'a str,
     pub x: u16,
     pub y: u16,
+    pub layer: u16,
     pub kind: u8,
     pub height: u64,
     pub ts: u64,
@@ -432,7 +486,7 @@ pub fn sign_record(
     pk_hash32.copy_from_slice(&pk_hash);
 
     let mut r = EntityRecord {
-        v: "QL-ENTREC-v1".into(),
+        v: RECORD_VERSION.into(),
         seq,
         op: d.op.into(),
         entity_id_hex: d.entity_id_hex.into(),
@@ -440,6 +494,7 @@ pub fn sign_record(
         name: d.name.into(),
         x: d.x,
         y: d.y,
+        layer: d.layer,
         kind: d.kind,
         height: d.height,
         ts: d.ts,
@@ -493,7 +548,7 @@ mod tests {
             &c,
             &Draft {
                 op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "创世塔",
-                x: 40, y: 60, kind: 4, height: 12, ts: 1,
+                x: 40, y: 60, layer: 0, kind: 4, height: 12, ts: 1,
             },
         );
         assert_eq!(r1.seq, 1);
@@ -504,7 +559,7 @@ mod tests {
             &c,
             &Draft {
                 op: op::RENAME, entity_id_hex: &r1.entity_id_hex, parent_hex: "", name: "改名塔",
-                x: 0, y: 0, kind: 0, height: 20, ts: 2,
+                x: 0, y: 0, layer: 0, kind: 0, height: 20, ts: 2,
             },
         );
         assert_eq!(r2.prev_hash_hex, hex::encode(record_hash(&r1)));
@@ -514,7 +569,7 @@ mod tests {
             &c,
             &Draft {
                 op: op::MOVE, entity_id_hex: &r1.entity_id_hex, parent_hex: "", name: "改名塔",
-                x: 41, y: 61, kind: 0, height: 25, ts: 3,
+                x: 41, y: 61, layer: 0, kind: 0, height: 25, ts: 3,
             },
         );
 
@@ -531,7 +586,7 @@ mod tests {
             &c,
             &Draft {
                 op: op::RELEASE, entity_id_hex: &r1.entity_id_hex, parent_hex: "", name: "改名塔",
-                x: 41, y: 61, kind: 0, height: 30, ts: 4,
+                x: 41, y: 61, layer: 0, kind: 0, height: 30, ts: 4,
             },
         );
         let (state, rep) = replay(&ledger.load());
@@ -552,7 +607,7 @@ mod tests {
             &c,
             &Draft {
                 op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "不可篡改",
-                x: 5, y: 5, kind: 1, height: 3, ts: 1,
+                x: 5, y: 5, layer: 0, kind: 1, height: 3, ts: 1,
             },
         );
         // 改名字 → record_hash 变、签名失效。这里连"改完再自签一次"都试了：
@@ -576,7 +631,7 @@ mod tests {
             &alice,
             &Draft {
                 op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "Alice 的树",
-                x: 9, y: 9, kind: 0, height: 4, ts: 1,
+                x: 9, y: 9, layer: 0, kind: 0, height: 4, ts: 1,
             },
         );
         commit(
@@ -584,7 +639,7 @@ mod tests {
             &bob,
             &Draft {
                 op: op::MOVE, entity_id_hex: &r1.entity_id_hex, parent_hex: "", name: "抢过来的树",
-                x: 10, y: 10, kind: 0, height: 5, ts: 2,
+                x: 10, y: 10, layer: 0, kind: 0, height: 5, ts: 2,
             },
         );
         let (state, rep) = replay(&ledger.load());
@@ -606,7 +661,7 @@ mod tests {
                 &c,
                 &Draft {
                     op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "塔",
-                    x: i, y: i, kind: 0, height: i as u64 + 1, ts: i as u64,
+                    x: i, y: i, layer: 0, kind: 0, height: i as u64 + 1, ts: i as u64,
                 },
             );
         }
@@ -631,7 +686,7 @@ mod tests {
                 &c,
                 &Draft {
                     op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "塔",
-                    x: i, y: i, kind: 0, height: i as u64 + 1, ts: i as u64,
+                    x: i, y: i, layer: 0, kind: 0, height: i as u64 + 1, ts: i as u64,
                 },
             );
         }
@@ -645,6 +700,101 @@ mod tests {
         let _ = std::fs::remove_file(ledger.path());
     }
 
+    /// Minecraft 的核心是往上叠：同一格不同高度层是**不同的位置**，
+    /// 但同一格同一层只能有一个活着的方块——释放归属后那一格才重新空出来。
+    #[test]
+    fn blocks_stack_by_layer_and_one_voxel_holds_only_one() {
+        let c = core();
+        let ledger = tmp_ledger("tower");
+        let claim = |ledger: &EntityLedger, name: &str, layer: u16| {
+            commit(
+                ledger,
+                &c,
+                &Draft {
+                    op: op::CLAIM, entity_id_hex: "", parent_hex: "", name,
+                    x: 77, y: 88, layer, kind: 2, height: 50, ts: 50,
+                },
+            )
+        };
+        let base = claim(&ledger, "塔基", 12);
+        claim(&ledger, "塔身", 13);
+        claim(&ledger, "塔顶", 14);
+        let (state, rep) = replay(&ledger.load());
+        assert!(rep.ok, "叠塔应合法：{}", rep.reason);
+        let mut col: Vec<u16> = state.values().filter(|e| e.x == 77 && e.y == 88).map(|e| e.layer).collect();
+        col.sort();
+        assert_eq!(col, vec![12, 13, 14]);
+
+        // 同格同层再造一枚：重放从这条起拒绝
+        commit(
+            &ledger,
+            &c,
+            &Draft {
+                op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "挤进来的",
+                x: 77, y: 88, layer: 13, kind: 5, height: 51, ts: 51,
+            },
+        );
+        let (_, rep) = replay(&ledger.load());
+        assert!(!rep.ok);
+        assert!(rep.reason.contains("已经有"), "{}", rep.reason);
+        assert_eq!(rep.first_bad, 4);
+
+        // 断租不删除，但那一格的空间重新可造
+        commit(
+            &ledger,
+            &c,
+            &Draft {
+                op: op::RELEASE, entity_id_hex: &base.entity_id_hex, parent_hex: "", name: "塔基",
+                x: 77, y: 88, layer: 12, kind: 0, height: 52, ts: 52,
+            },
+        );
+        let recs = ledger.load();
+        let truncated = &recs[..3]; // 只重放到三次铸造，塔仍是合法的
+        let (state, rep) = replay(truncated);
+        assert!(rep.ok, "{}", rep.reason);
+        assert_eq!(state.len(), 3);
+
+        let fresh = tmp_ledger("reuse");
+        claim(&fresh, "塔基", 12);
+        commit(
+            &fresh,
+            &c,
+            &Draft {
+                op: op::RELEASE, entity_id_hex: &fresh.load()[0].entity_id_hex,
+                parent_hex: "", name: "塔基", x: 77, y: 88, layer: 12, kind: 0, height: 53, ts: 53,
+            },
+        );
+        claim(&fresh, "重建塔基", 12);
+        let (state, rep) = replay(&fresh.load());
+        assert!(rep.ok, "释放后应可原地重建：{}", rep.reason);
+        assert_eq!(state.values().filter(|e| !e.released).count(), 1);
+        let _ = std::fs::remove_file(ledger.path());
+        let _ = std::fs::remove_file(fresh.path());
+    }
+
+    /// 高度层参与 id 与哈希：改一层就等于换了一条历史
+    #[test]
+    fn layer_is_bound_into_the_record() {
+        let c = core();
+        let ledger = tmp_ledger("layer");
+        let mut r = commit(
+            &ledger,
+            &c,
+            &Draft {
+                op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "悬空的",
+                x: 3, y: 4, layer: 20, kind: 3, height: 9, ts: 9,
+            },
+        );
+        assert_eq!(r.layer, 20);
+        r.layer = 21;
+        r.sig_hex = hex::encode(crypto::sign(&c.signing_key, &record_hash(&r)));
+        let (state, rep) = replay(&[r]);
+        assert!(!rep.ok);
+        assert!(rep.reason.contains("实体 id"), "{}", rep.reason);
+        assert!(state.is_empty());
+        let _ = std::fs::remove_file(ledger.path());
+    }
+
     #[test]
     fn chunk_root_is_a_set_commitment() {
         let mut state = BTreeMap::new();
@@ -652,7 +802,7 @@ mod tests {
             state.insert(
                 id.to_string(),
                 Entity {
-                    entity_id_hex: id.into(), name: "n".into(), x, y: 2, kind: 0,
+                    entity_id_hex: id.into(), name: "n".into(), x, y: 2, layer: 0, kind: 0,
                     owner: "ql1x".into(), parent_hex: String::new(), era: 1,
                     created_height: 1, created_ts: 1, last_height: 1, released: false,
                 },

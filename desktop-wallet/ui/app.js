@@ -42,6 +42,7 @@ document.querySelectorAll(".sb-item").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".sb-item").forEach((b) => b.classList.toggle("active", b === btn));
     pages.forEach((p) => $(`page-${p}`).classList.toggle("hidden", p !== btn.dataset.page));
+    if (btn.dataset.page !== "world") closeWorld3D(); // 离开世界页就把第一人称视图收掉，不停止渲染还白烧 GPU
     // 切页即刷新：活动列表/余额立刻反映最新账本
     if (!$("view-main").classList.contains("hidden")) refreshAll().catch(() => {});
   });
@@ -309,10 +310,11 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 const wcvs = $("world-canvas");
 const wctx = wcvs.getContext("2d");
 let worldSnap = null;
-let terrain = { sig: "", rgb: null, era1: 0, ents: 0, fp: "" };
+let terrain = { sig: "", rgb: null, era1: 0, ents: 0, fp: "", heights: null, blocks: null };
 let wSlot = 0;
 let wSel = ""; // 选中实体 id（空 = 未选中）
 let wProof = { id: "", json: "" }; // 展开的可验证记录（2 秒轮询重渲染时不能丢）
+let w3 = null; // 第一人称体素编辑器（惰性创建）
 
 const worldActive = () => !$("page-world").classList.contains("hidden");
 const worldErr = (m) => { $("err-world").textContent = m; $("ok-world").hidden = true; };
@@ -330,9 +332,19 @@ function buildTerrain(s) {
   const sig = terrainSig(s);
   if (terrain.sig !== sig || !terrain.rgb) {
     const out = QLWorld.render(QLWorld.seedWords(s.genesis_hash_hex, s.vrfs));
-    terrain = { sig, rgb: out.rgb, era1: out.era1, ents: out.entities, fp: QLWorld.fingerprint(out.rgb) };
+    terrain = {
+      sig, rgb: out.rgb, era1: out.era1, ents: out.entities,
+      fp: QLWorld.fingerprint(out.rgb), heights: out.heights, blocks: out.blocks,
+    };
   }
   return terrain;
+}
+
+/** 贴地高度层：与链侧同一个算式（layer = 高度场 >> 3），2D 页放的东西落地就在这个层 */
+function surfaceLayer(x, z) {
+  const t = buildTerrain(worldSnap);
+  if (!t.heights) return 0;
+  return t.heights[z * QLWorld.W + x] >> QLWorld3D.LEVEL_SHIFT;
 }
 
 function paintWorld() {
@@ -340,7 +352,8 @@ function paintWorld() {
   const s = worldSnap;
   QLWorld.paint(wctx, buildTerrain(s).rgb);
   for (const e of s.entities) {
-    wctx.fillStyle = e.released ? "rgba(150,150,150,.75)" : KIND_COLORS[e.kind] || KIND_COLORS[0];
+    if (e.released) continue; // 断租不删除，但也不再显形/占格（与 world.rs live_at 同判据）
+    wctx.fillStyle = KIND_COLORS[e.kind] || KIND_COLORS[0];
     wctx.fillRect(e.x - 1, e.y - 1, 3, 3);
     if (s.address && e.owner === s.address) {
       wctx.strokeStyle = "#E3B54A";
@@ -384,6 +397,7 @@ function renderF3() {
     [t("world.f3.era1"), `${tr.era1}`],
     [t("world.f3.nat"), `${tr.ents}`],
     [t("world.f3.ent"), `${s.entities.length}`],
+    [t("world.f3.layers"), `${s.max_layer} · ${t("world.f3.layers.note")}`],
     [t("world.f3.chunks"), `${s.chunks.length}`],
     [t("world.f3.addr"), s.address ? `<span class="cpy mono" data-copy="${s.address}">${short(s.address)}</span>` : `<span class="muted">${t("world.locked")}</span>`],
   ];
@@ -402,7 +416,7 @@ function renderParentSelect() {
   const mine = s.entities.filter((e) => e.owner === s.address && !e.released);
   sel.innerHTML =
     `<option value="">${t("world.parent.none")}</option>` +
-    mine.map((e) => `<option value="${e.entity_id_hex}">${esc(e.name)} · ${e.x},${e.y}</option>`).join("");
+    mine.map((e) => `<option value="${e.entity_id_hex}">${esc(e.name)} · ${e.x},${e.y},${e.layer}</option>`).join("");
   if (keep && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
 }
 
@@ -423,7 +437,7 @@ function renderEntList() {
         <i class="kd" style="background:${e.released ? "#9AA7BD" : KIND_COLORS[e.kind] || KIND_COLORS[0]}"></i>
         <div class="er-main">
           <div class="er-n">${esc(e.name)}${e.era === 1 ? ` <span class="tag era1">${t("world.sel.era1")}</span>` : ""}${e.released ? ` <span class="tag">${t("world.unowned")}</span>` : ""}</div>
-          <div class="er-m">X ${e.x} · Z ${e.y} · ${t(`world.kind.${e.kind}`)} · #${e.last_height}</div>
+          <div class="er-m">X ${e.x} · Z ${e.y} · Y ${e.layer} · ${t(`world.kind.${e.kind}`)} · #${e.last_height}</div>
         </div>
         <div class="er-o">${e.owner === s.address ? t("world.own") : ""}</div>
       </div>`
@@ -439,6 +453,7 @@ function selectEnt(id) {
   if (!e) return;
   $("ent-x").value = e.x;
   $("ent-z").value = e.y;
+  $("ent-layer").value = e.layer;
   if (!$("ent-name").value.trim()) $("ent-name").value = e.name;
   renderEntList();
   renderSelected();
@@ -471,7 +486,7 @@ function renderSelected() {
     <div class="es-name"><i class="kd" style="background:${e.released ? "#9AA7BD" : KIND_COLORS[e.kind] || KIND_COLORS[0]}"></i>${esc(e.name)}</div>
     <dl class="f3">
       ${r(t("world.sel.id"), `<span class="cpy mono" data-copy="${e.entity_id_hex}" title="${t("hist.copy")}">${idShort(e.entity_id_hex)}</span>`)}
-      ${r("X · Z", `${e.x} · ${e.y}`)}
+      ${r("X · Z · Y", `${e.x} · ${e.y} · ${e.layer}`)}
       ${r(t("world.sel.kind"), t(`world.kind.${e.kind}`))}
       ${r(t("world.sel.owner"), own ? t("world.own") : e.released ? t("world.unowned") : `<span class="mono">${short(e.owner)}</span>`)}
       ${r(t("world.sel.era"), e.era === 1 ? t("world.sel.era1") : t("world.sel.eraN", { n: e.era }))}
@@ -489,6 +504,7 @@ function renderWorld() {
   renderEntList();
   renderSelected();
   paintWorld();
+  syncWorld3D();
 }
 
 async function loadWorld() {
@@ -535,7 +551,8 @@ wcvs.addEventListener("mousemove", (ev) => {
   const cx = c.x >> 4, cy = c.y >> 4;
   const ch = worldSnap.chunks.find((k) => k.cx === cx && k.cy === cy);
   el.textContent =
-    `X ${c.x} · Z ${c.y} · chunk ${cx},${cy}` +
+    `X ${c.x} · Z ${c.y} · Y ${surfaceLayer(c.x, c.y)}` +
+    (ch ? ` · chunk ${cx},${cy}` : "") +
     (ch ? ` · ${t("world.f3.ch", { n: ch.count })} ${ch.root_hex.slice(0, 8)}…` : "");
 });
 
@@ -545,6 +562,7 @@ wcvs.addEventListener("click", (ev) => {
   const c = toCell(ev);
   if (!c || !worldSnap) return;
   const hit = worldSnap.entities
+    .filter((e) => !e.released)
     .map((e) => ({ e, d: Math.abs(e.x - c.x) + Math.abs(e.y - c.y) }))
     .sort((a, b) => a.d - b.d)[0];
   if (hit && hit.d <= 3) {
@@ -552,6 +570,7 @@ wcvs.addEventListener("click", (ev) => {
   } else {
     $("ent-x").value = c.x;
     $("ent-z").value = c.y;
+    $("ent-layer").value = surfaceLayer(c.x, c.y);
     renderEntList();
     renderSelected();
     paintWorld();
@@ -569,6 +588,7 @@ $("btn-place").addEventListener("click", async () => {
       name,
       x: Number($("ent-x").value),
       y: Number($("ent-z").value),
+      layer: Number($("ent-layer").value),
       kind: wSlot,
       parentHex: $("ent-parent").value,
     });
@@ -609,9 +629,9 @@ $("ent-sel").addEventListener("click", async (e) => {
       await invoke("world_rename", { entityIdHex: wSel, name });
       worldOk(t("world.ok.renamed", { name }));
     } else if (act === "move") {
-      const x = Number($("ent-x").value), y = Number($("ent-z").value);
-      await invoke("world_move", { entityIdHex: wSel, x, y });
-      worldOk(t("world.ok.moved", { x, y }));
+      const x = Number($("ent-x").value), y = Number($("ent-z").value), layer = Number($("ent-layer").value);
+      await invoke("world_move", { entityIdHex: wSel, x, y, layer });
+      worldOk(t("world.ok.moved", { x, y, layer }));
     } else if (act === "release") {
       if (!confirm(t("world.confirm.release", { name: e0.name }))) return;
       await invoke("world_release", { entityIdHex: wSel });
@@ -636,6 +656,182 @@ $("world-f3").addEventListener("click", async (e) => {
   const old = el.textContent;
   el.textContent = t("recv.copied");
   setTimeout(() => (el.textContent = old), 1200);
+});
+
+// —— 第一人称体素编辑（Minecraft 式创造）：地形仍是本机算出来的，只有签了名的方块才占格
+
+const w3toast = $("w3d-toast");
+let w3Busy = false, w3HudAt = 0, w3ToastTimer = 0, w3Spawned = false;
+
+function w3Toast(msg, bad) {
+  w3toast.hidden = false;
+  w3toast.textContent = msg;
+  w3toast.classList.toggle("bad", !!bad);
+  clearTimeout(w3ToastTimer);
+  w3ToastTimer = setTimeout(() => (w3toast.hidden = true), 3800);
+}
+
+/** 方块自动命名「类型·坐标」：第一人称里手打名字不现实，回来在列表里改 */
+function w3Name(slot, x, z, layer) {
+  return `${t(`world.kind.${slot}`)}·${x}_${z}_${layer}`.slice(0, 40);
+}
+
+/** 出生点：以当前编辑框里的格子为圆心往外找一块不是水的陆地 */
+function pickSpawn(x, z) {
+  const t = buildTerrain(worldSnap);
+  if (!t.blocks) return { x: 128, z: 128 };
+  const W = QLWorld.W, H = QLWorld.H;
+  const land = (cx, cz) => cx >= 0 && cz >= 0 && cx < W && cz < H && (t.blocks[cz * W + cx] & 7) !== 0;
+  if (land(x, z)) return { x, z };
+  for (let r = 1; r <= 60; r++) {
+    for (let d = 0; d < 8 * r; d++) {
+      const side = d % r, ring = (d / r) | 0;
+      const cx = ring === 0 ? x + r - side : ring === 1 ? x - r + side : ring === 2 ? x + r : x - r;
+      const cz = ring === 0 ? z - r : ring === 1 ? z + r : ring === 2 ? z + r - side : z - r + side;
+      if (land(cx, cz)) return { x: cx, z: cz };
+    }
+  }
+  return { x, z };
+}
+
+function ensureWorld3D() {
+  if (w3) return true;
+  try {
+    w3 = QLWorld3D.create($("w3d-canvas"), {
+      onUnsupported: () => { w3Toast(t("world3d.unsupported"), true); closeWorld3D(); },
+      onSlot: (i) => { wSlot = i; buildHotbar(); buildW3Hotbar(); if (w3) w3.setSlot(i); },
+      onPlace: (x, z, layer) => w3Place(x, z, layer, wSlot),
+      onBreak: (x, z, layer, ent) => w3Break(ent),      onBlocked: () => w3Toast(t("world3d.err.blocked"), true),
+      onEmpty: () => w3Toast(t("world3d.err.notarget"), true),
+      onLock: (on) => { $("w3d-cross").classList.toggle("locked", on); w3Hint(); },
+      onFrame: (s) => { const n = performance.now(); if (n - w3HudAt > 120) { w3HudAt = n; renderW3Hud(s); } },
+      onClose: () => closeWorld3D(),
+    });
+  } catch (e) {
+    w3 = null;
+    worldErr(String(e));
+    return false;
+  }
+  if (!w3) return false;
+  syncWorld3D();
+  return true;
+}
+
+function syncWorld3D() {
+  if (!w3 || !worldSnap) return;
+  const t = buildTerrain(worldSnap);
+  w3.setWorld(t.heights, t.blocks);
+  w3.setMaxLayer(worldSnap.max_layer || QLWorld3D.MAX_LAYER);
+  w3.setColors(KIND_COLORS);
+  w3.setEntities(worldSnap.entities, worldSnap.address);
+  w3.setSlot(wSlot);
+}
+
+function buildW3Hotbar() {
+  const n = worldSnap ? worldSnap.slot_count : 8;
+  const bar = $("w3d-hotbar");
+  bar.innerHTML = "";
+  for (let i = 0; i < n; i++) {
+    const b = document.createElement("button");
+    b.className = "hs" + (i === wSlot ? " active" : "");
+    b.dataset.slot = String(i);
+    b.type = "button";
+    b.title = t(`world.kind.${i}`);
+    b.innerHTML = `<i class="kd" style="background:${KIND_COLORS[i]}"></i><b>${i + 1}</b>`;
+    bar.appendChild(b);
+  }
+}
+
+function w3Hint() {
+  $("w3d-hint").textContent = t("world3d.hint");
+}
+
+function renderW3Hud(s) {
+  const s0 = worldSnap;
+  if (!s0) return;
+  const tg = s.target;
+  const ch = s0.chunks.find((k) => k.cx === (s.x >> 4) && k.cy === (s.z >> 4));
+  const row = (k, v, cls = "") => `<div class="f3k">${k}</div><div class="f3v ${cls}">${v}</div>`;
+  const pos = row(t("world3d.f3.pos"), `X ${s.x} · Y ${s.layer} · Z ${s.z}`);
+  const surf = row(t("world3d.f3.surface"), `${s.surface} · ${t(`world3d.biome.${s.block & 7}`)}`);
+  const tgt = row(t("world3d.f3.target"), tg ? `${tg.cx}, ${tg.layer}, ${tg.cz}${tg.entity ? ` · ${esc(tg.entity.name)}` : ""}` : "—", tg && tg.entity && tg.entity.owner === s0.address ? "gold" : "");
+  const plc = row(t("world3d.f3.place"), tg ? (tg.place ? `${tg.place.cx}, ${tg.place.layer}, ${tg.place.cz}` : t("world3d.f3.nospace")) : "—");
+  const slot = row(t("world3d.f3.slot"), `${wSlot + 1} · ${t(`world.kind.${wSlot}`)}`);
+  const chn = row(t("world3d.f3.chunk"), ch ? `${ch.count} · ${ch.root_hex.slice(0, 8)}…` : "0");
+  const fp = row(t("world3d.f3.fp"), `<span class="mono gold">${terrain.fp}</span>`);
+  const fps = row("FPS", `${s.fps}${s.locked ? "" : " · " + t("world3d.f3.unlocked")}`);
+  $("w3d-f3").innerHTML = [pos, surf, tgt, plc, slot, chn, fp, fps].join("");
+}
+
+async function w3Place(x, z, layer, slot) {
+  if (w3Busy) return;
+  if (!worldSnap || !worldSnap.unlocked) { w3Toast(t("world.err.locked"), true); return; }
+  w3Busy = true;
+  try {
+    const rec = await invoke("world_place", {
+      name: w3Name(slot, x, z, layer), x, y: z, layer, kind: slot, parentHex: "",
+    });
+    wSel = rec.entity_id_hex;
+    w3Toast(t("world.ok.placed", { name: rec.name, id: idShort(rec.entity_id_hex) }));
+    await loadWorld();
+  } catch (e) {
+    w3Toast(String(e), true);
+  }
+  w3Busy = false;
+}
+
+async function w3Break(ent) {
+  if (!ent) { w3Toast(t("world3d.err.terrain"), true); return; }
+  if (!worldSnap || !worldSnap.unlocked) { w3Toast(t("world.err.locked"), true); return; }
+  if (ent.owner !== worldSnap.address) { w3Toast(t("world3d.err.notown"), true); return; }
+  if (!confirm(t("world.confirm.release", { name: ent.name }))) return;
+  try {
+    await invoke("world_release", { entityIdHex: ent.entity_id_hex });
+    w3Toast(t("world.ok.released", { name: ent.name }));
+    await loadWorld();
+  } catch (e) {
+    w3Toast(String(e), true);
+  }
+}
+
+async function openWorld3D() {
+  if (!worldSnap) {
+    try {
+      await loadWorld();
+    } catch (e) {
+      worldErr(String(e));
+      return;
+    }
+  }
+  $("w3d").hidden = false;
+  document.body.classList.add("w3d-on");
+  if (!ensureWorld3D()) { closeWorld3D(); return; }
+  buildW3Hotbar();
+  w3Hint();
+  if (!w3Spawned) {
+    const c = pickSpawn(Number($("ent-x").value) || 128, Number($("ent-z").value) || 128);
+    w3.jumpTo(c.x, c.z, null);
+    w3Spawned = true;
+  }
+  w3.open();
+}
+
+function closeWorld3D() {
+  if ($("w3d").hidden && !w3) return;
+  if (w3) w3.close();
+  $("w3d").hidden = true;
+  document.body.classList.remove("w3d-on");
+}
+
+$("btn-w3d").addEventListener("click", openWorld3D);
+$("w3d-exit").addEventListener("click", () => closeWorld3D());
+$("w3d-hotbar").addEventListener("click", (e) => {
+  const b = e.target.closest(".hs");
+  if (!b) return;
+  wSlot = Number(b.dataset.slot);
+  buildHotbar();
+  buildW3Hotbar();
+  if (w3) w3.setSlot(wSlot);
 });
 
 // ---------------------------------------------------------------- 出块事件（实时推送）

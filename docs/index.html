@@ -287,8 +287,9 @@
       <div class="axiom">
         <span class="eq"><code>world = render(种子, 规则, 历史)</code></span>
         <p>它与区块链的状态转移 <code>state(n+1) = f(state(n), tx(n))</code> 是<b>同一个数学对象</b>，不是类比。
-        链就是世界的存档：种子 = 创世哈希 ⊕ 全部块 VRF，历史 = 你挖出的每一个块。
-        <b>多挖一个块，大陆就真的多长出一块。</b></p>
+        链就是世界的存档：<b>大地</b>只由创世哈希决定，<b>地表</b>才混入全部块 VRF，历史 = 你挖出的每一个块。
+        <b>山的位置永远不动，植被与地貌随链生长</b>——地面若每出一个块就漂移一次，
+        <code>(x, z, layer)</code> 就不再是可验证的承诺，签了名的塔会被埋进地里。</p>
       </div>
       <div class="ctrl">
         <button class="wbtn on" id="btnGenesis">只有创世（零历史）</button>
@@ -308,7 +309,7 @@
       <div class="ico">🔗</div>
       <h3>币不是世界的燃料，币就是世界</h3>
       <p>转账不是在给某个外部游戏充能——<b>转账就是在改变地貌</b>。本页默认大陆指纹
-      <b>9171377071cd48c4</b>，与仓库里 <b>Python</b> 参考实现逐位一致：两种完全不同的运行时，同一片大陆。
+      <b>bb95cc46d3bc8f90</b>，与仓库里 <b>Python</b> 参考实现逐位一致：两种完全不同的运行时，同一片大陆。
       确定性不是运气，是纪律（纯整数、只用 2 的幂、禁平台数学库）。</p>
     </div>
     <div class="card">
@@ -328,10 +329,12 @@
   </div>
 
   <p class="world-note">
-    点「篡改规则常量 +1」：一个常量之差，整片大陆面目全非，指纹从 <b>9171377071cd48c4</b> 跳到
-    <b>41e82c04605a381e</b>，而 Python 与本页<b>同时</b>跳——这就是规则集必须版本化、并与创世绑定的原因。
-    而且这不只是网页演示：桌面钱包的 <b>🌍 世界</b>页就是编辑器——点一格、选一个槽位（石碑/篝火/树屋/灯塔/花园/水晶/工坊/图腾）、
-    签一条 <b>ML-DSA-65</b> 记录，实体就永久进账本；<b>链只保存坐标与归属，像素仍然在每台本机各自算出来</b>。
+    点「篡改规则常量 +1」：一个常量之差，整片大陆面目全非，指纹从 <b>bb95cc46d3bc8f90</b> 跳到
+    <b>f4f3ee18cd05b9d2</b>，而 Python 与本页<b>同时</b>跳——这就是规则集必须版本化、并与创世绑定的原因。
+    而且这不只是网页演示：桌面钱包的 <b>🌍 世界</b>页就是编辑器——俯视图点一格、选一个槽位（石碑/篝火/树屋/灯塔/花园/水晶/工坊/图腾），
+    或者按「进入世界」以<b>第一人称</b>走进去，右键落下方块、左键拆掉自己签的方块，低头对准脚下连点就是一层一层原地起柱；
+    每一次编辑都是一条 <b>ML-DSA-65</b> 记录，永久进账本，任何第三方重放 <b>entities.jsonl</b> 都能复算出同一个世界。
+    <b>链只保存坐标与归属，像素仍然在每台本机各自算出来。</b>
     完整规格见 <a href="https://github.com/yuanhong792/qlight-wallet/blob/main/DESIGN.md#9-元宇宙运行时l2" target="_blank">DESIGN.md §9</a>，
     参考实现见 <a href="https://github.com/yuanhong792/qlight-wallet/tree/main/tools/world" target="_blank">tools/world/</a>
     （本渲染器 <a href="world.js" target="_blank">world.js</a> 全文可读，约 180 行，无依赖）。
@@ -382,11 +385,14 @@
 <script src="world.js"></script>
 <script>
   (function () {
-    var BASE_RULES = 0xca3318e0;
-    /* 只有这两种情形有公开基准：任何人 clone 仓库跑一次 python3 tools/world/world.py 就能重算 */
+    var BASE_RULES = 0xd120fe8f;
+    /* 只有这几种情形有公开基准：任何人 clone 仓库跑一次 python3 tools/world/world.py 就能重算 */
     var EXPECT = {};
-    EXPECT['0|base'] = '9171377071cd48c4';
-    EXPECT['0|tamper'] = '41e82c04605a381e';
+    EXPECT['0|base'] = 'bb95cc46d3bc8f90';
+    EXPECT['0|tamper'] = 'f4f3ee18cd05b9d2';
+    /* 大地指纹 = 只由创世哈希决定的高度场。它必须与历史无关：
+       地面若随块漂移，(x, z, layer) 就不是可验证的承诺，签了名的塔会被埋进地里。 */
+    EXPECT.heights = '7b2863f076bce5fa';
 
     var cv = document.getElementById('worldCanvas');
     var ctx = cv.getContext('2d');
@@ -413,10 +419,13 @@
       } else { v.textContent = '换个运行时必须得到同一个值'; v.className = ''; }
 
       var total = QLWorld.W * QLWorld.H;
+      var hfp = QLWorld.fingerprint(out.heights);
       document.getElementById('stats').innerHTML =
-        '种子 = 创世哈希 ⊕ ' + vrfs.length + ' 个块 VRF · 块 <b>' + vrfs.length + '</b>' +
+        '大地 = 创世哈希（与历史无关）· 地表 = 创世哈希 ⊕ ' + vrfs.length + ' 个块 VRF · 块 <b>' + vrfs.length + '</b>' +
         ' · 金色地标 <b>' + out.era1 + '</b>/' + total +
-        ' · 实体 <b>' + out.entities + '</b>' + (notice ? ' · ' + notice : '');
+        ' · 实体 <b>' + out.entities + '</b>' +
+        ' · 大地指纹 <b>' + hfp + '</b> ' + (hfp === EXPECT.heights ? '✓' : '✗ 与基准分叉') +
+        (notice ? ' · ' + notice : '');
     }
 
     function ingest(text) {

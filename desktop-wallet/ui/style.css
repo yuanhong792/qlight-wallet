@@ -375,3 +375,52 @@ body {
 .er-m { font-size: 11px; color: var(--muted); font-family: "SF Mono", Menlo, monospace; margin-top: 2px; }
 .er-o { font-size: 11px; color: var(--gold-dk); font-weight: 600; flex-shrink: 0; }
 .tag.era1 { background: linear-gradient(135deg, #FCEBA8, var(--gold)); color: #3A2A05; border-color: rgba(168,122,24,.4); }
+
+/* ---------- 第一人称体素编辑器（Minecraft 式创造） ---------- */
+.send-grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 10px; }
+.w3d-enter { width: 100%; margin-top: 12px; }
+
+.w3d { position: fixed; inset: 0; z-index: 80; background: #0B0F16; }
+.w3d[hidden] { display: none; }
+#w3d-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+
+.w3d-cross { position: absolute; left: 50%; top: 50%; width: 20px; height: 20px; transform: translate(-50%,-50%); pointer-events: none; opacity: .75; }
+.w3d-cross::before, .w3d-cross::after { content: ""; position: absolute; background: #FFFFFF; box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
+.w3d-cross::before { left: 9px; top: 0; width: 2px; height: 20px; }
+.w3d-cross::after { top: 9px; left: 0; height: 2px; width: 20px; }
+.w3d-cross.locked { opacity: 1; }
+.w3d-cross.locked::before, .w3d-cross.locked::after { background: var(--gold-lt); }
+
+.w3d-f3 {
+  position: absolute; left: 14px; top: 14px; display: grid; grid-template-columns: auto auto;
+  gap: 2px 12px; padding: 10px 12px; border-radius: 10px; pointer-events: none;
+  background: rgba(10,14,20,.62); border: 1px solid rgba(255,255,255,.14);
+  font-family: "SF Mono", Menlo, monospace; font-size: 11px; line-height: 1.5; color: #E6EAF2;
+}
+.w3d-f3 .f3k { color: #93A0B4; }
+.w3d-f3 .f3v { color: #E6EAF2; text-align: right; word-break: break-all; }
+.w3d-f3 .f3v.gold { color: var(--gold-lt); }
+
+.w3d-hotbar { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); margin: 0; gap: 8px; }
+.w3d-hotbar .hs { background: rgba(10,14,20,.6); border-color: rgba(255,255,255,.2); }
+.w3d-hotbar .hs b { color: #C7D0DE; }
+.w3d-hotbar .hs.active { background: rgba(227,181,74,.22); border-color: var(--gold); box-shadow: 0 0 0 3px rgba(227,181,74,.2); }
+
+.w3d-hint {
+  position: absolute; left: 50%; bottom: 6px; transform: translateX(-50%); pointer-events: none;
+  font-size: 11px; color: rgba(230,234,242,.72); font-family: "SF Mono", Menlo, monospace;
+  max-width: 92%; text-align: center;
+}
+.w3d-toast {
+  position: absolute; left: 50%; top: 18px; transform: translateX(-50%); max-width: 70%;
+  padding: 9px 16px; border-radius: 999px; font-size: 13px; font-weight: 600;
+  background: rgba(52,168,83,.92); color: #06170C; border: 1px solid rgba(255,255,255,.25);
+}
+.w3d-toast.bad { background: rgba(229,72,77,.94); color: #FFF1F1; }
+.w3d-toast[hidden] { display: none; }
+.w3d-exit {
+  position: absolute; right: 14px; top: 14px; padding: 7px 14px; border-radius: 999px; cursor: pointer;
+  background: rgba(10,14,20,.6); color: #E6EAF2; border: 1px solid rgba(255,255,255,.22); font-size: 12.5px;
+}
+.w3d-exit:hover { border-color: var(--gold); color: var(--gold-lt); }
+@media (max-width: 780px) { .w3d-f3 { font-size: 10px; } .w3d-hint { font-size: 10px; } }

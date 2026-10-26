@@ -162,6 +162,7 @@
           <canvas id="world-canvas" width="256" height="256" aria-label="world"></canvas>
           <div class="hotbar" id="world-hotbar"></div>
           <div class="world-cursor" id="world-cursor">X – · Z –</div>
+          <button id="btn-w3d" class="btn-primary w3d-enter" data-i18n="world3d.enter">进入世界（第一人称编辑）</button>
           <div class="muted small" data-i18n="world.map.note"></div>
         </div>
 
@@ -177,10 +178,12 @@
           <div class="panel">
             <div class="panel-title"><span data-i18n="world.editor">世界编辑器</span> <span class="tag" id="world-slot-tag">slot 0</span></div>
             <input id="ent-name" type="text" maxlength="64" data-i18n-ph="world.name.ph" placeholder="给它起个名字" spellcheck="false">
-            <div class="send-grid2">
+            <div class="send-grid3">
               <input id="ent-x" type="number" min="0" max="255" value="0" data-i18n-ph="world.x.ph" placeholder="X">
               <input id="ent-z" type="number" min="0" max="255" value="0" data-i18n-ph="world.z.ph" placeholder="Z">
+              <input id="ent-layer" type="number" min="0" max="63" value="0" data-i18n-ph="world.y.ph" placeholder="Y">
             </div>
+            <div class="muted small" data-i18n="world.y.note"></div>
             <select id="ent-parent" class="w-select"></select>
             <button id="btn-place" class="btn-primary inline" data-i18n="world.btn.place">签名并放置</button>
             <div class="error" id="err-world"></div>
@@ -251,11 +254,23 @@
         <p class="muted small" data-i18n="about.net"></p>
       </div>
     </section>
+
+    <!-- 第一人称体素编辑器：地形本地算，方块签了名才存在 -->
+    <div id="w3d" class="w3d" hidden>
+      <canvas id="w3d-canvas"></canvas>
+      <div class="w3d-cross" id="w3d-cross"></div>
+      <dl class="w3d-f3" id="w3d-f3"></dl>
+      <div class="hotbar w3d-hotbar" id="w3d-hotbar"></div>
+      <div class="w3d-hint" id="w3d-hint"></div>
+      <div class="w3d-toast" id="w3d-toast" hidden></div>
+      <button type="button" id="w3d-exit" class="w3d-exit" data-i18n="world3d.exit">离开世界</button>
+    </div>
   </main>
 </div>
 
 <script src="i18n.js"></script>
 <script src="world.js"></script>
+<script src="world3d.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
