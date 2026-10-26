@@ -91,6 +91,10 @@ pub struct TxRecordDto {
     pub ts_unix: u64,
     pub direction: String, // "out" | "in"
     pub counterparty: String,
+    /// 全量明细：完整地址与完整交易哈希（活动页点击复制用）
+    pub from: String,
+    pub to: String,
+    pub hash: String,
     pub amount: u64,
     pub fee: u64,
 }
@@ -116,6 +120,9 @@ pub fn tx_history(state: AppCtx) -> Vec<TxRecordDto> {
             } else {
                 r.from.clone()
             },
+            from: r.from.clone(),
+            to: r.to.clone(),
+            hash: r.hash_hex.clone(),
             amount: r.amount,
             fee: r.fee,
         })

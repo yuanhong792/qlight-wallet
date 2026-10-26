@@ -121,6 +121,18 @@ $("btn-copy").addEventListener("click", async () => {
 });
 $("addr-mini").addEventListener("click", () => navigator.clipboard.writeText($("addr").textContent));
 
+// 活动页：点击地址/哈希复制完整值（事件委托——2 秒轮询重渲染列表也不失效）
+$("tx-list").addEventListener("click", async (e) => {
+  const el = e.target.closest(".cpy");
+  if (!el) return;
+  const v = el.dataset.copy || "";
+  if (!v) return;
+  try { await navigator.clipboard.writeText(v); } catch { return; }
+  const old = el.textContent;
+  el.textContent = t("recv.copied");
+  setTimeout(() => (el.textContent = old), 1200);
+});
+
 // ---------------------------------------------------------------- 数据刷新
 
 let stateCache = { balance: 0, height: 0, minted: 0, hard_cap: 1, reward_per_block: 0, decimals: 9 };
@@ -146,7 +158,7 @@ async function refreshAll() {
   $("stat-cap").textContent = `${capPct.toFixed(6)}%`;
   $("cap-bar").style.width = `${Math.max(capPct, 0.0000002)}%`;
 
-  // 活动页
+  // 活动页（明细版：对方地址可点复制 / 精确时间 / 块高 / 完整哈希 / 真实手续费）
   const hist = await invoke("tx_history");
   const list = $("tx-list");
   if (!hist.length) {
@@ -155,15 +167,17 @@ async function refreshAll() {
     list.innerHTML = hist
       .map((x) => {
         const out = x.direction === "out";
+        const cp = out ? x.to : x.from;
         return `<div class="tx-item">
           <div class="tx-ico ${out ? "out" : "in"}">${out ? "↑" : "↓"}</div>
           <div class="tx-main">
-            <div class="t1">${t(out ? "hist.out" : "hist.in")} · ${short(x.counterparty)}</div>
-            <div class="t2">${t("hist.hashline", { hash: x.hash_short, h: x.height, ts: ts(x.ts_unix) })}</div>
+            <div class="t1">${t(out ? "hist.out" : "hist.in")} · <span class="cpy" data-copy="${cp}" title="${t("hist.copy")}">${short(cp)}</span></div>
+            <div class="t2">⏱ ${ts(x.ts_unix)} · #${x.height}</div>
+            <div class="t3"><span class="cpy" data-copy="${x.hash}" title="${t("hist.copy")}">${x.hash_short}</span></div>
           </div>
           <div class="tx-amt">
             <div class="a1 ${out ? "minus" : "plus"}">${out ? "−" : "+"}${fmtAmt(x.amount)} QLX</div>
-            <div class="a2">${t("hist.fee")}</div>
+            <div class="a2">${t("hist.fee", { f: fmtAmt(x.fee) })}</div>
           </div>
         </div>`;
       })
