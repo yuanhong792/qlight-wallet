@@ -87,6 +87,7 @@ pub fn run() {
             commands::export_backup,
             commands::import_backup,
             commands::net_status,
+            commands::app_version,
             commands::world_snapshot,
             commands::world_place,
             commands::world_rename,

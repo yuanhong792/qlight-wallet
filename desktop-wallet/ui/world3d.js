@@ -152,7 +152,7 @@
 
 
     var st = {
-      heights: null, blocks: null, entities: [], byCell: {}, address: '',
+      heights: null, blocks: null, entities: [], byCell: {}, address: '', entSig: '',
       slot: 0, slots: 16, colors: [], maxLayer: MAX_LAYER,
       x: 128.5, z: 128.5, y: 30, yaw: 0.6, pitch: -0.45,
       keys: {}, dirty: true, regionKey: '', target: null, locked: false, drag: false,
@@ -826,14 +826,28 @@
         }
       },
       setEntities: function (list, address) {
-        st.entities = list || []; st.address = address || '';
+        var ents = list || [];
+        // 快照每 2 秒就送一份全新数组（自己的写入和别人的写入都走这里）。只有几何
+        // 真的变了才重铺 64×64 区域网格，否则玩家站着不动也会被重建卡一下。
+        // 签名只算占格/层/种类：改名不改几何，断租（released）会改变活着的条数。
+        var sig = 0, live = 0;
+        for (var j = 0; j < ents.length; j++) {
+          var c = ents[j];
+          if (c.released) continue;
+          live++;
+          sig = (sig * 31 + c.x * 3 + c.y * 5 + c.layer * 7 + c.kind) | 0;
+        }
+        var sigKey = sig + ':' + live + ':' + ents.length + ':' + (address || '');
+        if (sigKey === st.entSig) return;
+        st.entSig = sigKey;
+        st.entities = ents; st.address = address || '';
         st.byCell = {};
         for (var i = 0; i < st.entities.length; i++) {
           var e = st.entities[i];
           if (e.released) continue; // 无主 = 不占格（与 world.rs live_at 同一判据）
-          var k = cellKey(e.x, e.y);
-          if (!st.byCell[k]) st.byCell[k] = [];
-          st.byCell[k].push(e);
+          var ck = cellKey(e.x, e.y);
+          if (!st.byCell[ck]) st.byCell[ck] = [];
+          st.byCell[ck].push(e);
         }
         st.dirty = true;
       },

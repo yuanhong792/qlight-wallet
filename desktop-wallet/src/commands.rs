@@ -433,6 +433,12 @@ pub fn net_status(state: AppCtx) -> serde_json::Value {
     })
 }
 
+/// 版本号唯一来源是 Cargo.toml —— 写进 8 个语言的文案里必然过期
+#[tauri::command]
+pub fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 // ---------------------------------------------------------------- 世界实体（DESIGN.md §9.11）
 
 /// 本机链的「已确认转账」索引（唯一数据来源是 blocks.jsonl）

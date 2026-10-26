@@ -10,6 +10,11 @@ BUNDLE_ID="net.qlight.wallet"
 APP_DIR="build/QLight.app"
 DMG="build/QLight-Wallet.dmg"
 
+# 版本唯一来源 = Cargo.toml（写死在脚本里必然和包体不一致）
+VER="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+test -n "$VER" || { echo "读不到 Cargo.toml 的 version"; exit 1; }
+echo "版本 v${VER}"
+
 echo "① cargo build --release ..."
 export PATH="$HOME/.cargo/bin:$PATH"
 # 外置盘会生成 ._ 资源叉文件，会破坏 tauri 的 build script —— 编译输出固定放内置盘
@@ -31,8 +36,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>${APP_NAME}</string>
     <key>CFBundleDisplayName</key><string>${APP_NAME}</string>
     <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
-    <key>CFBundleVersion</key><string>0.1.0</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>${VER}</string>
+    <key>CFBundleShortVersionString</key><string>${VER}</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>qlight-wallet</string>
     <key>CFBundleIconFile</key><string>icon</string>

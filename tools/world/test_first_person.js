@@ -10,6 +10,7 @@
  *   A 浅俯角连点 = 贴地铺开          B 低头对准脚下连点 = 同一列原地起柱
  *   C 自己垒的塔踩得住（support 含活方块）  D 左键拆 = 释放归属，块同时从三维与占格索引里消失
  *   E 准星落空必须有反馈（不许无声失败）    F 大地（高度场）钉死在创世哈希上，不随链长漂移
+ *   G 写完的方块当场显形（几何变了才重铺，轮询不卡）    G2 app.js 的快照刷新必须推给 3D 场景
  *
  * 用法：node tools/world/test_first_person.js
  */
@@ -47,6 +48,7 @@ const sendCv = (n, e) => (cvL[n] || []).forEach((f) => f(e));
 
 /* —— 最小 WebGL：只记录调用，不出图 —— */
 const GL = { ARRAY_BUFFER: 1, DYNAMIC_DRAW: 2, FLOAT: 3, TRIANGLES: 4, LINES: 5, DEPTH_TEST: 6, CULL_FACE: 7, COLOR_BUFFER_BIT: 8, DEPTH_BUFFER_BIT: 9, VERTEX_SHADER: 10, FRAGMENT_SHADER: 11, COMPILE_STATUS: 12, LINK_STATUS: 13 };
+const glCalls = {};
 const gl = new Proxy({}, { get(o, k) {
   if (k in GL) return GL[k];
   if (['createShader', 'createProgram', 'createBuffer'].includes(k)) return () => ({});
@@ -54,7 +56,7 @@ const gl = new Proxy({}, { get(o, k) {
   if (['getShaderInfoLog', 'getProgramInfoLog'].includes(k)) return () => '';
   if (k === 'getAttribLocation') return (p, n) => (n === 'a_c' ? 1 : 0);
   if (k === 'getUniformLocation') return (p, n) => ({ n });
-  return () => undefined;
+  return () => { glCalls[k] = (glCalls[k] || 0) + 1; };
 }, set() { return true; } });
 
 global.window = global;
@@ -173,6 +175,43 @@ const hg = (l) => W.fingerprint(W.render(W.seedWords(W.GENESIS_HASH, l)).heights
 check('F 创世哈希 = 仓库锚定值', W.GENESIS_HASH === '5dc2205a8f0153a05f84e26ab94086009796bb68fdfddff439f97ebfd2aa3104', W.GENESIS_HASH.slice(0, 12));
 check('F 高度场指纹 = 7b2863f076bce5fa（与 test_rules_v2.py 同一常量）', hg([]) === '7b2863f076bce5fa', hg([]));
 check('F 0 / 240 / 250 个块的历史渲染出同一片大地', hg(vrfs) === hg([]) && hg(vrfs.concat([hex64()])) === hg([]), hg(vrfs));
+
+/* G 快照 → 3D 场景的推送（app.js 的 loadWorld 每 2 秒做一次）
+ *   玩家报的「造了东西只弹一个坐标，币面上什么都没有」就是这一步从未发生：
+ *   实体表只在 openWorld3D 推一次，写完必须关了重开才显形。
+ *   反过来，轮询每次都重铺 64×64 区域网格会让站着不动也卡一下，
+ *   所以 setEntities 只对"几何真的变了"回应，签名漏改才是回归。 */
+const up = () => { const b = glCalls.bufferData || 0; frame(); return (glCalls.bufferData || 0) - b; };
+const feet = () => { w3.jumpTo(sx, sz, null); return w3.state().layer; };
+const burn = () => frame();          // jumpTo 也会置 dirty：不计帧把它消掉，否则下一步计数不干净
+
+w3.jumpTo(sx, sz, null);
+const S0 = w3.state().surface;
+burn();
+const gEnt = (layer) => [{ entity_id_hex: 'g1', name: 'G1', x: sx, y: sz, layer, kind: 0, owner: ADDR, released: false }];
+
+const gNew = (() => { w3.setEntities(gEnt(S0 + 1), ADDR); return up(); })();
+const feetNew = feet();
+burn();
+/* 条数不变、只有层号变：签名如果只数条数，这一步就会被吞掉，块永远停在旧层 */
+const gMove = (() => { w3.setEntities(gEnt(S0 + 2), ADDR); return up(); })();
+const feetMove = feet();
+burn();
+/* 内容完全一致的第二次推送（新数组、新对象）：不许重铺 */
+const gPoll = (() => { w3.setEntities(gEnt(S0 + 2).map((e) => ({ ...e })), ADDR); return up(); })();
+
+check('G 新块推进场景必须重铺网格', gNew > 0, gNew);
+check('G 新块踩得住（脚在块顶上一层）', feetNew === S0 + 2, { S0, feetNew });
+check('G 同格上移一层（条数不变）也必须重铺', gMove > 0 && gMove === gNew, { gNew, gMove });
+check('G 上移后脚下高度跟着变（签名没吞掉几何变化）', feetMove === S0 + 3, { S0, feetMove });
+check('G 内容未变的轮询不重铺', gPoll < gMove, { gMove, gPoll });
+
+/* G2 接线：上面全部走的是 harness 自己仿写的 onPlace→setEntities。
+ *   真正出问题的是 app.js 那一侧——实体表只在 openWorld3D 推过一次，
+ *   loadWorld 只刷了 2D 面板。这一行丢了，渲染器再对也照样"只弹坐标不见实物"。 */
+const appJs = require('fs').readFileSync(path.join(UI, 'app.js'), 'utf8');
+const loadWorldBody = (appJs.match(/async function loadWorld\(\)\s*\{[\s\S]*?\n\}/) || [''])[0];
+check('G2 app.js 的 loadWorld 把实体表推给开着的 3D 场景', /setEntities\s*\(/.test(loadWorldBody), loadWorldBody.slice(0, 150));
 
 let fail = 0;
 for (const r0 of results) {

@@ -19,6 +19,9 @@ const ts = (unix) => new Date(unix * 1000).toLocaleString(LANG === "en" ? "en-US
 // ---------------------------------------------------------------- i18n 接线
 
 applyI18n();
+invoke("app_version")
+  .then((v) => { window.__QLX_VERSION__ = v; applyI18n(); })
+  .catch(() => {});
 $("lang-select").addEventListener("change", (e) => { setLang(e.target.value); setNetChip(); });
 
 // ---------------------------------------------------------------- 联邦网络 chip
@@ -571,6 +574,9 @@ function renderStatus() {
 async function loadWorld() {
   worldSnap = await invoke("world_snapshot");
   renderWorld();
+  // 3D 视图开着时必须同步实体表：写完的方块只进了 2D 面板的话，玩家会看到
+  // 「坐标回执 + 一击火花」但币面上什么都没有，要关了重开才显形。
+  if (w3) w3.setEntities(worldSnap.entities, worldSnap.address);
 }
 
 /** 免费写入的即时回执：签名即落账，不存在"等一个块"的第二阶段 */

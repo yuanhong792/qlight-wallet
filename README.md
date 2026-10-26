@@ -132,6 +132,22 @@ cargo test --lib ore::tests::ore_matches_cross_language_golden   # Rust 共识�
 - **Windows**：三文件（exe + WebView2Loader.dll + libunwind.dll）须同目录；SmartScreen「更多信息 → 仍要运行」；防火墙选「允许」。
 - **macOS**：首次打开「无法验证开发者」→ 右键 → 打开（未公证提示，仅一次）。
 - **数据位置**：macOS `~/Library/Application Support/net.qlight.wallet/`；Windows `%APPDATA%\net.qlight.wallet\`。
+- **块格式 v1**：本版起发行规则改变（§9.13，块哈希域 `QL-BLOCK-V2`）。组网演示请**两端用同一版本**——0.1.0 的旧客户端在首个 v1 块之后会与本机节点分叉。
+
+## 🔨 从源码构建
+
+版本号只有一个来源：`desktop-wallet/Cargo.toml`。`tauri.conf.json` 与之同步，打包脚本从这里读，前端「关于」页的 `版本 {v}` 由 Rust 命令 `app_version` 运行时注入——写死在任何一处都必然过期。
+
+```bash
+cd desktop-wallet
+zsh scripts/build-macos.sh      # → build/QLight-Wallet.dmg（cargo + codesign + hdiutil，无需 npm/tauri-cli）
+zsh scripts/build-windows.sh    # → build/QLight-Wallet-Windows.zip（macOS 上用 llvm-mingw 交叉编译，无需 Windows 机器）
+```
+
+- Windows 目标必须是 `x86_64-pc-windows-gnullvm`：普通 `*-gnu` 的预编译 std 要链 `-lgcc/-lgcc_eh`，而 llvm-mingw 是 LLVM 实现、不提供 libgcc（见 `desktop-wallet/.cargo/config.toml`）。
+- 打包脚本会**自己校验导入表**：除系统 DLL 外若冒出第三个非系统依赖就直接失败退出——"三文件同目录"是可验断言，不是文档传说。
+- 交叉编译需要 llvm-mingw（脚本自动找 `~/qlx-tools/llvm-mingw-*`，或显式 `MINGW_HOME=/path`）。
+- **编译输出必须放内置盘**（脚本已固定）：外置 exFAT 卷会生成 `._*` 资源叉，既破坏构建也会污染发布用的 zip。
 
 ## 📄 许可与免责
 
