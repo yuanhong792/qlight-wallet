@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QLight Wallet · 抗量子桌面钱包</title>
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <meta name="description" content="QLight Wallet：ML-DSA-65（FIPS 204）抗量子签名桌面钱包，联邦网络，公平启动挖矿。QLX 演示凭证，非投资品。">
+  <style>
+    :root {
+      --ink: #1E2330;
+      --muted: #8A93A6;
+      --gold: #E3B54A;
+      --gold-lt: #FBE7A8;
+      --gold-dk: #A87A18;
+      --green: #34A853;
+      --bg: #FAFBFD;
+      --card: #FFFFFF;
+      --line: #ECEEF3;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, "PingFang SC", "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: var(--bg); color: var(--ink); line-height: 1.7;
+    }
+    a { color: inherit; text-decoration: none; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+    /* —— 顶栏 —— */
+    nav {
+      position: sticky; top: 0; z-index: 10;
+      background: rgba(255,255,255,.86); backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--line);
+    }
+    nav .wrap { display: flex; align-items: center; gap: 10px; height: 60px; }
+    nav img { width: 30px; height: 30px; }
+    nav .brand { font-weight: 700; font-size: 16px; letter-spacing: .3px; }
+    nav .brand small { color: var(--muted); font-weight: 500; margin-left: 6px; }
+    nav .links { margin-left: auto; display: flex; gap: 18px; font-size: 14px; }
+    nav .links a { color: var(--muted); }
+    nav .links a:hover { color: var(--gold-dk); }
+
+    /* —— Hero —— */
+    .hero { text-align: center; padding: 84px 0 56px; }
+    .hero .coin { width: 132px; height: 132px; border-radius: 50%;
+      box-shadow: 0 18px 50px rgba(227,181,74,.35); animation: float 5s ease-in-out infinite; }
+    @keyframes float { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-10px) } }
+    .hero h1 { font-size: 40px; margin: 26px 0 8px; letter-spacing: .5px; }
+    .hero h1 .q { color: var(--gold-dk); }
+    .hero p.sub { color: var(--muted); font-size: 17px; max-width: 640px; margin: 0 auto; }
+    .hero .badges { margin-top: 18px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+    .badge { font-size: 12.5px; color: var(--gold-dk); background: var(--gold-lt);
+      border-radius: 999px; padding: 4px 14px; font-weight: 600; }
+    .badge.green { color: var(--green); background: #EAF7EE; }
+    .badge.blue { color: #3B6FE0; background: #EBF1FF; }
+
+    /* —— 下载按钮 —— */
+    .dl { display: flex; gap: 16px; justify-content: center; margin-top: 34px; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 10px;
+      padding: 13px 30px; border-radius: 12px; font-size: 15.5px; font-weight: 600;
+      border: 1px solid var(--line); background: var(--card);
+      box-shadow: 0 2px 10px rgba(30,35,48,.06); transition: all .18s;
+    }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(30,35,48,.12); }
+    .btn.primary { background: linear-gradient(135deg, #EFC65C, #DFA83A); color: #fff; border: none;
+      box-shadow: 0 8px 22px rgba(227,181,74,.4); }
+    .btn small { display: block; font-weight: 400; font-size: 11.5px; opacity: .8; }
+    .dl-note { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 14px; }
+
+    /* —— 特性 —— */
+    .section { padding: 64px 0; }
+    .section > h2 { text-align: center; font-size: 27px; margin-bottom: 8px; }
+    .section > .lead { text-align: center; color: var(--muted); margin-bottom: 40px; font-size: 15px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+    .card {
+      background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+      padding: 26px 24px; transition: all .18s;
+    }
+    .card:hover { transform: translateY(-3px); box-shadow: 0 10px 30px rgba(30,35,48,.08); }
+    .card .ico { width: 44px; height: 44px; border-radius: 12px; background: var(--gold-lt);
+      color: var(--gold-dk); display: flex; align-items: center; justify-content: center;
+      font-size: 21px; margin-bottom: 14px; }
+    .card h3 { font-size: 16.5px; margin-bottom: 6px; }
+    .card p { color: var(--muted); font-size: 14px; }
+    .card b { color: var(--ink); }
+
+    /* —— 创世宣言 —— */
+    .genesis { background: linear-gradient(160deg, #FFFDF6, #FBF3DC); border: 1px solid var(--gold-lt); }
+    .genesis .manifesto {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 13.5px; color: var(--ink); background: #fff;
+      border: 1px dashed var(--gold); border-radius: 12px;
+      padding: 20px 22px; margin: 22px 0 14px; word-break: break-word;
+    }
+    .genesis .note { color: var(--muted); font-size: 13px; }
+    .genesis .note b { color: var(--gold-dk); }
+
+    /* —— 下载区 —— */
+    .dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+    .steps { margin-top: 34px; background: var(--card); border: 1px solid var(--line);
+      border-radius: 16px; padding: 24px 28px; }
+    .steps h3 { font-size: 15.5px; margin-bottom: 12px; }
+    .steps ol { padding-left: 20px; color: var(--muted); font-size: 14px; }
+    .steps li { margin: 6px 0; }
+    .steps b { color: var(--ink); }
+
+    /* —— 页脚 —— */
+    footer { border-top: 1px solid var(--line); padding: 34px 0 44px; text-align: center; }
+    footer .disc { color: var(--muted); font-size: 13px; max-width: 720px; margin: 0 auto 12px; }
+    footer .links { display: flex; gap: 20px; justify-content: center; font-size: 13.5px; color: var(--muted); }
+    footer .links a:hover { color: var(--gold-dk); }
+
+    @media (max-width: 640px) {
+      .hero h1 { font-size: 30px; }
+      nav .links { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <img src="assets/favicon.png" alt="QLight">
+    <div class="brand">QLight Wallet <small>抗量子桌面钱包</small></div>
+    <div class="links">
+      <a href="#features">特性</a>
+      <a href="#genesis">创世宣言</a>
+      <a href="#download">下载</a>
+      <a href="https://github.com/yuanhong792/qlight-wallet" target="_blank">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero wrap">
+  <img class="coin" src="assets/coin.png" alt="QLX">
+  <h1>QLight <span class="q">Wallet</span></h1>
+  <p class="sub">下一代抗量子桌面钱包。ML-DSA-65（FIPS 204）后量子签名 · 联邦网络 · 公平启动挖矿。</p>
+  <div class="badges">
+    <span class="badge">🛡 ML-DSA-65 · FIPS 204</span>
+    <span class="badge green">🌱 无预挖 · 无 ICO</span>
+    <span class="badge blue">🌐 联邦组网</span>
+  </div>
+  <div class="dl">
+    <a class="btn primary" href="https://github.com/yuanhong792/qlight-wallet/releases/latest/download/QLight-Wallet.dmg">
+      ⬇ 下载 macOS 版 <small>.dmg · 12 MB · Apple Silicon</small>
+    </a>
+    <a class="btn" href="https://github.com/yuanhong792/qlight-wallet/releases/latest/download/QLight-Wallet-Windows.zip">
+      ⬇ 下载 Windows 版 <small>.zip · 4.7 MB · Win 10/11 x64</small>
+    </a>
+  </div>
+  <p class="dl-note">免安装绿色版 · 数据本地加密存储 · 无需注册任何账号</p>
+</header>
+
+<section class="section wrap" id="features">
+  <h2>为什么是 QLight</h2>
+  <p class="lead">在量子计算机成熟之前，把钱包的锁先换掉。</p>
+  <div class="grid">
+    <div class="card">
+      <div class="ico">🛡</div>
+      <h3>抗量子签名</h3>
+      <p>全部交易使用 <b>ML-DSA-65</b>（NIST FIPS 204，Dilithium 家族）签名。今天截获的交易数据，未来量子计算机也无法伪造。</p>
+    </div>
+    <div class="card">
+      <div class="ico">🌐</div>
+      <h3>联邦网络</h3>
+      <p>libp2p + mDNS + gossipsub。同一局域网的钱包<b>自动发现彼此</b>，无需服务器，无需公网 IP，账本全网一致。</p>
+    </div>
+    <div class="card">
+      <div class="ico">🌱</div>
+      <h3>公平启动</h3>
+      <p>QLX 全部通过<b>挖矿产出</b>：无预挖、无 ICO、无投资人份额。总量封顶 2.1 亿，约 31.5M 块减半一次。</p>
+    </div>
+    <div class="card">
+      <div class="ico">🔐</div>
+      <h3>本地加密存储</h3>
+      <p>密钥库以 <b>AES-GCM + Argon2</b> 加密落盘，账本与块文件全路径原子写入，启动时自动哈希链校验。</p>
+    </div>
+    <div class="card">
+      <div class="ico">📜</div>
+      <h3>创世宣言上链</h3>
+      <p>借鉴比特币创世块：宣言原文嵌入创世哈希，<b>改一个字全网即可识破</b>——链的价值观从第 0 块起被锚死。</p>
+    </div>
+    <div class="card">
+      <div class="ico">💱</div>
+      <h3>2 秒结算</h3>
+      <p>出块周期 2 秒，手续费固定 0.001 QLX。转账签名后<span style="color:var(--gold-dk);font-weight:600">确认中</span>状态一目了然，入块即到账。</p>
+    </div>
+  </div>
+</section>
+
+<section class="section wrap" id="genesis">
+  <h2>创世宣言</h2>
+  <p class="lead">The Genesis Manifesto —— 像 2009 年比特币嵌入报纸标题一样，嵌入创世哈希。</p>
+  <div class="card genesis">
+    <div class="manifesto">QLight Genesis · Oct 26 2026 · QLX quantum-safe credential chain. No premine, no ICO, no investors — fair launch by mining only. 愿价值在量子时代依旧自由转移 · Value shall move freely in the quantum era.</div>
+    <p class="note">
+      宣言经 SHAKE-256 摘要后嵌入创世块的 tx_root，随哈希链永久锚定——任何人可用宣言原文重算创世哈希并比对源码中的硬编码值。
+      <b>宣言即信任根：篡改宣言 = 更换整条链。</b>
+    </p>
+  </div>
+</section>
+
+<section class="section wrap" id="download">
+  <h2>下载与上手</h2>
+  <p class="lead">两台电脑连同一 Wi-Fi，各自打开钱包，即自动组网。</p>
+  <div class="dl-grid">
+    <div class="card">
+      <h3>🍎 macOS</h3>
+      <p>下载 .dmg → 拖入「应用程序」→ 打开。<br>
+      首次打开若提示「无法验证开发者」：<b>右键 → 打开</b>（未做公证的普通提示，仅一次）。</p>
+    </div>
+    <div class="card">
+      <h3>🪟 Windows 10 / 11</h3>
+      <p>下载 .zip → 解压 → 双击 <b>qlight-wallet.exe</b>（三个文件须同目录）。<br>
+      SmartScreen 弹窗：<b>更多信息 → 仍要运行</b>；防火墙询问联网时选<b>允许</b>。</p>
+    </div>
+  </div>
+  <div class="steps">
+    <h3>✨ 三步体验联邦转账</h3>
+    <ol>
+      <li><b>组网</b>：两台设备（或同一台电脑开两个钱包）连同一网络，左上角出现「🌐 联邦 · 2 节点」即成功；</li>
+      <li><b>转账</b>：收款方在「收款」页复制 ql1 开头地址，付款方在「转账」页粘贴并输入金额；</li>
+      <li><b>到账</b>：约 2 秒入块，双方「活动」页自动刷新——付款方、收款方完整地址与时间直接可见。</li>
+    </ol>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p class="disc">
+      ⚠️ 免责声明：QLX 是<b>演示与教学用途的「凭证/权益」记账单位，不是投资品</b>，不承诺任何价值，
+      不构成任何证券或虚拟货币发行。当前版本为双机演示 / 小圈内测阶段，共识规则为演示级。
+      在您所在司法辖区使用前，请自行确认合规性。
+    </p>
+    <div class="links">
+      <a href="https://github.com/yuanhong792/qlight-wallet" target="_blank">GitHub 仓库</a>
+      <a href="https://github.com/yuanhong792/qlight-wallet/blob/main/whitepaper.md" target="_blank">白皮书</a>
+      <a href="https://github.com/yuanhong792/qlight-wallet/blob/main/DESIGN.md" target="_blank">技术设计</a>
+      <a href="https://github.com/yuanhong792/qlight-wallet/releases" target="_blank">历史版本</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
