@@ -72,6 +72,7 @@ pub fn run() {
             commands::wallet_status,
             commands::chain_state,
             commands::tx_history,
+            commands::tx_pending,
             commands::create_wallet,
             commands::unlock_wallet,
             commands::lock_wallet,

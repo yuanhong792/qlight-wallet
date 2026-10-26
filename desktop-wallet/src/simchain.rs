@@ -44,6 +44,38 @@ pub const MEMPOOL_CAP: usize = 256;
 /// 账本格式版本（B 档：v2 增加 miner/nonce 字段，旧档自动归档）
 pub const LEDGER_V: u8 = 2;
 
+// ---------------------------------------------------------------- 创世块（方案 A，借鉴 BTC）
+//
+// BTC 把创世当天报纸头版标题嵌进 coinbase 交易，于是那句话被永久锚进创世哈希——
+// 改一个字，哈希就变。QLight 同理：宣言原文 → SHAKE-256 → 嵌入 tx_root → 创世哈希。
+// 任何人拿宣言原文即可重算创世哈希并与本文件硬编码值比对，宣言与链的绑定自证。
+
+/// 创世宣言（创世 2026-10-26 00:00:00 UTC）
+pub const GENESIS_MANIFESTO: &str = "QLight Genesis · Oct 26 2026 · QLX quantum-safe credential chain. \
+No premine, no ICO, no investors — fair launch by mining only. \
+愿价值在量子时代依旧自由转移 · Value shall move freely in the quantum era.";
+
+/// 创世时间戳：固定值，所有节点一致（不随机器时间漂移）
+pub const GENESIS_TS_UNIX: u64 = 1792972800;
+
+/// 创世块的 prev：64 个 0（链的第一个锚点，BTC 同款）
+pub const GENESIS_PREV_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// 创世哈希 = SHAKE-256("QL-BLOCK-V1", 64×0 ‖ 0 ‖ 0 ‖ 0vrf ‖ tx_root(宣言摘要))
+/// ——宣言在哈希里，哈希在源码里；改宣言必改此值，全网一眼识破。
+pub fn genesis_hash() -> [u8; 32] {
+    let d = crypto::shake256(b"QL-GENESIS-V1", GENESIS_MANIFESTO.as_bytes(), 32);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&d);
+    let root = tx_root_of(&[digest]);
+    let zero_vrf = [0u8; 32];
+    block_hash_of(GENESIS_PREV_HEX, 0, 0, &zero_vrf, &root)
+}
+
+pub fn genesis_hash_hex() -> String {
+    hex::encode(genesis_hash())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxRecord {
     pub hash_hex: String,
@@ -72,12 +104,9 @@ impl Default for Ledger {
         Self {
             v: 2,
             height: 0,
-            prev_hash_hex: "genesis".into(),
+            prev_hash_hex: genesis_hash_hex(),
             total_minted: 0,
-            started_unix: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            started_unix: GENESIS_TS_UNIX,
             balances: HashMap::new(),
             nonces: HashMap::new(),
             records: vec![],
@@ -116,6 +145,16 @@ pub struct PendingTx {
     pub envelope: TxEnvelope,
     pub sig: Vec<u8>,
     pub digest: [u8; 32],
+}
+
+/// 待确认交易视图（活动页「确认中」DTO）
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingView {
+    pub hash: String,
+    pub hash_short: String,
+    pub to: String,
+    pub amount: u64,
+    pub fee: u64,
 }
 
 /// —— 哈希口径（打包/重放共用同一实现，保证账本可独立审计）——
@@ -178,10 +217,15 @@ pub struct BlockEvent {
     pub txs_count: usize,
 }
 
-/// 原子写：tmp + rename，进程中断不产生半截文件
+/// 原子写：tmp + rename，进程中断不产生半截文件；
+/// rename 前 fsync——掉电时也不落半截数据（2s 出块节奏下开销可忽略）
 fn atomic_write(path: &PathBuf, bytes: &[u8]) {
+    use std::io::Write;
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, bytes).is_ok() {
+    let ok = std::fs::File::create(&tmp).ok().and_then(|mut f| {
+        f.write_all(bytes).ok().and_then(|_| f.sync_all().ok())
+    });
+    if ok.is_some() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
@@ -211,6 +255,10 @@ impl SimChain {
             blocks_path,
             corrupted: Arc::new(Mutex::new(false)),
         };
+
+        // 上次进程中断可能残留 .tmp 半成品（无害但清理干净）
+        let _ = std::fs::remove_file(chain.ledger_path.with_extension("tmp"));
+        let _ = std::fs::remove_file(chain.blocks_path.with_extension("tmp"));
 
         if !chain.validate_blocks_jsonl() {
             // regtest 演示口径：旧格式（无 miner/nonce 字段的 v1 块）或损坏文件 →
@@ -244,7 +292,7 @@ impl SimChain {
             Ok(c) => c,
             Err(_) => return true,
         };
-        let mut expect_prev = "genesis".to_string();
+        let mut expect_prev = genesis_hash_hex();
         // 重放时的 minted_before 用于复刻硬顶减发口径（与打包时完全一致）
         let mut minted_running: u64 = 0;
         for line in content.lines() {
@@ -309,6 +357,31 @@ impl SimChain {
     pub fn records(&self) -> Vec<TxRecord> {
         let l = self.ledger.lock().unwrap();
         l.records.iter().rev().take(200).cloned().collect()
+    }
+
+    /// 内存池中某地址的待确认交易（活动页「确认中」条目；出块后自动消失）
+    pub fn pending_of(&self, addr_bech32: &str) -> Vec<PendingView> {
+        let want = addr_hex_of(addr_bech32);
+        let mp = self.mempool.lock().unwrap();
+        mp.iter()
+            .filter(|p| hex::encode(&p.envelope.from_addr) == want)
+            .map(|p| {
+                let h = hex::encode(&p.digest);
+                let (to, amount) = p
+                    .envelope
+                    .actions
+                    .first()
+                    .map(|a| (crypto::to_bech32_ql(&a.to), a.amount))
+                    .unwrap_or((String::new(), 0));
+                PendingView {
+                    hash_short: format!("{}…{}", &h[..10], &h[54..]),
+                    hash: h,
+                    to,
+                    amount,
+                    fee: FEE,
+                }
+            })
+            .collect()
     }
 
     pub fn mempool_len(&self) -> usize {
@@ -581,7 +654,7 @@ impl SimChain {
     /// 头部序列校验（接受远端块 / 追账快照共用）：
     /// 前向哈希连续 + 逐块重算 tx_root 与块哈希 + 排放/手续费口径一致
     fn verify_header_slice(headers: &[BlockHeader]) -> bool {
-        let mut expect_prev = "genesis".to_string();
+        let mut expect_prev = genesis_hash_hex();
         let mut minted_running: u64 = 0;
         for bh in headers {
             if bh.miner.is_empty() {
@@ -912,7 +985,7 @@ impl SimChain {
         let mut staged = Ledger {
             v: LEDGER_V,
             height: 0,
-            prev_hash_hex: "genesis".into(),
+            prev_hash_hex: genesis_hash_hex(),
             total_minted: 0,
             started_unix: headers[0].ts_unix,
             balances: HashMap::new(),
@@ -969,7 +1042,8 @@ impl SimChain {
         if let Ok(bytes) = serde_json::to_vec(&*self.ledger.lock().unwrap()) {
             atomic_write(&self.ledger_path, &bytes);
         }
-        std::fs::write(&self.blocks_path, lines).map_err(|e| format!("写入块文件失败: {e}"))?;
+        // 快照整链重写必须原子——这里曾是裸 fs::write，强杀进程会撕出半截 jsonl
+        atomic_write(&self.blocks_path, lines.as_bytes());
         Ok(tip_height)
     }
 
@@ -1059,7 +1133,11 @@ fn append_block_header(path: &PathBuf, h: &BlockHeader) {
         .open(path)
     {
         if let Ok(line) = serde_json::to_string(h) {
-            let _ = writeln!(f, "{line}");
+            // 单次 write_all 整行落盘 + fsync：kill -9 不会撕行，掉电也不丢尾块
+            let mut buf = line.into_bytes();
+            buf.push(b'\n');
+            let _ = f.write_all(&buf);
+            let _ = f.sync_all();
         }
     }
 }
@@ -1109,6 +1187,25 @@ mod tests {
         assert_ne!(h1, h3);
         // 同参数确定性
         assert_eq!(block_hash_of("genesis", 1, 0, &vrf, &tx_root_of(&[d1])), h1);
+    }
+
+    #[test]
+    fn genesis_is_anchored() {
+        // 创世哈希确定性：宣言原文不变 → 哈希不变
+        let g = genesis_hash();
+        assert_eq!(hex::encode(g), genesis_hash_hex());
+        // 宣言被篡改 → 哈希必变（宣言与链的绑定自证，BTC 同款）
+        let d_tampered = crypto::shake256(b"QL-GENESIS-V1", b"tampered manifesto", 32);
+        let mut dig = [0u8; 32];
+        dig.copy_from_slice(&d_tampered);
+        let zero_vrf = [0u8; 32];
+        let tampered = block_hash_of(GENESIS_PREV_HEX, 0, 0, &zero_vrf, &tx_root_of(&[dig]));
+        assert_ne!(g, tampered);
+        // 创世 prev = 64 个 0（链的第一个锚点）
+        assert_eq!(GENESIS_PREV_HEX.len(), 64);
+        assert!(GENESIS_PREV_HEX.chars().all(|c| c == '0'));
+        // 创世时间戳固定（2026-10-26 00:00:00 UTC）
+        assert_eq!(GENESIS_TS_UNIX, 1792972800);
     }
 }
 

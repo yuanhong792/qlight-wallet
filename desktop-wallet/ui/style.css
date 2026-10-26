@@ -238,6 +238,12 @@ body {
 
 /* ---------- 活动列表 ---------- */
 .tx-list { display: flex; flex-direction: column; }
+.hist-filter { display: flex; gap: 6px; margin: 10px 0 2px; }
+.hf-btn {
+  font-size: 12px; color: var(--muted); background: #F5F6F8; border: none;
+  border-radius: 999px; padding: 4px 12px; cursor: pointer;
+}
+.hf-btn.active { color: var(--gold-dk); background: var(--gold-lt); font-weight: 600; }
 .tx-item {
   display: flex; align-items: center; gap: 14px;
   padding: 12px 8px; border-bottom: 1px solid #F0F2F5;
@@ -249,6 +255,9 @@ body {
 }
 .tx-ico.in  { background: #EAF7EE; color: var(--green); }
 .tx-ico.out { background: #FCEBEC; color: var(--danger); }
+/* 确认中条目：琥珀色半透明，入块后自动转为正式记录 */
+.tx-item.pend { opacity: 0.78; }
+.tx-ico.pend { background: #FFF6E0; color: var(--gold-dk); font-size: 13px; }
 .tx-main { flex: 1; min-width: 0; }
 .tx-main .t1 { font-size: 13px; font-weight: 600; }
 .tx-main .t-party {

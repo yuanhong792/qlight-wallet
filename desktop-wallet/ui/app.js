@@ -46,6 +46,16 @@ document.querySelectorAll(".sb-item").forEach((btn) => {
     if (!$("view-main").classList.contains("hidden")) refreshAll().catch(() => {});
   });
 });
+
+// 活动页筛选：全部 / 转入 / 转出（点击即刷新，随轮询保持）
+let histFilter = "all";
+document.querySelectorAll(".hf-btn").forEach((b) => {
+  b.addEventListener("click", () => {
+    histFilter = b.dataset.f || "all";
+    document.querySelectorAll(".hf-btn").forEach((x) => x.classList.toggle("active", x === b));
+    if (!$("view-main").classList.contains("hidden")) refreshAll().catch(() => {});
+  });
+});
 function openPage(name) {
   document.querySelector(`.sb-item[data-page="${name}"]`).click();
   $(name === "asset" ? "receive-card" : "send-card").scrollIntoView({ behavior: "smooth" });
@@ -158,35 +168,54 @@ async function refreshAll() {
   $("stat-cap").textContent = `${capPct.toFixed(6)}%`;
   $("cap-bar").style.width = `${Math.max(capPct, 0.0000002)}%`;
 
-  // 活动页（完整明细：付款/收款双方完整地址直接可见、本钱包金色标注、
-  // 精确时间、块高、真实手续费、哈希可点复制）
+  // 活动页（完整明细 + 确认中 + 筛选：付款/收款双方完整地址直接可见、
+  // 本钱包金色标注、精确时间、块高、真实手续费、哈希可点复制）
   const hist = await invoke("tx_history");
+  const pend = await invoke("tx_pending").catch(() => []);
   const my = cs.address || "";
   const list = $("tx-list");
-  if (!hist.length) {
+  const party = (a) =>
+    `<span class="addr cpy" data-copy="${a}" title="${t("hist.copy")}">${a}</span>` +
+    (a && a === my ? ` <span class="me">${t("hist.me")}</span>` : "");
+  // 确认中条目（已签发未入块，约 2 秒后转为正式记录；只有转出方向）
+  const pendRows = (histFilter === "all" || histFilter === "out" ? pend : [])
+    .map(
+      (p) => `<div class="tx-item pend">
+        <div class="tx-ico pend">⏳</div>
+        <div class="tx-main">
+          <div class="t1">${t("hist.pending")}</div>
+          <div class="t-party"><span class="lbl">${t("hist.to")}</span>${party(p.to)}</div>
+        </div>
+        <div class="tx-amt">
+          <div class="a1 minus">−${fmtAmt(p.amount)} QLX</div>
+          <div class="a2">${t("hist.wait")}</div>
+        </div>
+      </div>`
+    )
+    .join("");
+  const rows = hist
+    .filter((x) => histFilter === "all" || x.direction === histFilter)
+    .map((x) => {
+      const out = x.direction === "out";
+      return `<div class="tx-item">
+        <div class="tx-ico ${out ? "out" : "in"}">${out ? "↑" : "↓"}</div>
+        <div class="tx-main">
+          <div class="t1">${t(out ? "hist.out" : "hist.in")}</div>
+          <div class="t-party"><span class="lbl">${t("hist.from")}</span>${party(x.from)}</div>
+          <div class="t-party"><span class="lbl">${t("hist.to")}</span>${party(x.to)}</div>
+          <div class="t2">⏱ ${ts(x.ts_unix)} · #${x.height} · ${t("hist.fee", { f: fmtAmt(x.fee) })}</div>
+          <div class="t3"><span class="cpy" data-copy="${x.hash}" title="${t("hist.copy")}">${x.hash_short}</span></div>
+        </div>
+        <div class="tx-amt">
+          <div class="a1 ${out ? "minus" : "plus"}">${out ? "−" : "+"}${fmtAmt(x.amount)} QLX</div>
+        </div>
+      </div>`;
+    })
+    .join("");
+  if (!pendRows && !rows) {
     list.innerHTML = `<div class="muted small tx-empty">${t("hist.empty")}</div>`;
   } else {
-    list.innerHTML = hist
-      .map((x) => {
-        const out = x.direction === "out";
-        const party = (a) =>
-          `<span class="addr cpy" data-copy="${a}" title="${t("hist.copy")}">${a}</span>` +
-          (a && a === my ? ` <span class="me">${t("hist.me")}</span>` : "");
-        return `<div class="tx-item">
-          <div class="tx-ico ${out ? "out" : "in"}">${out ? "↑" : "↓"}</div>
-          <div class="tx-main">
-            <div class="t1">${t(out ? "hist.out" : "hist.in")}</div>
-            <div class="t-party"><span class="lbl">${t("hist.from")}</span>${party(x.from)}</div>
-            <div class="t-party"><span class="lbl">${t("hist.to")}</span>${party(x.to)}</div>
-            <div class="t2">⏱ ${ts(x.ts_unix)} · #${x.height} · ${t("hist.fee", { f: fmtAmt(x.fee) })}</div>
-            <div class="t3"><span class="cpy" data-copy="${x.hash}" title="${t("hist.copy")}">${x.hash_short}</span></div>
-          </div>
-          <div class="tx-amt">
-            <div class="a1 ${out ? "minus" : "plus"}">${out ? "−" : "+"}${fmtAmt(x.amount)} QLX</div>
-          </div>
-        </div>`;
-      })
-      .join("");
+    list.innerHTML = pendRows + rows;
   }
 }
 

@@ -129,6 +129,37 @@ pub fn tx_history(state: AppCtx) -> Vec<TxRecordDto> {
         .collect()
 }
 
+#[derive(serde::Serialize)]
+pub struct PendingTxDto {
+    pub hash_short: String,
+    pub hash: String,
+    pub to: String,
+    pub amount: u64,
+    pub fee: u64,
+}
+
+/// 内存池中本钱包的待确认交易（活动页「确认中」；约 2 秒入块后转为正式记录）
+#[tauri::command]
+pub fn tx_pending(state: AppCtx) -> Vec<PendingTxDto> {
+    let core = state.core.read().unwrap().clone();
+    let my = match core {
+        Some(c) => c.address.clone(),
+        None => return vec![],
+    };
+    state
+        .chain
+        .pending_of(&my)
+        .into_iter()
+        .map(|p| PendingTxDto {
+            hash_short: p.hash_short,
+            hash: p.hash,
+            to: p.to,
+            amount: p.amount,
+            fee: p.fee,
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------- 钱包生命周期
 
 #[derive(serde::Serialize)]
