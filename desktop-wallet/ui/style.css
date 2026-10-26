@@ -251,8 +251,19 @@ body {
 .tx-ico.out { background: #FCEBEC; color: var(--danger); }
 .tx-main { flex: 1; min-width: 0; }
 .tx-main .t1 { font-size: 13px; font-weight: 600; }
-.tx-main .t1 .cpy {
-  font-family: "SF Mono", Menlo, monospace; font-size: 12px; user-select: text;
+.tx-main .t-party {
+  display: flex; align-items: baseline; gap: 6px;
+  margin-top: 3px; font-size: 11.5px; line-height: 1.5; user-select: text;
+}
+.tx-main .t-party .lbl { color: var(--muted); flex-shrink: 0; min-width: 34px; }
+.tx-main .t-party .addr {
+  font-family: "SF Mono", Menlo, monospace;
+  word-break: break-all; /* 完整地址必须全部可见，长地址自动换行 */
+}
+.tx-main .me {
+  flex-shrink: 0; font-size: 10px; font-weight: 600;
+  color: var(--gold-dk); background: var(--gold-lt);
+  border-radius: 4px; padding: 0 5px; align-self: center;
 }
 .tx-main .t2 { font-size: 11px; color: var(--muted);
   font-family: "SF Mono", Menlo, monospace;

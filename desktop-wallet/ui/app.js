@@ -158,8 +158,10 @@ async function refreshAll() {
   $("stat-cap").textContent = `${capPct.toFixed(6)}%`;
   $("cap-bar").style.width = `${Math.max(capPct, 0.0000002)}%`;
 
-  // 活动页（明细版：对方地址可点复制 / 精确时间 / 块高 / 完整哈希 / 真实手续费）
+  // 活动页（完整明细：付款/收款双方完整地址直接可见、本钱包金色标注、
+  // 精确时间、块高、真实手续费、哈希可点复制）
   const hist = await invoke("tx_history");
+  const my = cs.address || "";
   const list = $("tx-list");
   if (!hist.length) {
     list.innerHTML = `<div class="muted small tx-empty">${t("hist.empty")}</div>`;
@@ -167,17 +169,20 @@ async function refreshAll() {
     list.innerHTML = hist
       .map((x) => {
         const out = x.direction === "out";
-        const cp = out ? x.to : x.from;
+        const party = (a) =>
+          `<span class="addr cpy" data-copy="${a}" title="${t("hist.copy")}">${a}</span>` +
+          (a && a === my ? ` <span class="me">${t("hist.me")}</span>` : "");
         return `<div class="tx-item">
           <div class="tx-ico ${out ? "out" : "in"}">${out ? "↑" : "↓"}</div>
           <div class="tx-main">
-            <div class="t1">${t(out ? "hist.out" : "hist.in")} · <span class="cpy" data-copy="${cp}" title="${t("hist.copy")}">${short(cp)}</span></div>
-            <div class="t2">⏱ ${ts(x.ts_unix)} · #${x.height}</div>
+            <div class="t1">${t(out ? "hist.out" : "hist.in")}</div>
+            <div class="t-party"><span class="lbl">${t("hist.from")}</span>${party(x.from)}</div>
+            <div class="t-party"><span class="lbl">${t("hist.to")}</span>${party(x.to)}</div>
+            <div class="t2">⏱ ${ts(x.ts_unix)} · #${x.height} · ${t("hist.fee", { f: fmtAmt(x.fee) })}</div>
             <div class="t3"><span class="cpy" data-copy="${x.hash}" title="${t("hist.copy")}">${x.hash_short}</span></div>
           </div>
           <div class="tx-amt">
             <div class="a1 ${out ? "minus" : "plus"}">${out ? "−" : "+"}${fmtAmt(x.amount)} QLX</div>
-            <div class="a2">${t("hist.fee", { f: fmtAmt(x.fee) })}</div>
           </div>
         </div>`;
       })
