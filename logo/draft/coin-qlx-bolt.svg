@@ -1,0 +1,207 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="480" height="480">
+  <defs>
+    <!-- 外缘亮金 -->
+    <linearGradient id="rimG" x1="0.08" y1="0" x2="0.92" y2="1">
+      <stop offset="0" stop-color="#FFF3C0"/>
+      <stop offset="0.28" stop-color="#ECC862"/>
+      <stop offset="0.62" stop-color="#C08F1D"/>
+      <stop offset="1" stop-color="#7E560C"/>
+    </linearGradient>
+    <!-- 底板：偏亮的金（参考币的场区） -->
+    <radialGradient id="fieldG" cx="0.34" cy="0.28" r="0.98">
+      <stop offset="0" stop-color="#EFC155"/>
+      <stop offset="0.5" stop-color="#D3A12C"/>
+      <stop offset="1" stop-color="#A5761A"/>
+    </radialGradient>
+    <!-- 巨型符号：中等金 + 深色勾边 -->
+    <linearGradient id="glyphG" x1="0.1" y1="0" x2="0.95" y2="1">
+      <stop offset="0" stop-color="#FCE9A6"/>
+      <stop offset="0.4" stop-color="#E0B03E"/>
+      <stop offset="1" stop-color="#A87A18"/>
+    </linearGradient>
+    <linearGradient id="traceG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F8E59A"/>
+      <stop offset="1" stop-color="#D2A431"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.28" cy="0.2" r="0.85">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.3"/>
+      <stop offset="0.42" stop-color="#FFFFFF" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vig" cx="0.58" cy="0.6" r="0.9">
+      <stop offset="0" stop-color="#2A1900" stop-opacity="0"/>
+      <stop offset="0.68" stop-color="#2A1900" stop-opacity="0"/>
+      <stop offset="1" stop-color="#2A1900" stop-opacity="0.45"/>
+    </radialGradient>
+
+    <!-- 巨型闪电：敦实、竖直、占场区约 60%（₋ 级体量） -->
+    <path id="boltP" d="M13 2 L3 14 H12 L11 22 L21 10 H12 L13 2 Z"/>
+    <clipPath id="boltClip"><use href="#boltP" transform="translate(61 31.2) scale(5 7.4)"/></clipPath>
+
+    <!-- 走线连接件 -->
+    <g id="c1"><line x1="120" y1="88" x2="120" y2="82" stroke="url(#traceG)" stroke-width="2"/><circle cx="120" cy="80" r="1.5" fill="#7A5408"/></g>
+    <g id="c2"><line x1="120" y1="82" x2="120" y2="76" stroke="url(#traceG)" stroke-width="2"/><circle cx="120" cy="74" r="1.5" fill="#7A5408"/></g>
+    <g id="c3"><line x1="120" y1="76" x2="120" y2="70" stroke="url(#traceG)" stroke-width="2"/><circle cx="120" cy="68" r="1.5" fill="#7A5408"/></g>
+    <g id="c4"><line x1="120" y1="70" x2="120" y2="64" stroke="url(#traceG)" stroke-width="2"/><circle cx="120" cy="62" r="1.5" fill="#7A5408"/></g>
+    <g id="c5"><line x1="120" y1="64" x2="120" y2="58" stroke="url(#traceG)" stroke-width="2"/><circle cx="120" cy="56" r="1.5" fill="#7A5408"/></g>
+    <g id="c6"><line x1="120" y1="58" x2="120" y2="52" stroke="url(#traceG)" stroke-width="2"/><circle cx="120" cy="50" r="1.5" fill="#7A5408"/></g>
+    <g id="j1"><line x1="120" y1="76" x2="120" y2="70" stroke="url(#traceG)" stroke-width="2"/><line x1="120" y1="70" x2="109" y2="70" stroke="url(#traceG)" stroke-width="2"/><rect x="105" y="68.4" width="4" height="3.2" rx="0.6" fill="#F4DC93"/></g>
+    <g id="j2"><line x1="120" y1="58" x2="120" y2="52" stroke="url(#traceG)" stroke-width="2"/><line x1="120" y1="52" x2="131" y2="52" stroke="url(#traceG)" stroke-width="2"/><rect x="131" y="50.4" width="4" height="3.2" rx="0.6" fill="#F4DC93"/></g>
+    <g id="j3"><line x1="120" y1="46" x2="120" y2="40" stroke="url(#traceG)" stroke-width="2"/><line x1="120" y1="40" x2="110" y2="40" stroke="url(#traceG)" stroke-width="2"/><rect x="106" y="38.4" width="4" height="3.2" rx="0.6" fill="#F4DC93"/></g>
+    <!-- 过孔组 -->
+    <g id="vias" fill="#7A5408" opacity="0.85">
+      <circle cx="120" cy="45" r="1.6"/><circle cx="151" cy="66" r="1.6"/><circle cx="89" cy="66" r="1.6"/>
+      <circle cx="120" cy="195" r="1.6"/><circle cx="151" cy="174" r="1.6"/><circle cx="89" cy="174" r="1.6"/>
+    </g>
+  </defs>
+
+  <!-- ① 币体与外缘 -->
+  <circle cx="120" cy="120" r="118" fill="url(#rimG)"/>
+  <circle cx="120" cy="120" r="118" fill="none" stroke="#5E3D06" stroke-opacity="0.75" stroke-width="1.8"/>
+  <circle cx="120" cy="120" r="113" fill="none" stroke="#FFF0BC" stroke-opacity="0.4" stroke-width="4.5" stroke-dasharray="1.7 3.3"/>
+  <circle cx="120" cy="120" r="110" fill="none" stroke="#5E3D06" stroke-opacity="0.55" stroke-width="1.2"/>
+
+  <!-- ② 铭文带 -->
+  <circle cx="120" cy="120" r="102" fill="none" stroke="url(#rimG)" stroke-width="15"/>
+  <circle cx="120" cy="120" r="110" fill="none" stroke="#FCEFB4" stroke-opacity="0.45" stroke-width="1"/>
+  <circle cx="120" cy="120" r="94" fill="none" stroke="#5E3D06" stroke-opacity="0.5" stroke-width="1.4"/>
+
+  <!-- ③ 底板（电路基板） -->
+  <circle cx="120" cy="120" r="92" fill="url(#fieldG)"/>
+  <circle cx="120" cy="120" r="92" fill="none" stroke="#4F3405" stroke-opacity="0.8" stroke-width="2.6"/>
+  <circle cx="120" cy="120" r="89.5" fill="none" stroke="#F0CE7C" stroke-opacity="0.5" stroke-width="1"/>
+
+  <!-- ④ 连续细密同心走线（15 圈，带刻槽暗底） -->
+  <g fill="none" stroke="#7A5408" stroke-opacity="0.4" stroke-width="2.6">
+    <circle cx="120" cy="120" r="24"/><circle cx="120" cy="120" r="28.5"/><circle cx="120" cy="120" r="33"/>
+    <circle cx="120" cy="120" r="37.5"/><circle cx="120" cy="120" r="42"/><circle cx="120" cy="120" r="46.5"/>
+    <circle cx="120" cy="120" r="51"/><circle cx="120" cy="120" r="55.5"/><circle cx="120" cy="120" r="60"/>
+    <circle cx="120" cy="120" r="64.5"/><circle cx="120" cy="120" r="69"/><circle cx="120" cy="120" r="73.5"/>
+    <circle cx="120" cy="120" r="78"/><circle cx="120" cy="120" r="82.5"/><circle cx="120" cy="120" r="87"/>
+  </g>
+  <g fill="none" stroke="#F2D47F" stroke-opacity="0.72" stroke-width="1.2">
+    <circle cx="120" cy="120" r="24"/><circle cx="120" cy="120" r="28.5"/><circle cx="120" cy="120" r="33"/>
+    <circle cx="120" cy="120" r="37.5"/><circle cx="120" cy="120" r="42"/><circle cx="120" cy="120" r="46.5"/>
+    <circle cx="120" cy="120" r="51"/><circle cx="120" cy="120" r="55.5"/><circle cx="120" cy="120" r="60"/>
+    <circle cx="120" cy="120" r="64.5"/><circle cx="120" cy="120" r="69"/><circle cx="120" cy="120" r="73.5"/>
+    <circle cx="120" cy="120" r="78"/><circle cx="120" cy="120" r="82.5"/><circle cx="120" cy="120" r="87"/>
+  </g>
+
+  <!-- ⑤ 放射齿带（宽描边 + 极短虚线 = 放射小格） -->
+  <g fill="none" stroke="#F6DE8C" stroke-opacity="0.5" stroke-linecap="butt">
+    <circle cx="120" cy="120" r="30.5" stroke-width="9" stroke-dasharray="1.1 3.1"/>
+    <circle cx="120" cy="120" r="48.5" stroke-width="10" stroke-dasharray="1.1 2.7"/>
+    <circle cx="120" cy="120" r="66.5" stroke-width="11" stroke-dasharray="1.2 3.3"/>
+    <circle cx="120" cy="120" r="84" stroke-width="7" stroke-dasharray="1 2.6"/>
+  </g>
+
+  <!-- ⑥ 走线连接件 / 拐点 / 过孔 -->
+  <use href="#c1" transform="rotate(20 120 120)"/>
+  <use href="#c2" transform="rotate(60 120 120)"/>
+  <use href="#c3" transform="rotate(100 120 120)"/>
+  <use href="#c4" transform="rotate(140 120 120)"/>
+  <use href="#c5" transform="rotate(180 120 120)"/>
+  <use href="#c6" transform="rotate(220 120 120)"/>
+  <use href="#j1" transform="rotate(340 120 120)"/>
+  <use href="#j1" transform="rotate(80 120 120)"/>
+  <use href="#j2" transform="rotate(200 120 120)"/>
+  <use href="#j2" transform="rotate(320 120 120)"/>
+  <use href="#j3" transform="rotate(120 120 120)"/>
+  <use href="#j3" transform="rotate(260 120 120)"/>
+  <use href="#vias" transform="rotate(30 120 120)"/>
+  <use href="#vias" transform="rotate(90 120 120)"/>
+  <use href="#vias" transform="rotate(150 120 120)"/>
+  <use href="#vias" transform="rotate(210 120 120)"/>
+  <use href="#vias" transform="rotate(270 120 120)"/>
+  <use href="#vias" transform="rotate(330 120 120)"/>
+
+  <!-- ⑦ 梳齿环 -->
+  <g fill="#F0D173" opacity="0.7">
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6"/>
+  </g>
+  <use href="#vias" transform="rotate(15 120 120)" opacity="0"/>
+  <g id="tickring">
+    <use href="#tickring"/>
+  </g>
+  <g fill="#F2D886" opacity="0.8">
+    <use href="#tickref"/>
+  </g>
+  <!-- 梳齿（逐个复制 48 根） -->
+  <g fill="#F2D886" opacity="0.8">
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(7.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(15 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(22.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(30 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(37.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(45 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(52.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(60 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(67.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(75 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(82.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(90 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(97.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(105 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(112.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(120 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(127.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(135 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(142.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(150 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(157.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(165 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(172.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(180 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(187.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(195 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(202.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(210 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(217.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(225 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(232.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(240 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(247.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(255 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(262.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(270 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(277.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(285 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(292.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(300 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(307.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(315 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(322.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(330 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(337.5 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(345 120 120)"/>
+    <rect x="119.2" y="88.5" width="1.7" height="6" rx="0.6" transform="rotate(352.5 120 120)"/>
+  </g>
+
+  <!-- ⑧ 全环粗体铭文（凿刻） -->
+  <path id="legend" d="M 120 18 A 102 102 0 1 1 119.99 18" fill="none"/>
+  <g font-family="Inter,'SF Pro Display','PingFang SC',system-ui,sans-serif" font-weight="800" letter-spacing="2.4">
+    <text font-size="10.5" fill="#F6DE8C" opacity="0.5" dy="1.1"><textPath href="#legend" startOffset="1%">★ QUANTUM LIGHTNING ★ PEER TO PEER ★ FAIR MINED ★ QLX ★ 2026 ★</textPath></text>
+    <text font-size="10.5" fill="#4A3004"><textPath href="#legend" startOffset="1%">★ QUANTUM LIGHTNING ★ PEER TO PEER ★ FAIR MINED ★ QLX ★ 2026 ★</textPath></text>
+  </g>
+
+  <!-- ⑨ 巨型中心符号 -->
+  <g transform="rotate(-4 120 120)">
+    <use href="#boltP" transform="translate(3 3.4) translate(61 31.2) scale(5 7.4)" fill="#3B2602" opacity="0.32"/>
+    <use href="#boltP" transform="translate(-1.2 -1.3) translate(61 31.2) scale(5 7.4)" fill="#FFF0B4" opacity="0.5"/>
+    <use href="#boltP" transform="translate(61 31.2) scale(5 7.4)" fill="url(#glyphG)"/>
+    <!-- 符号内部蚀刻元件 -->
+    <g clip-path="url(#boltClip)">
+      <g stroke="#8A5F0E" stroke-opacity="0.38" stroke-width="1.2" fill="none">
+        <path d="M148 78 L124 118"/>
+        <path d="M116 132 L102 156"/>
+      </g>
+      <g fill="#8A5F0E" opacity="0.32">
+        <circle cx="140" cy="80" r="2.4"/><circle cx="118" cy="124" r="2.4"/><circle cx="104" cy="152" r="2.4"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- ⑩ 环境光 + 暗角 -->
+  <circle cx="120" cy="120" r="118" fill="url(#sheen)"/>
+  <circle cx="120" cy="120" r="118" fill="url(#vig)"/>
+</svg>

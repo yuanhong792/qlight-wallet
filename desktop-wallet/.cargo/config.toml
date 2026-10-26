@@ -1,0 +1,6 @@
+# Windows 交叉编译：llvm-mingw 工具链（LLVM 实现，无 libgcc）
+# 目标必须用 x86_64-pc-windows-gnullvm（Rust 专为 llvm-mingw 提供的标准库），
+# 普通 *-gnu 目标的 std 链接 -lgcc/-lgcc_eh，llvm-mingw 不提供 → 必然链接失败
+[target.x86_64-pc-windows-gnullvm]
+linker = "x86_64-w64-mingw32-clang"
+ar = "x86_64-w64-mingw32-ar"

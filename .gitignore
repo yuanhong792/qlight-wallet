@@ -1,0 +1,25 @@
+# ---- 构建产物（可随时重新生成，不入库）----
+desktop-wallet/build/
+*.dmg
+*.zip
+*.exe
+
+# ---- Rust（编译输出已固定在仓库外，防呆）----
+target/
+qlx-build-target*/
+
+# ---- macOS 垃圾 ----
+.DS_Store
+._*
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+
+# ---- 前端依赖（如未来引入）----
+node_modules/
+
+# ---- 运行期数据（钱包数据在 ~/Library/Application Support，防呆）----
+*.ledger.json
+blocks.jsonl
+ledger.json

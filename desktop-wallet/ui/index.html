@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>QLight Wallet · 量子闪电</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ 创建钱包 ============ -->
+<div id="view-create" class="view auth hidden">
+  <div class="auth-card">
+    <img src="assets/coin-face-reverse.png" width="72" height="72" alt="">
+    <h1 data-i18n="create.title">创建 QLight 钱包</h1>
+    <p class="muted" data-i18n="create.sub">ML-DSA-65 后量子账户 · ql1 地址 · 密钥加密存储于本机</p>
+    <input id="input-pass" type="password" data-i18n-ph="create.pass" placeholder="设置密码（≥ 8 位）" autocomplete="new-password">
+    <input id="input-pass2" type="password" data-i18n-ph="create.pass2" placeholder="重复密码" autocomplete="new-password">
+    <button id="btn-create" class="btn-primary" data-i18n="create.btn">创建钱包</button>
+    <button id="btn-restore-dat" class="btn-ghost" data-i18n="backup.restore">从 .dat 备份文件恢复</button>
+    <p class="muted small" data-i18n="create.note">密码用于加密本机密钥库（Argon2id + AES-256-GCM），丢失即无法找回。</p>
+    <div class="error" id="err-create"></div>
+    <div class="ok" id="ok-create" hidden></div>
+  </div>
+</div>
+
+<!-- ============ 解锁 ============ -->
+<div id="view-lock" class="view auth hidden">
+  <div class="auth-card">
+    <img src="assets/coin-face-reverse.png" width="72" height="72" alt="">
+    <h1 data-i18n="lock.title">欢迎回来</h1>
+    <p class="muted" data-i18n="lock.sub">输入钱包密码解锁</p>
+    <input id="input-unlock" type="password" data-i18n-ph="lock.pass" placeholder="钱包密码" autocomplete="current-password">
+    <button id="btn-unlock" class="btn-primary" data-i18n="lock.btn">解锁</button>
+    <div class="error" id="err-unlock"></div>
+  </div>
+</div>
+
+<!-- ============ 主界面（浅色主流钱包布局：左侧导航 + 内容区） ============ -->
+<div id="view-main" class="view shell hidden">
+
+  <aside class="sidebar">
+    <div class="sb-brand">
+      <img src="assets/coin-face-reverse.png" width="34" height="34" alt="">
+      <div><b>QLight</b><span class="muted sb-sub" data-i18n="brand.sub">量子闪电钱包</span></div>
+    </div>
+    <nav class="sb-nav">
+      <button class="sb-item active" data-page="asset" data-i18n="nav.wallet">◈ 钱包</button>
+      <button class="sb-item" data-page="mine" data-i18n="nav.mine">⛏ 挖矿</button>
+      <button class="sb-item" data-page="history" data-i18n="nav.history">≡ 活动</button>
+      <button class="sb-item" data-page="about" data-i18n="nav.about">ⓘ 关于</button>
+    </nav>
+    <div class="sb-bottom">
+      <span class="badge" data-i18n="nav.badge">模拟链 regtest</span>
+      <select id="lang-select" class="lang-select" aria-label="Language"></select>
+      <button id="btn-backup" class="btn-ghost small" data-i18n="backup.export">💾 备份钱包</button>
+      <button id="btn-lock" class="btn-ghost small" data-i18n="nav.lock">🔒 锁定钱包</button>
+      <span class="muted small" id="backup-status" hidden></span>
+    </div>
+  </aside>
+
+  <main class="content">
+    <!-- 网络条 -->
+    <div class="netbar">
+      <span class="chip"><i class="dot"></i><span data-i18n="net.chain">QLight regtest</span></span>
+      <span class="chip"><span data-i18n="net.height">块高</span> <b id="stat-height">–</b></span>
+      <span class="chip" id="net-chip">◦ 单机演示</span>
+      <span class="addr-mini" id="addr-mini">ql1…</span>
+    </div>
+
+    <!-- ◈ 钱包页 -->
+    <section class="page" id="page-asset">
+      <div class="hero">
+        <div class="hero-balance">
+          <div class="hero-label"><span data-i18n="hero.label">总余额</span> <span class="muted small" data-i18n="hero.unit">QLX 权益（模拟链演示）</span></div>
+          <div class="hero-num" id="bal-int-big">0</div>
+          <div class="hero-frac" id="bal-frac-big">.000000000</div>
+        </div>
+        <div class="quick">
+          <button class="q-btn" id="btn-receive">↓<span data-i18n="act.receive">收款</span></button>
+          <button class="q-btn" id="btn-send-open">↑<span data-i18n="act.send">转账</span></button>
+          <button class="q-btn" id="btn-mine-open">⛏<span data-i18n="act.mine">挖矿</span></button>
+        </div>
+      </div>
+
+      <div class="asset-row">
+        <div class="asset-token">
+          <div class="coin-ico">
+            <img src="assets/coin-face-reverse.png" width="46" height="46" alt="QLX">
+          </div>
+          <div><b data-i18n="asset.name">Quantum Lightning</b><div class="muted small" data-i18n="asset.sub">QLX 权益 · ML-DSA-65 账户</div></div>
+        </div>
+        <div class="asset-right"><b id="asset-bal">0 QLX</b></div>
+      </div>
+
+      <!-- 收款面板 -->
+      <div class="panel" id="receive-card" hidden>
+        <div class="panel-title" data-i18n="recv.title">你的收款地址</div>
+        <div class="recv-qr" id="recv-qr"></div>
+        <div class="muted small recv-qr-cap" data-i18n="recv.qr">扫码或复制地址收款</div>
+        <code class="addr-full" id="addr"></code>
+        <button id="btn-copy" class="btn-ghost small" data-i18n="recv.copy">复制地址</button>
+      </div>
+
+      <!-- 转账面板 -->
+      <div class="panel" id="send-card" hidden>
+        <div class="panel-title" data-i18n="send.title">转账</div>
+        <input id="input-to" type="text" data-i18n-ph="send.to.ph" placeholder="收款地址 ql1…" spellcheck="false">
+        <div class="send-grid2">
+          <input id="input-amount" type="text" data-i18n-ph="send.amount.ph" placeholder="数量（QLX）" inputmode="decimal">
+          <button id="btn-send" class="btn-primary inline" data-i18n="send.btn">签发交易</button>
+        </div>
+        <div class="muted small" data-i18n="send.fee">手续费 0.001 QLX · QL-TX-v1 canonical CBOR + ML-DSA-65 签名</div>
+        <div class="error" id="err-send"></div>
+        <div class="ok" id="tx-ok" hidden></div>
+      </div>
+    </section>
+
+    <!-- ⛏ 挖矿页 -->
+    <section class="page hidden" id="page-mine">
+      <div class="mine-cards">
+        <div class="mine-card">
+          <div class="k" data-i18n="mine.earned">本节点累计挖到</div>
+          <div class="v gold" id="mine-earned">–</div>
+        </div>
+        <div class="mine-card"><div class="k" data-i18n="mine.reward">块奖励</div><div class="v" id="stat-reward">–</div></div>
+        <div class="mine-card"><div class="k" data-i18n="mine.minted">全网已排放</div><div class="v" id="stat-minted">–</div></div>
+        <div class="mine-card"><div class="k" data-i18n="mine.cap">硬顶占比</div><div class="v" id="stat-cap">0.000%</div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title"><span data-i18n="mine.progress">排放进度</span> <span class="tag" data-i18n="mine.tag">每 2s 出块</span></div>
+        <div class="bar"><i id="cap-bar" style="width:0.0000002%"></i></div>
+        <div class="muted small" data-i18n="mine.note">210,000,000 QLX 硬顶 · 第 0 纪元（31.5M 块 ≈ 2 年后首次减半）</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title"><span data-i18n="mine.vrf">VRF 存活心跳</span> <span class="tag">SHAKE-256</span></div>
+        <div class="vrf-log" id="vrf-log"></div>
+      </div>
+    </section>
+
+    <!-- ≡ 活动页 -->
+    <section class="page hidden" id="page-history">
+      <div class="panel">
+        <div class="panel-title" data-i18n="hist.title">交易活动</div>
+        <div id="tx-list" class="tx-list"></div>
+      </div>
+    </section>
+
+    <!-- ⓘ 关于页（版本 / 新手引导 / 安全须知 / 审计） -->
+    <section class="page hidden" id="page-about">
+      <div class="panel">
+        <div class="panel-title" data-i18n="about.title">关于 QLight Wallet</div>
+        <div class="about-head">
+          <img src="assets/coin-face-reverse.png" width="52" height="52" alt="">
+          <div>
+            <b>QLight Wallet</b>
+            <div class="muted small" data-i18n="about.ver">版本 0.1.0 · QLight 本地演示网络（regtest）</div>
+          </div>
+        </div>
+        <p class="muted small" data-i18n="about.intro"></p>
+        <div class="about-chips">
+          <span class="tag">ML-DSA-65 · FIPS 204</span>
+          <span class="tag">SHAKE-256 · FIPS 202</span>
+          <span class="tag">Argon2id + AES-256-GCM</span>
+          <span class="tag">QL-TX-v1 canonical CBOR</span>
+          <span class="tag">VRF 心跳挖矿</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title" data-i18n="about.howto">三步上手</div>
+        <ol class="about-steps">
+          <li><span class="step-no">1</span><div><b data-i18n="about.s1t">① 先备份钱包</b><div class="muted small" data-i18n="about.s1"></div></div></li>
+          <li><span class="step-no">2</span><div><b data-i18n="about.s2t">② 把地址给对方（收款）</b><div class="muted small" data-i18n="about.s2"></div></div></li>
+          <li><span class="step-no">3</span><div><b data-i18n="about.s3t">③ 转账</b><div class="muted small" data-i18n="about.s3"></div></div></li>
+        </ol>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title" data-i18n="about.safe">安全须知</div>
+        <div class="about-warn">⚠️ <span data-i18n="about.safe1"></span></div>
+        <div class="about-warn">🛡️ <span data-i18n="about.safe2"></span></div>
+        <div class="muted small" data-i18n="about.safe3"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title" data-i18n="about.audit">账本可审计</div>
+        <p class="muted small" data-i18n="about.auditline"></p>
+        <p class="muted small" data-i18n="about.net"></p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="i18n.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

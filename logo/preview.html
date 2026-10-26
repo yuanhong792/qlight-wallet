@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QLight / QLX 视觉资产规范 v1.0（定稿）</title>
+<style>
+  :root {
+    --bg:#081A38; --panel:#0E2450; --ink:#F4F7FF; --muted:#8FA3C8;
+    --gold:#E3B54A; --gold-lt:#FBE7A8; --gold-dk:#7A5410; --navy:#0A1B3D;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--ink); font-family:'PingFang SC',Inter,system-ui,sans-serif; padding:40px 24px 80px; }
+  .wrap { max-width:1100px; margin:0 auto; }
+  h1 { font-size:28px; letter-spacing:-0.5px; }
+  .sub { color:var(--muted); font-size:14px; margin:6px 0 36px; }
+  h2 { font-size:18px; margin:44px 0 16px; padding-left:10px; border-left:3px solid var(--gold); }
+  .grid { display:grid; gap:16px; }
+  .g2 { grid-template-columns:repeat(2,1fr); }
+  .card { background:var(--panel); border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:24px; display:flex; flex-direction:column; align-items:center; gap:14px; }
+  .card img { max-width:100%; border-radius:8px; }
+  .label { color:var(--muted); font-size:12px; letter-spacing:1px; text-align:center; }
+  .ph { width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; border:1px dashed rgba(255,255,255,.2); border-radius:8px; color:var(--muted); font-size:13px; text-align:center; padding:20px; }
+  .sw { border-radius:12px; overflow:hidden; border:1px solid rgba(255,255,255,.08); }
+  .sw .c { height:86px; }
+  .sw .t { padding:10px; font-size:12px; background:var(--panel); }
+  .sw .t b { display:block; } .sw .t span { color:var(--muted); font-size:11px; }
+  .rules { display:grid; gap:9px; color:var(--muted); font-size:14px; line-height:1.7; }
+  .ok::before { content:"✅ "; } .no::before { content:"❌ "; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th,td { text-align:left; padding:10px 12px; border-bottom:1px solid rgba(255,255,255,.08); color:var(--muted); }
+  th { color:var(--ink); }
+  .note { color:var(--muted); font-size:13.5px; line-height:1.9; }
+  .note b { color:var(--ink); }
+  code { background:rgba(255,255,255,.08); padding:2px 6px; border-radius:4px; font-size:12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>QLight / QLX 视觉资产规范 · v1.0（定稿）</h1>
+  <div class="sub">量子闪电 · 抗量子结算链 —— 金质纪念币视觉体系（2026-10-22 定稿）</div>
+
+  <h2>一、官方币面（正 / 反）</h2>
+  <div class="grid g2">
+    <div class="card">
+      <img src="qlx-coin-front.png" alt="QLX 币面 · 正面"
+           onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+      <div class="ph" style="display:none;">正面：巨型闪电贯穿电路蚀刻场区<br>（把图片另存为 <code>logo/qlx-coin-front.png</code>）</div>
+      <div class="label">正面 · OBVERSE｜⚡ 符号 + 电路蚀刻 + 全环铭文</div>
+    </div>
+    <div class="card">
+      <img src="qlx-coin-back.png" alt="QLX 币面 · 背面"
+           onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+      <div class="ph" style="display:none;">背面：QLX 字标 + 节点网络图<br>（把图片另存为 <code>logo/qlx-coin-back.png</code>）</div>
+      <div class="label">背面 · REVERSE｜QLX 字标 + 节点网络（参与者网络）</div>
+    </div>
+  </div>
+  <p class="note" style="margin-top:14px">
+    <b>设计语义</b>：正面 = <b>⚡ 闪电</b>（价值与速度，"量子闪电"）；背面 = <b>节点网络</b>（每一个节点都是一个真实参与者——验证者、钱包节点、创作者、开发者，对应 §12 的五类挖矿池）；全环铭文 <b>PEER TO PEER / FAIR MINED / QLX / 2026</b> 把产品主张直接铸在资产上。
+  </p>
+
+  <h2>二、色彩规范</h2>
+  <div class="grid" style="grid-template-columns:repeat(5,1fr);">
+    <div class="sw"><div class="c" style="background:linear-gradient(135deg,#FBE7A8,#E3B54A 55%,#9A6E12)"></div><div class="t"><b>金 · 高光</b><span>#FBE7A8</span></div></div>
+    <div class="sw"><div class="c" style="background:linear-gradient(135deg,#F3D98C,#C9962C 60%,#7A5410)"></div><div class="t"><b>金 · 主体</b><span>#E3B54A / #C9962C</span></div></div>
+    <div class="sw"><div class="c" style="background:#7A5410"></div><div class="t"><b>金 · 暗部</b><span>#7A5410 · 阴刻/勾边</span></div></div>
+    <div class="sw"><div class="c" style="background:linear-gradient(135deg,#0C2050,#081A38)"></div><div class="t"><b>深空蓝</b><span>#081A38 · 底色</span></div></div>
+    <div class="sw"><div class="c" style="background:#F4F7FF"></div><div class="t"><b>星白</b><span>#F4F7FF · 文字</span></div></div>
+  </div>
+
+  <h2>三、字体与铭文</h2>
+  <table>
+    <tr><th>元素</th><th>字体</th><th>规则</th></tr>
+    <tr><td>币面环形铭文</td><td>衬线/无衬线大写，字距放宽</td><td>全大写；★ 作分隔符；沿圆周连续排布</td></tr>
+    <tr><td>背面 QLX 字标</td><td>Heavy / Black</td><td>金属浮雕效果，中心对齐</td></tr>
+    <tr><td>官网/文档品牌字</td><td>Inter ExtraBold</td><td>"QLight" 字距 -0.5；副线大写大字距</td></tr>
+    <tr><td>中文</td><td>思源黑体 / PingFang SC</td><td>Medium；仅作说明性副标题</td></tr>
+  </table>
+
+  <h2>四、使用规范</h2>
+  <div class="rules">
+    <div class="ok">币面图使用时保持深空蓝底或纯黑底，不加额外投影/描边。</div>
+    <div class="ok">最小尺寸：完整币面 ≥ 96px；仅符号（⚡ 或 QLX）≥ 24px。</div>
+    <div class="ok">多尺寸导出：1024 / 512 / 256 / 128 / 64 全套 PNG + favicon.ico。</div>
+    <div class="no">不得拉伸变形、不得改金色、不得把 ⚡ 单独放进"闪电币"式文案中。</div>
+    <div class="no">合规红线：对外统一称 <b>QLX 凭证 / QLX 权益</b>，<b>不称"币"</b>（白皮书 §16、TOKEN.md §1.1）。</div>
+  </div>
+
+  <h2>五、文件清单</h2>
+  <table>
+    <tr><th>路径</th><th>用途</th></tr>
+    <tr><td><code>logo/qlx-coin-front.png</code></td><td>正面源图（建议 ≥ 2048px 宽）</td></tr>
+    <tr><td><code>logo/qlx-coin-back.png</code></td><td>背面源图</td></tr>
+    <tr><td><code>logo/qlx-coin-front.svg</code> / <code>-back.svg</code></td><td>矢量版（若可导出，用于印刷与动效）</td></tr>
+    <tr><td><code>logo/exports/</code></td><td>多尺寸 PNG 导出与 favicon</td></tr>
+    <tr><td><code>logo/draft/</code></td><td>前期矢量草稿（仅供参考，已不作为定稿）</td></tr>
+  </table>
+
+  <h2>六、待办</h2>
+  <div class="rules">
+    <div class="ok">① 把正/反面源图落盘到 <code>logo/</code>，本页即可显示成图。</div>
+    <div class="ok">② 中文标「量子闪电」专属字标设计。</div>
+    <div class="ok">③ 动效版：闪电划过后电路依次点亮（社区传播素材）。</div>
+    <div class="ok">④ 实物/3D：币缘滚花、浮雕高度，用于落地与周边。</div>
+  </div>
+</div>
+</body>
+</html>

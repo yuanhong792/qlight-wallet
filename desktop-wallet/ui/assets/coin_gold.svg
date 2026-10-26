@@ -1,0 +1,36 @@
+<!-- 迷你金质币（UILINT：对齐官方币面正面的电路蚀刻语言） -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <radialGradient id="field" cx="0.4" cy="0.32" r="0.9">
+      <stop offset="0" stop-color="#F3D98C"/>
+      <stop offset="0.55" stop-color="#D9A832"/>
+      <stop offset="1" stop-color="#8A5C10"/>
+    </radialGradient>
+    <linearGradient id="g" x1="0.1" y1="0" x2="0.95" y2="1">
+      <stop offset="0" stop-color="#FBE7A8"/>
+      <stop offset="0.45" stop-color="#E3B54A"/>
+      <stop offset="1" stop-color="#A87A18"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.3" cy="0.24" r="0.85">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- 币缘 -->
+  <circle cx="32" cy="32" r="30" fill="url(#g)"/>
+  <circle cx="32" cy="32" r="30" fill="none" stroke="#5E3D06" stroke-opacity="0.7" stroke-width="1"/>
+  <circle cx="32" cy="32" r="27" fill="url(#field)" stroke="#4F3405" stroke-opacity="0.75" stroke-width="1.4"/>
+  <!-- 同心电路走线 -->
+  <circle cx="32" cy="32" r="22" fill="none" stroke="#7A5410" stroke-opacity="0.55" stroke-width="1.4"/>
+  <circle cx="32" cy="32" r="17" fill="none" stroke="#F2D47F" stroke-opacity="0.5" stroke-width="0.9" stroke-dasharray="1.6 2.6"/>
+  <!-- 梳齿 -->
+  <circle cx="32" cy="32" r="25" fill="none" stroke="#F6DE8C" stroke-opacity="0.55" stroke-width="4" stroke-dasharray="1 2.4"/>
+  <!-- Q 符号（暗部勾边+主体） -->
+  <circle cx="30" cy="32" r="9.5" fill="none" stroke="#4F3405" stroke-width="4.4" stroke-opacity="0.6"/>
+  <circle cx="30" cy="32" r="9.5" fill="none" stroke="url(#g)" stroke-width="3.4"/>
+  <path d="M31.15 19 L23.9 31 L31 31 L30.15 41 L37.4 29 L31 29 Z" fill="#4F3405" stroke="#4F3405" stroke-width="1.6" stroke-linejoin="round" opacity="0.62"/>
+  <path d="M31.15 19 L23.9 31 L31 31 L30.15 41 L37.4 29 L31 29 Z" fill="url(#g)"/>
+  <path d="M38 39 L43.5 44.5 L40.5 47.5 L35.5 42.5 Z" fill="#4F3405" stroke="#4F3405" stroke-width="1.4" stroke-opacity="0.62"/>
+  <path d="M38 39 L43.5 44.5 L40.5 47.5 L35.5 42.5 Z" fill="url(#g)"/>
+  <circle cx="32" cy="32" r="30" fill="url(#sheen)"/>
+</svg>

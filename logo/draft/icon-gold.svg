@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="256" height="256">
+  <defs>
+    <linearGradient id="gsym" x1="0.1" y1="0" x2="0.95" y2="1">
+      <stop offset="0" stop-color="#FCE9A6"/>
+      <stop offset="0.42" stop-color="#E0B03E"/>
+      <stop offset="1" stop-color="#A87A18"/>
+    </linearGradient>
+    <radialGradient id="gfield" cx="0.5" cy="0.5" r="0.72">
+      <stop offset="0" stop-color="#F6DE8C" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#F6DE8C" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gsheen" cx="0.3" cy="0.24" r="0.85">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="#0A0E27"/>
+
+  <!-- 电路纹暗示（与币面同语言） -->
+  <g fill="none" stroke="#F2D47F" stroke-opacity="0.4">
+    <circle cx="32" cy="32" r="26" stroke-width="0.7" stroke-dasharray="1 2.4"/>
+    <circle cx="32" cy="32" r="22" stroke-width="0.7" stroke-dasharray="1 2.4"/>
+    <circle cx="32" cy="32" r="29" stroke-width="0.6" stroke-opacity="0.28"/>
+  </g>
+  <circle cx="32" cy="32" r="30" fill="url(#gfield)"/>
+
+  <!-- Q 环 + 贯穿闪电 + Q 尾（金） -->
+  <circle cx="32" cy="32" r="16" fill="none" stroke="#3A2A05" stroke-width="5.4" stroke-opacity="0.6"/>
+  <circle cx="32" cy="32" r="16" fill="none" stroke="url(#gsym)" stroke-width="4.5"/>
+
+  <path d="M33.35 12 L19.85 36 L32 36 L30.65 52 L44.15 28 L32 28 Z" fill="#3A2A05" stroke="#3A2A05" stroke-width="2.6" stroke-linejoin="round" opacity="0.75"/>
+  <path d="M33.35 12 L19.85 36 L32 36 L30.65 52 L44.15 28 L32 28 Z" fill="url(#gsym)"/>
+
+  <path d="M43 43 L49.5 49.5 L46 53.5 L39.5 47 Z" fill="#3A2A05" stroke="#3A2A05" stroke-width="2.2" stroke-linejoin="round" opacity="0.75"/>
+  <path d="M43 43 L49.5 49.5 L46 53.5 L39.5 47 Z" fill="url(#gsym)"/>
+
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="url(#gsheen)"/>
+</svg>

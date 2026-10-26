@@ -1,0 +1,52 @@
+[package]
+name = "qlight-wallet"
+version = "0.1.0"
+description = "QLight / QLX 抗量子桌面钱包（M1 PoC）"
+edition = "2021"
+rust-version = "1.82"
+
+[lib]
+name = "qlight_wallet_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# —— 后量子签名：ML-DSA-65（RustCrypto 纯 Rust，FIPS 204）——
+ml-dsa = "0.1"
+getrandom = "0.4"
+
+# —— 哈希 / 地址 ——
+sha3 = "0.10"
+bech32 = "0.11"
+hex = "0.4"
+
+# —— 密钥库加密（落盘安全）——
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = "1"
+
+# —— 收款二维码（纯 Rust 生成 SVG，无网络依赖）——
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+# —— B 档联邦网络：libp2p（gossipsub 广播 + mDNS 本地发现）——
+libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "mdns", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+futures = "0.3"
+# 多实例数据目录文件锁（同机双开钱包 → 自动隔离账本）
+fs2 = "0.4"
+# 追账快照压缩（整链 JSON 冗余极高，gzip 缩小约 10 倍；纯 Rust 后端，交叉编译友好）
+flate2 = "1"
+base64 = "0.22"
+# 诊断日志（RUST_LIB 设了才输出；libp2p 0.5x 用 tracing，env_logger 接不住）
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+strip = true
