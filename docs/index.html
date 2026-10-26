@@ -68,7 +68,17 @@
     .btn small { display: block; font-weight: 400; font-size: 11.5px; opacity: .8; }
     .dl-note { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 14px; }
 
-    /* —— 特性 —— */
+    /* —— 截图 —— */
+.shots { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+.shots img { width: 100%; border-radius: 14px; border: 1px solid var(--line);
+  box-shadow: 0 14px 40px rgba(30,35,48,.12); display: block; }
+.shots .cap { text-align: center; color: var(--muted); font-size: 13px; margin-top: 10px; }
+.shot-wide { margin-top: 22px; text-align: center; }
+.shot-wide img { max-width: 760px; width: 100%; border-radius: 14px; border: 1px solid var(--line);
+  box-shadow: 0 14px 40px rgba(30,35,48,.12); }
+@media (max-width: 760px) { .shots { grid-template-columns: 1fr; } }
+
+/* —— 特性 —— */
     .section { padding: 64px 0; }
     .section > h2 { text-align: center; font-size: 27px; margin-bottom: 8px; }
     .section > .lead { text-align: center; color: var(--muted); margin-bottom: 40px; font-size: 15px; }
@@ -124,6 +134,7 @@
     <img src="assets/favicon.png" alt="QLight">
     <div class="brand">QLight Wallet <small>抗量子桌面钱包</small></div>
     <div class="links">
+      <a href="#shots">界面</a>
       <a href="#features">特性</a>
       <a href="#genesis">创世宣言</a>
       <a href="#download">下载</a>
@@ -151,6 +162,25 @@
   </div>
   <p class="dl-note">免安装绿色版 · 数据本地加密存储 · 无需注册任何账号</p>
 </header>
+
+<section class="section wrap" id="shots">
+  <h2>界面一览</h2>
+  <p class="lead">真实运行截图 · 同一笔联邦转账的两端视角。</p>
+  <div class="shots">
+    <div>
+      <img src="screenshots/wallet-asset.png" alt="主界面：余额、联邦状态、收款二维码">
+      <div class="cap">主界面 · 余额 / 联邦状态 / 收款二维码</div>
+    </div>
+    <div>
+      <img src="screenshots/wallet-activity.png" alt="活动明细：付款与收款完整地址直显">
+      <div class="cap">活动明细 · 付款 / 收款完整地址、时间、块高、手续费直显</div>
+    </div>
+  </div>
+  <div class="shot-wide">
+    <img src="screenshots/wallet-activity-sent.png" alt="付款方视角的活动明细">
+    <div class="cap">付款方视角（英文界面）· 同一笔转账，双方账本完全一致</div>
+  </div>
+</section>
 
 <section class="section wrap" id="features">
   <h2>为什么是 QLight</h2>
