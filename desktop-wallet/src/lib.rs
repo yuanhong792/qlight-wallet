@@ -14,6 +14,7 @@ pub mod keystore;
 pub mod net;
 pub mod simchain;
 pub mod tx;
+pub mod world;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -41,6 +42,7 @@ pub fn run() {
             let keystore_path = data_dir.join("keystore.json");
             let ledger_path = data_dir.join("ledger.json");
             let blocks_path = data_dir.join("blocks.jsonl");
+            let entities_path = data_dir.join("entities.jsonl");
             let chain =
                 simchain::SimChain::new(ledger_path.clone(), blocks_path.clone());
 
@@ -61,6 +63,7 @@ pub fn run() {
                 keystore_path,
                 ledger_path,
                 blocks_path,
+                entities: Arc::new(world::EntityLedger::new(entities_path)),
                 chain: chain.clone(),
                 core: core_slot,
                 net,
@@ -82,6 +85,12 @@ pub fn run() {
             commands::export_backup,
             commands::import_backup,
             commands::net_status,
+            commands::world_snapshot,
+            commands::world_place,
+            commands::world_rename,
+            commands::world_move,
+            commands::world_release,
+            commands::world_proof,
         ])
         .run(tauri::generate_context!())
         .expect("QLight Wallet 启动失败");

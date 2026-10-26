@@ -47,6 +47,7 @@
       <button class="sb-item active" data-page="asset" data-i18n="nav.wallet">◈ 钱包</button>
       <button class="sb-item" data-page="mine" data-i18n="nav.mine">⛏ 挖矿</button>
       <button class="sb-item" data-page="history" data-i18n="nav.history">≡ 活动</button>
+      <button class="sb-item" data-page="world" data-i18n="nav.world">🌍 世界</button>
       <button class="sb-item" data-page="about" data-i18n="nav.about">ⓘ 关于</button>
     </nav>
     <div class="sb-bottom">
@@ -150,6 +151,62 @@
       </div>
     </section>
 
+    <!-- 🌍 世界页（确定性渲染 + 实体编辑器） -->
+    <section class="page hidden" id="page-world">
+      <div class="world-wrap">
+        <div class="panel world-map-col">
+          <div class="panel-title">
+            <span data-i18n="world.map">世界地图</span>
+            <span class="tag" data-i18n="world.map.tag">本地确定性渲染</span>
+          </div>
+          <canvas id="world-canvas" width="256" height="256" aria-label="world"></canvas>
+          <div class="hotbar" id="world-hotbar"></div>
+          <div class="world-cursor" id="world-cursor">X – · Z –</div>
+          <div class="muted small" data-i18n="world.map.note"></div>
+        </div>
+
+        <div class="world-side-col">
+          <div class="panel">
+            <div class="panel-title">
+              <span data-i18n="world.f3">世界状态</span>
+              <span class="tag">SHAKE-256 · ML-DSA-65</span>
+            </div>
+            <dl class="f3" id="world-f3"></dl>
+          </div>
+
+          <div class="panel">
+            <div class="panel-title"><span data-i18n="world.editor">世界编辑器</span> <span class="tag" id="world-slot-tag">slot 0</span></div>
+            <input id="ent-name" type="text" maxlength="64" data-i18n-ph="world.name.ph" placeholder="给它起个名字" spellcheck="false">
+            <div class="send-grid2">
+              <input id="ent-x" type="number" min="0" max="255" value="0" data-i18n-ph="world.x.ph" placeholder="X">
+              <input id="ent-z" type="number" min="0" max="255" value="0" data-i18n-ph="world.z.ph" placeholder="Z">
+            </div>
+            <select id="ent-parent" class="w-select"></select>
+            <button id="btn-place" class="btn-primary inline" data-i18n="world.btn.place">签名并放置</button>
+            <div class="error" id="err-world"></div>
+            <div class="ok" id="ok-world" hidden></div>
+            <div class="muted small" data-i18n="world.editor.note"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-title">
+              <span data-i18n="world.selected">选中的实体</span>
+              <span class="muted small" id="ent-sel-hint" data-i18n="world.sel.hint"></span>
+            </div>
+            <div id="ent-sel" class="ent-sel" hidden></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-title">
+              <span data-i18n="world.list">世界里的实体</span>
+              <span class="muted small" id="ent-count"></span>
+            </div>
+            <div id="ent-list" class="ent-list"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- ⓘ 关于页（版本 / 新手引导 / 安全须知 / 审计） -->
     <section class="page hidden" id="page-about">
       <div class="panel">
@@ -168,6 +225,7 @@
           <span class="tag">Argon2id + AES-256-GCM</span>
           <span class="tag">QL-TX-v1 canonical CBOR</span>
           <span class="tag">VRF 心跳挖矿</span>
+          <span class="tag">确定性世界 · 本地渲染</span>
         </div>
       </div>
 
@@ -197,6 +255,7 @@
 </div>
 
 <script src="i18n.js"></script>
+<script src="world.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

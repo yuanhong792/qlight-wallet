@@ -9,6 +9,7 @@ use crate::keystore::{self, Keystore, WalletCore};
 use crate::net;
 use crate::simchain::{self, bech32_decode_addr, BlockEvent, SimChain};
 use crate::tx;
+use crate::world;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tauri::{AppHandle, Emitter, State};
@@ -20,6 +21,8 @@ pub struct AppState {
     pub keystore_path: PathBuf,
     pub ledger_path: PathBuf,
     pub blocks_path: PathBuf,
+    /// 世界实体账本（entities.jsonl，append-only 哈希链；DESIGN.md §9.11）
+    pub entities: Arc<world::EntityLedger>,
     pub chain: Arc<SimChain>,
     /// 解锁核心槽（与 net 层共用同一个 Arc<RwLock>：锁定/解锁两侧自动同步）
     pub core: Arc<RwLock<Option<Arc<WalletCore>>>>,
@@ -428,3 +431,229 @@ pub fn net_status(state: AppCtx) -> serde_json::Value {
         "unlocked": state.core.read().unwrap().is_some(),
     })
 }
+
+// ---------------------------------------------------------------- 世界实体（DESIGN.md §9.11）
+
+/// 世界快照：渲染与查询所需的全部输入。
+///
+/// 分工口径（§9.8）：**链只给坐标与归属，像素全部在本地算**。本命令不返回任何
+/// 图片、不做任何渲染，只交出「创世哈希 + 每块 VRF + 实体状态」，由 ui/world.js
+/// 在本机确定性渲染出大陆——同一份输入，任何一台机器都必须得到同一片世界。
+#[derive(serde::Serialize)]
+pub struct WorldSnapshot {
+    pub genesis_hash_hex: String,
+    pub vrfs: Vec<String>,
+    pub height: u64,
+    pub world_w: u16,
+    pub world_h: u16,
+    pub chunk: u16,
+    pub era1_end_height: u64,
+    pub slot_count: u8,
+    pub entities: Vec<world::Entity>,
+    pub chunks: Vec<world::Chunk>,
+    pub report: world::Report,
+    pub address: String,
+    pub unlocked: bool,
+}
+
+/// 逐块读出 VRF 序列（世界的历史即种子；创世行的 VRF 是全零，异或进去不改变种子）
+fn vrf_sequence(blocks_path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(blocks_path) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if let Some(s) = v.get("vrf_hex").and_then(|x| x.as_str()) {
+            if s.len() == 64 {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[tauri::command]
+pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
+    let records = state.entities.load();
+    let (state_map, report) = world::replay(&records);
+    let core = state.core.read().unwrap().clone();
+    WorldSnapshot {
+        genesis_hash_hex: simchain::genesis_hash_hex(),
+        vrfs: vrf_sequence(&state.blocks_path),
+        height: state.chain.height(),
+        world_w: world::WORLD_W,
+        world_h: world::WORLD_H,
+        chunk: world::CHUNK,
+        era1_end_height: world::ERA1_END_HEIGHT,
+        slot_count: world::SLOT_COUNT,
+        chunks: world::chunk_roots(&state_map),
+        entities: state_map.into_values().collect(),
+        report,
+        address: core.as_ref().map(|c| c.address.clone()).unwrap_or_default(),
+        unlocked: core.is_some(),
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn check_coords(x: u16, y: u16, kind: u8) -> Result<(), String> {
+    if x >= world::WORLD_W || y >= world::WORLD_H {
+        return Err(format!("坐标 ({x},{y}) 超出世界边界 {}×{}", world::WORLD_W, world::WORLD_H));
+    }
+    if kind >= world::SLOT_COUNT {
+        return Err(format!("物品栏槽位 {kind} 非法（0..{}）", world::SLOT_COUNT - 1));
+    }
+    Ok(())
+}
+
+fn check_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("实体要有名字".into());
+    }
+    if name.len() > world::NAME_MAX {
+        return Err(format!("名称最长 {} 字节", world::NAME_MAX));
+    }
+    Ok(name.to_string())
+}
+
+/// 铸造一个实体：坐标 + 槽位 + 名字，由本机 ML-DSA-65 私钥签名后追加进实体账本
+#[tauri::command]
+pub fn world_place(
+    state: AppCtx,
+    name: String,
+    x: u16,
+    y: u16,
+    kind: u8,
+    parent_hex: String,
+) -> Result<world::EntityRecord, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    let name = check_name(&name)?;
+    check_coords(x, y, kind)?;
+    let parent_hex = parent_hex.trim().to_string();
+    if !parent_hex.is_empty() {
+        let (map, _) = world::replay(&state.entities.load());
+        match map.get(&parent_hex) {
+            Some(p) if !p.released => {}
+            Some(_) => return Err("父实体已无归属，不能再衍生".into()),
+            None => return Err("父实体不存在".into()),
+        }
+    }
+    let height = state.chain.height();
+    let ts = now_unix();
+    let draft = world::Draft {
+        op: world::op::CLAIM,
+        entity_id_hex: "",
+        parent_hex: &parent_hex,
+        name: &name,
+        x,
+        y,
+        kind,
+        height,
+        ts,
+    };
+    state.entities.commit(|seq, prev| world::sign_record(&core, seq, &prev, &draft))
+}
+
+/// 三条改写操作共用的前置检查：目标存在、未释放、且签名者就是当前归属者。
+///
+/// 必须在追加**之前**做完：一条语义非法的记录一旦落盘，整本账本从那条起
+/// 就再也重放不过去——世界不能因为一次误操作而消失。
+fn owned_for(
+    state: &AppState,
+    entity_id_hex: &str,
+    me: &str,
+) -> Result<world::Entity, String> {
+    let (map, report) = world::replay(&state.entities.load());
+    if !report.ok {
+        return Err(format!(
+            "实体账本第 {} 条起校验失败：{}。先排查账本再继续写入",
+            report.first_bad, report.reason
+        ));
+    }
+    let e = map.get(entity_id_hex).ok_or("实体不存在")?.clone();
+    if e.released {
+        return Err("该实体已释放归属，不可再改写".into());
+    }
+    if e.owner != me {
+        return Err("只有当前归属者能改写它".into());
+    }
+    Ok(e)
+}
+
+/// 对非 claim 操作，记录里仍要带一个合法名字（名字本身参与哈希链）
+fn op_record(
+    state: &AppState,
+    core: &Arc<WalletCore>,
+    op: &str,
+    e: &world::Entity,
+    x: u16,
+    y: u16,
+    name: &str,
+) -> Result<world::EntityRecord, String> {
+    let draft = world::Draft {
+        op,
+        entity_id_hex: &e.entity_id_hex,
+        parent_hex: "",
+        name,
+        x,
+        y,
+        kind: e.kind,
+        height: state.chain.height(),
+        ts: now_unix(),
+    };
+    state.entities.commit(|seq, prev| world::sign_record(core, seq, &prev, &draft))
+}
+
+#[tauri::command]
+pub fn world_rename(
+    state: AppCtx,
+    entity_id_hex: String,
+    name: String,
+) -> Result<world::EntityRecord, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    let name = check_name(&name)?;
+    let e = owned_for(&state, &entity_id_hex, &core.address)?;
+    op_record(&state, &core, world::op::RENAME, &e, e.x, e.y, &name)
+}
+
+#[tauri::command]
+pub fn world_move(
+    state: AppCtx,
+    entity_id_hex: String,
+    x: u16,
+    y: u16,
+) -> Result<world::EntityRecord, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    check_coords(x, y, 0)?;
+    let e = owned_for(&state, &entity_id_hex, &core.address)?;
+    op_record(&state, &core, world::op::MOVE, &e, x, y, &e.name)
+}
+
+/// 释放归属：实体永久留在账本里可查，只是不再有主人（§9.9 断租不删除）
+#[tauri::command]
+pub fn world_release(
+    state: AppCtx,
+    entity_id_hex: String,
+) -> Result<world::EntityRecord, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    let e = owned_for(&state, &entity_id_hex, &core.address)?;
+    op_record(&state, &core, world::op::RELEASE, &e, e.x, e.y, &e.name)
+}
+
+/// 导出某条实体的原始记录（含公钥与签名）：任何人可离线重算 record_hash 并验签
+#[tauri::command]
+pub fn world_proof(state: AppCtx, entity_id_hex: String) -> Result<String, String> {
+    let recs = state.entities.load();
+    let hit = recs
+        .iter()
+        .filter(|r| r.entity_id_hex == entity_id_hex)
+        .max_by_key(|r| r.seq)
+        .ok_or("账本里没有这个实体")?;
+    serde_json::to_string_pretty(hit).map_err(|e| e.to_string())
+}
+

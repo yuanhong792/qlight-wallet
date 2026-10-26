@@ -106,6 +106,45 @@
     .genesis .note { color: var(--muted); font-size: 13px; }
     .genesis .note b { color: var(--gold-dk); }
 
+    /* —— 确定性世界 —— */
+    .world-grid { display: grid; grid-template-columns: 320px 1fr; gap: 24px; align-items: start; }
+    @media (max-width: 780px) { .world-grid { grid-template-columns: 1fr; } }
+    .world-map { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
+    .world-map canvas {
+      width: 100%; height: auto; aspect-ratio: 1 / 1; display: block; border-radius: 10px;
+      image-rendering: pixelated; image-rendering: crisp-edges;
+    }
+    .world-map .cap { text-align: center; color: var(--muted); font-size: 12px; margin-top: 10px; }
+    .fp { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: #F6F7FB;
+      border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; margin-top: 8px;
+      display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .fp span:first-child { color: var(--muted); }
+    .fp b { color: var(--gold-dk); }
+    .fp .ok { color: var(--green); font-weight: 700; }
+    .fp .bad { color: #D93025; font-weight: 700; }
+    .world-side { display: flex; flex-direction: column; gap: 14px; }
+    .axiom { background: linear-gradient(160deg, #FFFDF6, #FBF3DC); border: 1px solid var(--gold-lt);
+      border-radius: 16px; padding: 20px 22px; }
+    .axiom code { font-family: "SF Mono", Menlo, Consolas, monospace; color: var(--gold-dk); font-size: 13px; }
+    .axiom .eq { display: block; background: #fff; border: 1px dashed var(--gold); border-radius: 10px;
+      padding: 12px 14px; margin-bottom: 12px; font-size: 14px; text-align: center; }
+    .axiom p { color: var(--muted); font-size: 13.5px; }
+    .axiom p b { color: var(--ink); }
+    .ctrl { display: flex; gap: 10px; flex-wrap: wrap; }
+    .wbtn { font: inherit; font-size: 13px; padding: 8px 14px; border-radius: 10px;
+      border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; transition: all .18s; }
+    .wbtn:hover { border-color: var(--gold); color: var(--gold-dk); }
+    .wbtn.on { background: var(--gold-lt); border-color: var(--gold); color: var(--gold-dk); font-weight: 600; }
+    .drop { border: 1px dashed var(--line); border-radius: 12px; padding: 14px;
+      color: var(--muted); font-size: 13px; text-align: center; cursor: pointer; transition: all .18s; }
+    .drop b { color: var(--ink); }
+    .drop.hot { border-color: var(--gold); background: var(--gold-lt); color: var(--gold-dk); }
+    .wstats { font-size: 13px; color: var(--muted); }
+    .wstats b { color: var(--ink); }
+    .world-note { color: var(--muted); font-size: 13px; margin-top: 26px; }
+    .world-note b { color: var(--gold-dk); }
+    .world-note a { color: var(--gold-dk); text-decoration: underline; }
+
     /* —— 下载区 —— */
     .dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
     .steps { margin-top: 34px; background: var(--card); border: 1px solid var(--line);
@@ -137,6 +176,7 @@
       <a href="#shots">界面</a>
       <a href="#features">特性</a>
       <a href="#genesis">创世宣言</a>
+      <a href="#world">确定性世界</a>
       <a href="#download">下载</a>
       <a href="https://github.com/yuanhong792/qlight-wallet" target="_blank">GitHub</a>
     </div>
@@ -231,6 +271,73 @@
   </div>
 </section>
 
+<section class="section wrap" id="world">
+  <h2>世界是算出来的</h2>
+  <p class="lead">「世界是被数学算出来、被数据渲染出来的」——这句话在这里不是文案，是可运行、可对拍、可证伪的实验。</p>
+
+  <div class="world-grid">
+    <div class="world-map">
+      <canvas id="worldCanvas" width="256" height="256"></canvas>
+      <div class="cap">256 × 256 · 每个像素由链历史算出，没有任何一张贴图</div>
+      <div class="fp"><span>本机像素指纹</span><b id="fpNow">—</b></div>
+      <div class="fp"><span>基准（Python 独立实现）</span><span><b id="fpExp">—</b> <span id="fpVerdict"></span></span></div>
+    </div>
+
+    <div class="world-side">
+      <div class="axiom">
+        <span class="eq"><code>world = render(种子, 规则, 历史)</code></span>
+        <p>它与区块链的状态转移 <code>state(n+1) = f(state(n), tx(n))</code> 是<b>同一个数学对象</b>，不是类比。
+        链就是世界的存档：种子 = 创世哈希 ⊕ 全部块 VRF，历史 = 你挖出的每一个块。
+        <b>多挖一个块，大陆就真的多长出一块。</b></p>
+      </div>
+      <div class="ctrl">
+        <button class="wbtn on" id="btnGenesis">只有创世（零历史）</button>
+        <button class="wbtn" id="btnRules">篡改规则常量 +1</button>
+      </div>
+      <div class="drop" id="drop">
+        把你的 <b>blocks.jsonl</b> 拖进来 / 点击选择<br>
+        渲染出<b>你的链历史</b>专属的那片大陆 · 文件只在本地解析，不上传任何数据
+      </div>
+      <input type="file" id="fileInput" accept=".jsonl,.json,.txt,.log" style="display:none">
+      <div class="wstats" id="stats">种子 = 创世哈希 · 块 0</div>
+    </div>
+  </div>
+
+  <div class="grid world-notes">
+    <div class="card">
+      <div class="ico">🔗</div>
+      <h3>币不是世界的燃料，币就是世界</h3>
+      <p>转账不是在给某个外部游戏充能——<b>转账就是在改变地貌</b>。本页默认大陆指纹
+      <b>9171377071cd48c4</b>，与仓库里 <b>Python</b> 参考实现逐位一致：两种完全不同的运行时，同一片大陆。
+      确定性不是运气，是纪律（纯整数、只用 2 的幂、禁平台数学库）。</p>
+    </div>
+    <div class="card">
+      <div class="ico">👁</div>
+      <h3>彼此看见 · 彼此证明自己存在</h3>
+      <p>链上没有查询者，只有交易。所以"看见"被写成一条永久记账的<b>指认</b>：A 声明"我在块高 H 见过 B"，
+      B 与任何第三方都能独立验证。<b>存在不是被探测出来的，是被互相指认出来的。</b>
+      实体 id 由创建它的那笔交易内容寻址——无注册机构、无命名空间仲裁、无白名单。</p>
+    </div>
+    <div class="card">
+      <div class="ico">⚖️</div>
+      <h3>说清楚边界，否则就是骗人</h3>
+      <p><b>自由 ≠ 免费</b>：创建只付手续费，持续存在要付租，断租不删除、只把归属置空。
+      <b>自由 ≠ 无限</b>：当前 32 笔/秒，必须走 chunk 粒度承诺。
+      <b>可见 ≠ 可读</b>：链证明归属与状态，证明不了画面好不好看——<b>渲染器不是共识的一部分</b>。</p>
+    </div>
+  </div>
+
+  <p class="world-note">
+    点「篡改规则常量 +1」：一个常量之差，整片大陆面目全非，指纹从 <b>9171377071cd48c4</b> 跳到
+    <b>41e82c04605a381e</b>，而 Python 与本页<b>同时</b>跳——这就是规则集必须版本化、并与创世绑定的原因。
+    而且这不只是网页演示：桌面钱包的 <b>🌍 世界</b>页就是编辑器——点一格、选一个槽位（石碑/篝火/树屋/灯塔/花园/水晶/工坊/图腾）、
+    签一条 <b>ML-DSA-65</b> 记录，实体就永久进账本；<b>链只保存坐标与归属，像素仍然在每台本机各自算出来</b>。
+    完整规格见 <a href="https://github.com/yuanhong792/qlight-wallet/blob/main/DESIGN.md#9-元宇宙运行时l2" target="_blank">DESIGN.md §9</a>，
+    参考实现见 <a href="https://github.com/yuanhong792/qlight-wallet/tree/main/tools/world" target="_blank">tools/world/</a>
+    （本渲染器 <a href="world.js" target="_blank">world.js</a> 全文可读，约 180 行，无依赖）。
+  </p>
+</section>
+
 <section class="section wrap" id="download">
   <h2>下载与上手</h2>
   <p class="lead">两台电脑连同一 Wi-Fi，各自打开钱包，即自动组网。</p>
@@ -271,6 +378,96 @@
     </div>
   </div>
 </footer>
+
+<script src="world.js"></script>
+<script>
+  (function () {
+    var BASE_RULES = 0xca3318e0;
+    /* 只有这两种情形有公开基准：任何人 clone 仓库跑一次 python3 tools/world/world.py 就能重算 */
+    var EXPECT = {};
+    EXPECT['0|base'] = '9171377071cd48c4';
+    EXPECT['0|tamper'] = '41e82c04605a381e';
+
+    var cv = document.getElementById('worldCanvas');
+    var ctx = cv.getContext('2d');
+    var vrfs = [], tampered = false, notice = '';
+
+    function draw() {
+      QLWorld.setRulesSeed(tampered ? (BASE_RULES + 1) >>> 0 : BASE_RULES);
+      var out = QLWorld.render(QLWorld.seedWords(QLWorld.GENESIS_HASH, vrfs));
+
+      var rgba = new Uint8ClampedArray(QLWorld.W * QLWorld.H * 4);
+      for (var i = 0, o = 0; i < out.rgb.length; i += 3, o += 4) {
+        rgba[o] = out.rgb[i]; rgba[o + 1] = out.rgb[i + 1]; rgba[o + 2] = out.rgb[i + 2]; rgba[o + 3] = 255;
+      }
+      ctx.putImageData(new ImageData(rgba, QLWorld.W, QLWorld.H), 0, 0);
+
+      var fp = QLWorld.fingerprint(out.rgb);
+      var exp = EXPECT[vrfs.length + '|' + (tampered ? 'tamper' : 'base')];
+      document.getElementById('fpNow').textContent = fp;
+      document.getElementById('fpExp').textContent = exp || '无公开基准';
+      var v = document.getElementById('fpVerdict');
+      if (exp) {
+        v.textContent = fp === exp ? '✓ 逐位一致' : '✗ 与基准分叉';
+        v.className = fp === exp ? 'ok' : 'bad';
+      } else { v.textContent = '换个运行时必须得到同一个值'; v.className = ''; }
+
+      var total = QLWorld.W * QLWorld.H;
+      document.getElementById('stats').innerHTML =
+        '种子 = 创世哈希 ⊕ ' + vrfs.length + ' 个块 VRF · 块 <b>' + vrfs.length + '</b>' +
+        ' · 金色地标 <b>' + out.era1 + '</b>/' + total +
+        ' · 实体 <b>' + out.entities + '</b>' + (notice ? ' · ' + notice : '');
+    }
+
+    function ingest(text) {
+      var lines = text.split('\n'), list = [], bad = 0;
+      for (var i = 0; i < lines.length; i++) {
+        var s = lines[i].trim();
+        if (!s) continue;
+        try {
+          var h = JSON.parse(s);
+          /* 创世行（height 0）的 vrf 是全零，XOR 进去不改变种子——所以带不带第 0 行，同一条链渲染出同一片大陆 */
+          if (typeof h.vrf_hex === 'string' && /^[0-9a-fA-F]{64}$/.test(h.vrf_hex)) list.push(h.vrf_hex.toLowerCase());
+          else bad++;
+        } catch (e) { bad++; }
+      }
+      if (!list.length) { notice = '这个文件里没有解析出任何块的 vrf_hex'; return; }
+      vrfs = list;
+      notice = bad ? '已忽略 ' + bad + ' 行非块数据' : '来自你的链历史';
+      draw();
+    }
+
+    function readFile(f) {
+      var r = new FileReader();
+      r.onload = function () { ingest(String(r.result)); };
+      r.readAsText(f);
+    }
+
+    var drop = document.getElementById('drop');
+    var fileInput = document.getElementById('fileInput');
+    drop.addEventListener('click', function () { fileInput.click(); });
+    fileInput.addEventListener('change', function () { if (fileInput.files[0]) readFile(fileInput.files[0]); });
+    ['dragenter', 'dragover'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('hot'); });
+    });
+    ['dragleave', 'drop'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove('hot'); });
+    });
+    drop.addEventListener('drop', function (e) {
+      var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) readFile(f);
+    });
+    /* 拖到页面其它位置时不要被浏览器当成"打开文件" */
+    ['dragover', 'drop'].forEach(function (ev) { document.addEventListener(ev, function (e) { e.preventDefault(); }); });
+
+    var btnG = document.getElementById('btnGenesis'), btnR = document.getElementById('btnRules');
+    function mark() { btnG.classList.toggle('on', !tampered); btnR.classList.toggle('on', tampered); }
+    btnG.addEventListener('click', function () { tampered = false; vrfs = []; notice = ''; mark(); draw(); });
+    btnR.addEventListener('click', function () { tampered = true; vrfs = []; notice = ''; mark(); draw(); });
+
+    draw();
+  })();
+</script>
 
 </body>
 </html>

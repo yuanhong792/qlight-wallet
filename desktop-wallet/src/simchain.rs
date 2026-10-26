@@ -63,17 +63,63 @@ pub const GENESIS_PREV_HEX: &str = "00000000000000000000000000000000000000000000
 
 /// 创世哈希 = SHAKE-256("QL-BLOCK-V1", 64×0 ‖ 0 ‖ 0 ‖ 0vrf ‖ tx_root(宣言摘要))
 /// ——宣言在哈希里，哈希在源码里；改宣言必改此值，全网一眼识破。
-pub fn genesis_hash() -> [u8; 32] {
+pub const GENESIS_HASH_HEX: &str = "5dc2205a8f0153a05f84e26ab94086009796bb68fdfddff439f97ebfd2aa3104";
+
+/// 创世宣言摘要——嵌进创世块 tx_root 的那一笔，宣言与链的绑定就落在这里
+pub fn genesis_manifesto_digest() -> [u8; 32] {
     let d = crypto::shake256(b"QL-GENESIS-V1", GENESIS_MANIFESTO.as_bytes(), 32);
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&d);
-    let root = tx_root_of(&[digest]);
-    let zero_vrf = [0u8; 32];
-    block_hash_of(GENESIS_PREV_HEX, 0, 0, &zero_vrf, &root)
+    digest
+}
+
+/// 运行时重算创世哈希（口径与 genesis_header 完全一致，供启动断言比对）
+pub fn genesis_hash() -> [u8; 32] {
+    let root = tx_root_of(&[genesis_manifesto_digest()]);
+    block_hash_of(GENESIS_PREV_HEX, 0, 0, &[0u8; 32], &root)
 }
 
 pub fn genesis_hash_hex() -> String {
     hex::encode(genesis_hash())
+}
+
+/// 创世块本体（blocks.jsonl 第 0 行）。
+///
+/// 无出块者、无排放、无手续费——它不是一次记账，是整条链的锚点；
+/// 唯一内容是那笔摘要即宣言原文的"创世交易"，让宣言实打实在链上可查。
+pub fn genesis_header() -> BlockHeader {
+    BlockHeader {
+        height: 0,
+        ts_unix: GENESIS_TS_UNIX,
+        prev_hash_hex: GENESIS_PREV_HEX.to_string(),
+        block_hash_hex: genesis_hash_hex(),
+        vrf_hex: hex::encode([0u8; 32]),
+        minted_after: 0,
+        reward_total: 0,
+        miner: String::new(),
+        txs: vec![TxAttestation {
+            digest_hex: hex::encode(genesis_manifesto_digest()),
+            from: String::new(),
+            to: String::new(),
+            amount: 0,
+            fee: 0,
+            nonce: 0,
+        }],
+    }
+}
+
+/// 启动断言：重算值必须等于锚定值，否则创世已被替换，链不再可信。
+fn assert_genesis_anchored() {
+    let computed = genesis_hash_hex();
+    if computed != GENESIS_HASH_HEX {
+        eprintln!(
+            "[QLight] 致命：创世哈希与源码锚定值不符，信任根已被替换，拒绝启动。\n  \
+             锚定值：{GENESIS_HASH_HEX}\n  \
+             重算值：{computed}\n  \
+             若确有意修改 GENESIS_MANIFESTO，须同步更新 GENESIS_HASH_HEX 并重新发布创世。"
+        );
+        panic!("genesis hash does not match the anchored constant");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,7 +161,7 @@ impl Default for Ledger {
 }
 
 /// 区块头（blocks.jsonl 每行一条，含块内全部交易，供哈希链重放校验）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub height: u64,
     pub ts_unix: u64,
@@ -239,6 +285,9 @@ fn now_unix() -> u64 {
 
 impl SimChain {
     pub fn new(ledger_path: PathBuf, blocks_path: PathBuf) -> Arc<Self> {
+        // 信任根先于一切：创世哈希对不上锚定值就没有必要读任何账本
+        assert_genesis_anchored();
+
         let ledger = match std::fs::read(&ledger_path) {
             Ok(bytes) => serde_json::from_slice::<Ledger>(&bytes)
                 .ok()
@@ -260,6 +309,7 @@ impl SimChain {
         let _ = std::fs::remove_file(chain.ledger_path.with_extension("tmp"));
         let _ = std::fs::remove_file(chain.blocks_path.with_extension("tmp"));
 
+        chain.ensure_genesis_line();
         if !chain.validate_blocks_jsonl() {
             // regtest 演示口径：旧格式（无 miner/nonce 字段的 v1 块）或损坏文件 →
             // 归档为 .bak-epoch 后从新创世继续；数据不丢，仅链重置。
@@ -267,8 +317,33 @@ impl SimChain {
                 "[QLight] 提醒：blocks.jsonl 哈希链校验未通过（可能为旧格式或文件被改动），已归档并重启演示链"
             );
             chain.archive_and_reset();
+            chain.ensure_genesis_line();
         }
         Arc::new(chain)
+    }
+
+    /// 保证 blocks.jsonl 第 0 行是创世块。
+    ///
+    /// 新档直接写入；旧档（首行即 #1 且 prev 正是创世哈希）一次性前置补写，
+    /// 让"创世是否启动"在文件里可查。其余形态一律不动，交给重放校验裁决。
+    fn ensure_genesis_line(&self) {
+        let Ok(line) = serde_json::to_string(&genesis_header()) else {
+            return;
+        };
+        let content = std::fs::read_to_string(&self.blocks_path).unwrap_or_default();
+        match content.lines().find(|l| !l.trim().is_empty()) {
+            None => atomic_write(&self.blocks_path, format!("{line}\n").as_bytes()),
+            Some(first) => {
+                if let Ok(h) = serde_json::from_str::<BlockHeader>(first) {
+                    if h.height == 1 && h.prev_hash_hex == genesis_hash_hex() {
+                        atomic_write(
+                            &self.blocks_path,
+                            format!("{line}\n{content}").as_bytes(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// 校验失败的账本文件归档（ledger/blocks → *.bak-epoch），并从新创世继续
@@ -303,6 +378,14 @@ impl SimChain {
                 Ok(b) => b,
                 Err(_) => return false,
             };
+            // 创世行只做锚定：必须与源码常量逐字相等（无出块者、无排放）
+            if bh.height == 0 {
+                if bh != genesis_header() {
+                    return false;
+                }
+                expect_prev = bh.block_hash_hex;
+                continue;
+            }
             // 1) 前向哈希连续
             if bh.prev_hash_hex != expect_prev {
                 return false;
@@ -657,6 +740,14 @@ impl SimChain {
         let mut expect_prev = genesis_hash_hex();
         let mut minted_running: u64 = 0;
         for bh in headers {
+            // 创世行只做锚定：与源码常量逐字相等；它没有出块者，也没有排放
+            if bh.height == 0 {
+                if bh != &genesis_header() {
+                    return false;
+                }
+                expect_prev = bh.block_hash_hex.clone();
+                continue;
+            }
             if bh.miner.is_empty() {
                 return false;
             }
@@ -694,6 +785,12 @@ impl SimChain {
     /// 共享状态转移：按块头凭据推进 balances/nonce/records，封顶排放收归出块者。
     /// （本地打包 / 远端块采用 / 追账重建 三个口径完全一致）
     fn apply_header_to_ledger(l: &mut Ledger, h: &BlockHeader) -> Result<(), String> {
+        // 创世块不改变状态：它只把链钉在宣言上（无铸造、无转账、不入交易历史）
+        if h.height == 0 {
+            l.height = 0;
+            l.prev_hash_hex = h.block_hash_hex.clone();
+            return Ok(());
+        }
         let fee_pool: u64 = h.txs.iter().map(|t| t.fee).sum();
         for t in &h.txs {
             let bal = l.balances.get(&t.from).copied().unwrap_or(0);
@@ -987,7 +1084,7 @@ impl SimChain {
             height: 0,
             prev_hash_hex: genesis_hash_hex(),
             total_minted: 0,
-            started_unix: headers[0].ts_unix,
+            started_unix: GENESIS_TS_UNIX,
             balances: HashMap::new(),
             nonces: HashMap::new(),
             records: vec![],
@@ -1206,6 +1303,95 @@ mod tests {
         assert!(GENESIS_PREV_HEX.chars().all(|c| c == '0'));
         // 创世时间戳固定（2026-10-26 00:00:00 UTC）
         assert_eq!(GENESIS_TS_UNIX, 1792972800);
+    }
+
+    /// 信任根回归闸：改宣言不必报警，改宣言而不改锚定值必须让测试与启动同时失败
+    #[test]
+    fn genesis_hash_equals_anchored_constant() {
+        assert_eq!(genesis_hash_hex(), GENESIS_HASH_HEX);
+    }
+
+    /// 创世块自身自洽：块哈希由自己的字段算出，且不是一次记账（无出块者/无排放）
+    #[test]
+    fn genesis_header_is_self_consistent() {
+        let g = genesis_header();
+        assert_eq!(g.height, 0);
+        assert_eq!(g.prev_hash_hex, GENESIS_PREV_HEX);
+        assert_eq!(g.minted_after, 0);
+        assert_eq!(g.reward_total, 0);
+        assert!(g.miner.is_empty());
+        assert_eq!(g.block_hash_hex, genesis_hash_hex());
+
+        let vrf = hex::decode(&g.vrf_hex).unwrap();
+        let digests: Vec<[u8; 32]> = g
+            .txs
+            .iter()
+            .map(|t| {
+                let mut d = [0u8; 32];
+                hex::decode_to_slice(&t.digest_hex, &mut d).unwrap();
+                d
+            })
+            .collect();
+        let recomputed =
+            block_hash_of(&g.prev_hash_hex, g.height, g.minted_after, &vrf, &tx_root_of(&digests));
+        assert_eq!(hex::encode(recomputed), g.block_hash_hex);
+        // 宣言真的在创世块里（txs 唯一那笔的摘要即宣言摘要）
+        assert_eq!(g.txs[0].digest_hex, hex::encode(genesis_manifesto_digest()));
+    }
+
+    /// 创世行 + 首个真实块整链可重放；篡改创世行的非哈希字段必须被拒
+    #[test]
+    fn genesis_line_replays_and_tampering_is_rejected() {
+        let g = genesis_header();
+        let vrf_hex = hex::encode([7u8; 32]);
+        let mut one = BlockHeader {
+            height: 1,
+            ts_unix: GENESIS_TS_UNIX + 2,
+            prev_hash_hex: g.block_hash_hex.clone(),
+            block_hash_hex: String::new(),
+            vrf_hex: vrf_hex.clone(),
+            minted_after: reward_at(1),
+            reward_total: reward_at(1),
+            miner: "ql1qqqminer".to_string(),
+            txs: vec![],
+        };
+        one.block_hash_hex = hex::encode(block_hash_of(
+            &one.prev_hash_hex,
+            one.height,
+            one.minted_after,
+            &hex::decode(&vrf_hex).unwrap(),
+            &tx_root_of(&[]),
+        ));
+        assert!(SimChain::verify_header_slice(&[g.clone(), one.clone()]));
+
+        // reward_total / miner 不进块哈希，只能靠"逐字等于源码常量"这道闸拦住
+        let mut greedy = g.clone();
+        greedy.reward_total = 1_000_000_000_000;
+        greedy.miner = "ql1qqqattacker".to_string();
+        assert!(!SimChain::verify_header_slice(&[greedy, one.clone()]));
+    }
+
+    /// 新建链的 blocks.jsonl 第 0 行就是创世块（"创世是否启动"落盘可查）
+    #[test]
+    fn new_chain_materializes_genesis_line() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("qlight-genesis-test-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocks = dir.join("blocks.jsonl");
+
+        let chain = SimChain::new(dir.join("ledger.json"), blocks.clone());
+        let first_line = std::fs::read_to_string(&blocks).unwrap();
+        let first_line = first_line.lines().next().unwrap();
+        assert_eq!(
+            serde_json::from_str::<BlockHeader>(first_line).unwrap(),
+            genesis_header()
+        );
+        assert_eq!(chain.height(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

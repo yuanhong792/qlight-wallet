@@ -37,7 +37,7 @@ invoke("net_status").then((s) => { netCount = s.count || 0; setNetChip(); }).cat
 
 // ---------------------------------------------------------------- 页面路由（侧边导航）
 
-const pages = ["asset", "mine", "history", "about"];
+const pages = ["asset", "mine", "history", "world", "about"];
 document.querySelectorAll(".sb-item").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".sb-item").forEach((b) => b.classList.toggle("active", b === btn));
@@ -217,6 +217,9 @@ async function refreshAll() {
   } else {
     list.innerHTML = pendRows + rows;
   }
+
+  // 世界页只在可见时重载：地形按种子签名缓存，链每 2 秒长一格才重算一次
+  if (worldActive()) await loadWorld().catch(() => {});
 }
 
 // 主界面轮询（2 秒）：余额/块高/活动列表随链自动更新——
@@ -294,6 +297,347 @@ $("btn-restore-dat").addEventListener("click", async () => {
   }
 });
 
+// ---------------------------------------------------------------- 🌍 世界页（本地渲染 + 实体编辑器）
+//
+// 分工（DESIGN.md §9.8 / §9.11）：链只提供**坐标与归属**，地形像素全部由本机
+// world.js 从「创世哈希 ⊕ 全部区块 VRF 折叠」算出来。钱包不下载地图、不存贴图，
+// 任何一台机器拿同一份 blocks.jsonl 都必须渲染出逐位相同的大陆（对拍指纹为证）。
+
+const KIND_COLORS = ["#9AA7BD", "#FF6A2A", "#2FBF71", "#29B6F6", "#F06292", "#00E0C8", "#B388FF", "#FFD23F"];
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const wcvs = $("world-canvas");
+const wctx = wcvs.getContext("2d");
+let worldSnap = null;
+let terrain = { sig: "", rgb: null, era1: 0, ents: 0, fp: "" };
+let wSlot = 0;
+let wSel = ""; // 选中实体 id（空 = 未选中）
+let wProof = { id: "", json: "" }; // 展开的可验证记录（2 秒轮询重渲染时不能丢）
+
+const worldActive = () => !$("page-world").classList.contains("hidden");
+const worldErr = (m) => { $("err-world").textContent = m; $("ok-world").hidden = true; };
+const worldOk = (m) => { $("err-world").textContent = ""; const o = $("ok-world"); o.hidden = false; o.textContent = m; setTimeout(() => (o.hidden = true), 6000); };
+const entById = (id) => (worldSnap ? worldSnap.entities.find((e) => e.entity_id_hex === id) : null);
+const idShort = (id) => (id ? `${id.slice(0, 10)}…${id.slice(-8)}` : "—");
+
+/** 种子签名：创世哈希 + 历史长度 + 最后一个 VRF（任一变化地形就变） */
+function terrainSig(s) {
+  return `${s.genesis_hash_hex}|${s.vrfs.length}|${s.vrfs[s.vrfs.length - 1] || ""}`;
+}
+
+/** 地形只算一次并缓存；链长一格才重算（每格 2 秒，重算约十几毫秒） */
+function buildTerrain(s) {
+  const sig = terrainSig(s);
+  if (terrain.sig !== sig || !terrain.rgb) {
+    const out = QLWorld.render(QLWorld.seedWords(s.genesis_hash_hex, s.vrfs));
+    terrain = { sig, rgb: out.rgb, era1: out.era1, ents: out.entities, fp: QLWorld.fingerprint(out.rgb) };
+  }
+  return terrain;
+}
+
+function paintWorld() {
+  if (!worldSnap) return;
+  const s = worldSnap;
+  QLWorld.paint(wctx, buildTerrain(s).rgb);
+  for (const e of s.entities) {
+    wctx.fillStyle = e.released ? "rgba(150,150,150,.75)" : KIND_COLORS[e.kind] || KIND_COLORS[0];
+    wctx.fillRect(e.x - 1, e.y - 1, 3, 3);
+    if (s.address && e.owner === s.address) {
+      wctx.strokeStyle = "#E3B54A";
+      wctx.strokeRect(e.x - 2.5, e.y - 2.5, 6, 6);
+    }
+  }
+  const sel = entById(wSel);
+  if (sel) {
+    wctx.strokeStyle = "#FFFFFF";
+    wctx.strokeRect(sel.x - 4.5, sel.y - 4.5, 9, 9);
+    wctx.strokeStyle = "#12161F";
+    wctx.strokeRect(sel.x - 5.5, sel.y - 5.5, 11, 11);
+  }
+}
+
+function buildHotbar() {
+  const n = worldSnap ? worldSnap.slot_count : 8;
+  const bar = $("world-hotbar");
+  bar.innerHTML = "";
+  for (let i = 0; i < n; i++) {
+    const b = document.createElement("button");
+    b.className = "hs" + (i === wSlot ? " active" : "");
+    b.dataset.slot = String(i);
+    b.type = "button";
+    b.title = t(`world.kind.${i}`);
+    b.innerHTML = `<i class="kd" style="background:${KIND_COLORS[i]}"></i><b>${i + 1}</b>`;
+    bar.appendChild(b);
+  }
+  $("world-slot-tag").textContent = `slot ${wSlot + 1} · ${t(`world.kind.${wSlot}`)}`;
+}
+
+function renderF3() {
+  const s = worldSnap;
+  const tr = buildTerrain(s);
+  const r = (k, v, cls = "") => `<div class="f3k">${k}</div><div class="f3v ${cls}">${v}</div>`;
+  const rows = [
+    [t("world.f3.genesis"), `<span class="cpy mono" data-copy="${s.genesis_hash_hex}">${s.genesis_hash_hex.slice(0, 16)}…</span>`],
+    [t("world.f3.blocks"), `${s.vrfs.length} · #${s.height}`],
+    [t("world.f3.rules"), `${QLWorld.RULES_VERSION}`],
+    [t("world.f3.fp"), `<span class="mono gold">${tr.fp}</span>`],
+    [t("world.f3.era1"), `${tr.era1}`],
+    [t("world.f3.nat"), `${tr.ents}`],
+    [t("world.f3.ent"), `${s.entities.length}`],
+    [t("world.f3.chunks"), `${s.chunks.length}`],
+    [t("world.f3.addr"), s.address ? `<span class="cpy mono" data-copy="${s.address}">${short(s.address)}</span>` : `<span class="muted">${t("world.locked")}</span>`],
+  ];
+  let led;
+  if (!s.report.total) led = `<span class="muted">${t("world.ledger.empty")}</span>`;
+  else if (s.report.ok) led = `<span class="ok-inline">${t("world.ledger.ok", { n: s.report.total })}</span>`;
+  else led = `<span class="bad-inline">${t("world.ledger.bad", { n: s.report.first_bad, r: s.report.reason })}</span>`;
+  rows.push([t("world.f3.ledger"), led]);
+  $("world-f3").innerHTML = rows.map(([k, v]) => r(k, v)).join("");
+}
+
+function renderParentSelect() {
+  const s = worldSnap;
+  const sel = $("ent-parent");
+  const keep = sel.value;
+  const mine = s.entities.filter((e) => e.owner === s.address && !e.released);
+  sel.innerHTML =
+    `<option value="">${t("world.parent.none")}</option>` +
+    mine.map((e) => `<option value="${e.entity_id_hex}">${esc(e.name)} · ${e.x},${e.y}</option>`).join("");
+  if (keep && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
+}
+
+function renderEntList() {
+  const s = worldSnap;
+  const box = $("ent-list");
+  const mine = s.entities.filter((e) => e.owner === s.address).length;
+  $("ent-count").textContent = t("world.list.count", { n: s.entities.length, m: mine });
+  if (!s.entities.length) {
+    box.innerHTML = `<div class="muted small">${t("world.list.empty")}</div>`;
+    return;
+  }
+  const sorted = s.entities.slice().sort((a, b) => Number(b.owner === s.address) - Number(a.owner === s.address) || b.last_height - a.last_height);
+  const keepScroll = box.scrollTop; // 2 秒轮询重渲染不打断阅读位置
+  box.innerHTML = sorted
+    .map(
+      (e) => `<div class="ent-row${e.entity_id_hex === wSel ? " active" : ""}" data-id="${e.entity_id_hex}">
+        <i class="kd" style="background:${e.released ? "#9AA7BD" : KIND_COLORS[e.kind] || KIND_COLORS[0]}"></i>
+        <div class="er-main">
+          <div class="er-n">${esc(e.name)}${e.era === 1 ? ` <span class="tag era1">${t("world.sel.era1")}</span>` : ""}${e.released ? ` <span class="tag">${t("world.unowned")}</span>` : ""}</div>
+          <div class="er-m">X ${e.x} · Z ${e.y} · ${t(`world.kind.${e.kind}`)} · #${e.last_height}</div>
+        </div>
+        <div class="er-o">${e.owner === s.address ? t("world.own") : ""}</div>
+      </div>`
+    )
+    .join("");
+  box.scrollTop = keepScroll;
+}
+
+/** 选中一个实体：名字输入框为空时顺手填上，改名按钮立刻可用 */
+function selectEnt(id) {
+  wSel = id;
+  const e = entById(id);
+  if (!e) return;
+  $("ent-x").value = e.x;
+  $("ent-z").value = e.y;
+  if (!$("ent-name").value.trim()) $("ent-name").value = e.name;
+  renderEntList();
+  renderSelected();
+  paintWorld();
+}
+
+function renderSelected() {
+  const box = $("ent-sel");
+  const e = entById(wSel);
+  if (!e) {
+    box.hidden = true;
+    $("ent-sel-hint").textContent = t("world.sel.hint");
+    return;
+  }
+  box.hidden = false;
+  $("ent-sel-hint").textContent = "";
+  const s = worldSnap;
+  const own = !!s.address && e.owner === s.address;
+  const open = wProof.id === e.entity_id_hex && !!wProof.json;
+  const r = (k, v) => `<div class="f3k">${k}</div><div class="f3v">${v}</div>`;
+  const btn = (act, label, cls = "") => `<button type="button" class="es-btn ${cls}" data-act="${act}">${label}</button>`;
+  const acts = [];
+  if (own && !e.released) {
+    acts.push(btn("rename", t("world.btn.rename")));
+    acts.push(btn("move", t("world.btn.move")));
+    acts.push(btn("release", t("world.btn.release"), "danger"));
+  }
+  acts.push(btn("proof", t("world.btn.proof")));
+  box.innerHTML = `
+    <div class="es-name"><i class="kd" style="background:${e.released ? "#9AA7BD" : KIND_COLORS[e.kind] || KIND_COLORS[0]}"></i>${esc(e.name)}</div>
+    <dl class="f3">
+      ${r(t("world.sel.id"), `<span class="cpy mono" data-copy="${e.entity_id_hex}" title="${t("hist.copy")}">${idShort(e.entity_id_hex)}</span>`)}
+      ${r("X · Z", `${e.x} · ${e.y}`)}
+      ${r(t("world.sel.kind"), t(`world.kind.${e.kind}`))}
+      ${r(t("world.sel.owner"), own ? t("world.own") : e.released ? t("world.unowned") : `<span class="mono">${short(e.owner)}</span>`)}
+      ${r(t("world.sel.era"), e.era === 1 ? t("world.sel.era1") : t("world.sel.eraN", { n: e.era }))}
+      ${r(t("world.sel.created"), `#${e.created_height}`)}
+      ${e.parent_hex ? r(t("world.sel.parent"), `<span class="mono">${idShort(e.parent_hex)}</span>`) : ""}
+    </dl>
+    <div class="es-btns">${acts.join("")}</div>
+    <pre class="proof" id="ent-proof" ${open ? "" : "hidden"}>${open ? esc(wProof.json) : ""}</pre>`;
+}
+
+function renderWorld() {
+  buildHotbar();
+  renderF3();
+  renderParentSelect();
+  renderEntList();
+  renderSelected();
+  paintWorld();
+}
+
+async function loadWorld() {
+  worldSnap = await invoke("world_snapshot");
+  renderWorld();
+}
+
+// —— 交互：物品栏、地图、编辑器
+
+$("world-hotbar").addEventListener("click", (e) => {
+  const b = e.target.closest(".hs");
+  if (!b) return;
+  wSlot = Number(b.dataset.slot);
+  buildHotbar();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return; // 不抢系统/浏览器快捷键
+  if (!worldActive() || $("view-main").classList.contains("hidden")) return;
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "select" || tag === "textarea") return;
+  const n = Number(e.key);
+  if (n >= 1 && n <= (worldSnap ? worldSnap.slot_count : 8)) {
+    wSlot = n - 1;
+    buildHotbar();
+  }
+});
+
+/** 鼠标位置 → 格子坐标（offsetX/Y 以内容盒为原点，不受 1px 边框和 CSS 缩放影响） */
+function toCell(ev) {
+  const x = Math.floor((ev.offsetX * QLWorld.W) / wcvs.clientWidth);
+  const y = Math.floor((ev.offsetY * QLWorld.H) / wcvs.clientHeight);
+  if (x < 0 || y < 0 || x >= QLWorld.W || y >= QLWorld.H) return null;
+  return { x, y };
+}
+
+wcvs.addEventListener("mousemove", (ev) => {
+  const c = toCell(ev);
+  const el = $("world-cursor");
+  if (!c || !worldSnap) {
+    el.textContent = "X – · Z –";
+    return;
+  }
+  const cx = c.x >> 4, cy = c.y >> 4;
+  const ch = worldSnap.chunks.find((k) => k.cx === cx && k.cy === cy);
+  el.textContent =
+    `X ${c.x} · Z ${c.y} · chunk ${cx},${cy}` +
+    (ch ? ` · ${t("world.f3.ch", { n: ch.count })} ${ch.root_hex.slice(0, 8)}…` : "");
+});
+
+wcvs.addEventListener("mouseleave", () => ($("world-cursor").textContent = "X – · Z –"));
+
+wcvs.addEventListener("click", (ev) => {
+  const c = toCell(ev);
+  if (!c || !worldSnap) return;
+  const hit = worldSnap.entities
+    .map((e) => ({ e, d: Math.abs(e.x - c.x) + Math.abs(e.y - c.y) }))
+    .sort((a, b) => a.d - b.d)[0];
+  if (hit && hit.d <= 3) {
+    selectEnt(hit.e.entity_id_hex);
+  } else {
+    $("ent-x").value = c.x;
+    $("ent-z").value = c.y;
+    renderEntList();
+    renderSelected();
+    paintWorld();
+  }
+});
+
+$("btn-place").addEventListener("click", async () => {
+  worldErr("");
+  const name = $("ent-name").value.trim();
+  if (!name) { worldErr(t("world.err.noname")); return; }
+  if (!worldSnap || !worldSnap.unlocked) { worldErr(t("world.err.locked")); return; }
+  $("btn-place").disabled = true;
+  try {
+    const rec = await invoke("world_place", {
+      name,
+      x: Number($("ent-x").value),
+      y: Number($("ent-z").value),
+      kind: wSlot,
+      parentHex: $("ent-parent").value,
+    });
+    wSel = rec.entity_id_hex;
+    $("ent-name").value = "";
+    worldOk(t("world.ok.placed", { name: rec.name, id: idShort(rec.entity_id_hex) }));
+    await loadWorld();
+  } catch (e) {
+    worldErr(String(e));
+  }
+  $("btn-place").disabled = false;
+});
+
+$("ent-list").addEventListener("click", (e) => {
+  const row = e.target.closest(".ent-row");
+  if (row) selectEnt(row.dataset.id);
+});
+
+$("ent-sel").addEventListener("click", async (e) => {
+  const cpy = e.target.closest(".cpy");
+  if (cpy) {
+    try { await navigator.clipboard.writeText(cpy.dataset.copy); } catch { return; }
+    const old = cpy.textContent;
+    cpy.textContent = t("recv.copied");
+    setTimeout(() => (cpy.textContent = old), 1200);
+    return;
+  }
+  const b = e.target.closest(".es-btn");
+  if (!b || !wSel) return;
+  const act = b.dataset.act;
+  const e0 = entById(wSel);
+  if (!e0) return;
+  worldErr("");
+  try {
+    if (act === "rename") {
+      const name = $("ent-name").value.trim();
+      if (!name) { worldErr(t("world.err.noname")); return; }
+      await invoke("world_rename", { entityIdHex: wSel, name });
+      worldOk(t("world.ok.renamed", { name }));
+    } else if (act === "move") {
+      const x = Number($("ent-x").value), y = Number($("ent-z").value);
+      await invoke("world_move", { entityIdHex: wSel, x, y });
+      worldOk(t("world.ok.moved", { x, y }));
+    } else if (act === "release") {
+      if (!confirm(t("world.confirm.release", { name: e0.name }))) return;
+      await invoke("world_release", { entityIdHex: wSel });
+      worldOk(t("world.ok.released", { name: e0.name }));
+    } else if (act === "proof") {
+      if (wProof.id === wSel && wProof.json) { wProof = { id: "", json: "" }; } // 再点一次收起
+      else wProof = { id: wSel, json: await invoke("world_proof", { entityIdHex: wSel }) };
+      renderSelected();
+      return;
+    }
+    await loadWorld();
+  } catch (err) {
+    worldErr(String(err));
+  }
+});
+
+// —— 复制 F3 里的哈希/地址（事件委托，重渲染不失效）
+$("world-f3").addEventListener("click", async (e) => {
+  const el = e.target.closest(".cpy");
+  if (!el) return;
+  try { await navigator.clipboard.writeText(el.dataset.copy); } catch { return; }
+  const old = el.textContent;
+  el.textContent = t("recv.copied");
+  setTimeout(() => (el.textContent = old), 1200);
+});
+
 // ---------------------------------------------------------------- 出块事件（实时推送）
 
 listen("chain_block", (ev) => {
@@ -313,10 +657,13 @@ listen("chain_block", (ev) => {
   if (e.vrf_hex) {
     const log = $("vrf-log");
     const line = document.createElement("div");
-    line.innerHTML = `<b>#${e.height}</b> <span class="vrf-reward">+${(e.reward / 1e9).toFixed(2)} QLX</span> · VRF ${e.vrfHex}…`;
+    line.innerHTML = `<b>#${e.height}</b> <span class="vrf-reward">+${(e.reward / 1e9).toFixed(2)} QLX</span> · VRF ${e.vrf_hex.slice(0, 16)}…`;
     log.prepend(line);
     while (log.childElementCount > 50) log.lastChild.remove();
   }
+
+  // 新块 = 新的历史 = 世界真的会变（种子含全部 VRF 折叠）
+  if (worldSnap && worldActive()) loadWorld().catch(() => {});
 });
 
 route().catch((e) => console.error(e));
