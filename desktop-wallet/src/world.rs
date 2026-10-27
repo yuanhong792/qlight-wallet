@@ -770,6 +770,76 @@ pub fn chunk_roots(state: &BTreeMap<String, Entity>) -> Vec<Chunk> {
         .collect()
 }
 
+// ================================================================ 创造权重（§9.16）
+//
+// 「创造没有好坏，所以不评价创造」——这条是整个设计的起点。任何评分、点赞、
+// 排行榜都需要一个裁判，而裁判既是审查者又是刷分目标，并且**跨实现不可复算**，
+// 因此永远进不了共识。共识只认两种量得起的事实：
+//
+// 1. **占了几格**：一格一主由 `live_at` 在重放里强制（`CLAIM`/`MOVE` 都要查），
+//    释放（`RELEASE`）即不再计入——记录永不删除，但"你不在了就不算"；
+// 2. **守了多少个块**：`tip − created_height`，只能等，不能刷。脚本可以零成本
+//    写满 4096 条记录，却刷不出 64 格各自的 4000 个块——时间是唯一不可压缩的成本。
+//
+// 权重唯一的作用是**发行节奏**：分数越高，两次挖矿发行的最小间隔越短（50→10 块），
+// 而每笔发行最多结算一个当前档位的量（`reward_at(h) × Δ`），空档不补发。于是每块
+// 平均发行量 ≤ `reward_at(h)`，减半曲线与 210M 硬顶一字不改——创造换到的是"更快看到进度"
+// 和更多次抢占机会，不是更多的币。这条不变量由 simchain 的性质测试钉死。
+
+/// 一格守满这么多块记 1 分
+pub const CRAFT_KEEP_UNIT: u64 = 200;
+/// 单格保护时长封顶：一格吃老本不能永久躺赢
+pub const CRAFT_KEEP_CAP: u64 = 4_000;
+/// 最多计这么多格：写入配额是 4096 条/窗口，权重只数 64 格
+pub const CRAFT_CELL_CAP: usize = 64;
+/// 发行节奏阶梯（块）。下标 = 权重分（封顶 7）；0 分即 v1/v2 的 50 块冷却。
+pub const MINE_FLOORS: [u64; 8] = [50, 40, 30, 25, 20, 16, 12, 10];
+
+/// 某个地址此刻在世界里的创造权重（纯函数：世界状态 + 链头高度）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Craft {
+    /// 活着的自有格子总数（含超出计分上限的部分）
+    pub cells: usize,
+    /// 实际参与计分的格子数（≤ `CRAFT_CELL_CAP`）
+    pub graded: usize,
+    /// 这些格子累计的守护块数（单格封顶后求和）
+    pub kept_blocks: u64,
+    /// 权重分 = `kept_blocks / CRAFT_KEEP_UNIT`，封顶 `MINE_FLOORS.len()-1`
+    pub score: u8,
+    /// 由分数决定的两次挖矿发行最小间隔（块）
+    pub floor: u64,
+}
+
+/// 「守了多久」的起算点是**落子那一刻**（`created_height`），不是最后一次互动：
+/// 世界不需要靠心跳按钮来证明有人在，越要求互动就越奖励挂机脚本。
+/// 掉下去的代价走另一条路——释放即失分，未来的租约则让"占着"本身持续花钱。
+pub fn craft_of(state: &BTreeMap<String, Entity>, owner: &str, tip: u64) -> Craft {
+    let mut kept: Vec<u64> = Vec::new();
+    for e in state.values() {
+        if e.released || e.owner != owner {
+            continue;
+        }
+        kept.push(tip.saturating_sub(e.created_height).min(CRAFT_KEEP_CAP));
+    }
+    // BTreeMap 按实体 id 字典序遍历，`sort_by` 稳定 → 并列格子永远取 id 小的那批：
+    // 任何一份实现、任何一次重放都选同一批，权重因此可被第三方独立复算。
+    kept.sort_by(|a, b| b.cmp(a));
+    let cells = kept.len();
+    let graded = cells.min(CRAFT_CELL_CAP);
+    let kept_blocks: u64 = kept.iter().take(graded).sum();
+    // 链龄闸门：每 CRAFT_KEEP_UNIT 个块最多解锁 1 分。脚本可以在一个窗口里造满
+    // 64 格，但世界的时间只有一份——新钱包无论怎么刷，都刷不出"这里已经存在了很久"。
+    let raw = kept_blocks / CRAFT_KEEP_UNIT;
+    let score = raw.min(tip / CRAFT_KEEP_UNIT).min((MINE_FLOORS.len() - 1) as u64) as u8;
+    Craft {
+        cells,
+        graded,
+        kept_blocks,
+        score,
+        floor: MINE_FLOORS[score as usize],
+    }
+}
+
 /// 合并邻居中继记录的结算单（M0「彼此看见」的账面上的那一笔）
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct MergeReport {
@@ -792,11 +862,42 @@ pub fn signer_pk_hash(core: &crate::keystore::WalletCore) -> String {
 pub struct EntityLedger {
     path: PathBuf,
     lock: std::sync::Mutex<()>,
+    /// 最近一次整本读入跳过的坏行数（0 = 账本逐行都能解析）
+    bad_lines: std::sync::atomic::AtomicUsize,
+    /// 已经就该数值告过警的坏行数——轮询每次都整本重放，不控制就会刷屏
+    warned_at: std::sync::atomic::AtomicUsize,
+}
+
+/// 整本读入的附带说明：解析不了的行**逐行跳过**并计数，绝不从那里截断。
+///
+/// 旧口径是遇到坏行就停：联邦世界里各归属者的记录交错在同一本文件里，
+/// 中间一行坏了会把后面所有人的全部历史一起静默丢掉，账本"看起来"只是变短了。
+/// 跳过后坏行只伤它自己：受影响那条链的 `prev_hash` 接不上，`walk` 当场判它断链；
+/// 其余各链照常重放。判定依旧唯一，只是不再拿"解析失败"冒充"链到此为止"。
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct LoadReport {
+    /// 跳过的无法解析的行数
+    pub bad_lines: usize,
+    /// 第一处坏行的行号（1 起；0 = 没有坏行）
+    pub first_line: usize,
+    /// 第一处坏行的解析错误原文，供 UI 与日志直显，不翻译成委婉语
+    pub reason: String,
+}
+
+impl LoadReport {
+    pub fn is_clean(&self) -> bool {
+        self.bad_lines == 0
+    }
 }
 
 impl EntityLedger {
     pub fn new(path: PathBuf) -> Self {
-        let led = Self { path, lock: std::sync::Mutex::new(()) };
+        let led = Self {
+            path,
+            lock: std::sync::Mutex::new(()),
+            bad_lines: std::sync::atomic::AtomicUsize::new(0),
+            warned_at: std::sync::atomic::AtomicUsize::new(0),
+        };
         led.archive_if_legacy();
         led
     }
@@ -835,21 +936,60 @@ impl EntityLedger {
         &self.path
     }
 
-    /// 整本读入；文件不存在即空世界。坏行按"截断"处理并停止（与块账本同口径）
+    /// 整本读入；文件不存在即空世界。坏行只跳过它自己并计数（见 [`LoadReport`]）。
     pub fn load(&self) -> Vec<EntityRecord> {
-        let Ok(text) = std::fs::read_to_string(&self.path) else { return Vec::new() };
+        self.load_report().0
+    }
+
+    /// 整本读入 + 读到了什么不该读到的东西。上层要显式调用这一版才能拿到坏行数；
+    /// `load()` 已经把同一个数存进 `bad_lines()`，快照与告警都从那里取。
+    pub fn load_report(&self) -> (Vec<EntityRecord>, LoadReport) {
+        let mut rep = LoadReport::default();
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            self.note_bad(rep.clone());
+            return (Vec::new(), rep);
+        };
         let mut out = Vec::new();
-        for line in text.lines() {
+        for (i, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
             match serde_json::from_str::<EntityRecord>(line) {
                 Ok(r) => out.push(r),
-                Err(_) => break,
+                Err(e) => {
+                    rep.bad_lines += 1;
+                    if rep.first_line == 0 {
+                        rep.first_line = i + 1;
+                        rep.reason = e.to_string();
+                    }
+                }
             }
         }
-        out
+        self.note_bad(rep.clone());
+        (out, rep)
+    }
+
+    /// 最近一次整本读入跳过的坏行数。计数是"最后一次读的结果"，不是累计：
+    /// 账本修好了它就回到 0，UI 上的告警也跟着消失。
+    pub fn bad_lines(&self) -> usize {
+        self.bad_lines.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn note_bad(&self, rep: LoadReport) {
+        use std::sync::atomic::Ordering;
+        self.bad_lines.store(rep.bad_lines, Ordering::Relaxed);
+        let was = self.warned_at.swap(rep.bad_lines, Ordering::Relaxed);
+        if rep.bad_lines == 0 || was == rep.bad_lines {
+            return;
+        }
+        eprintln!(
+            "[QLight] 实体账本有 {} 行解析失败（首处第 {} 行：{}），已逐行跳过、继续读后面的记录：{}",
+            rep.bad_lines,
+            rep.first_line,
+            rep.reason,
+            self.path.display()
+        );
     }
 
     /// 追加一条记录（自取写锁）
@@ -949,14 +1089,30 @@ impl EntityLedger {
 
 /// 单次 write_all 整行 + fsync：kill -9 不会撕行（与 append_block_header 同款）
 fn write_line(path: &Path, r: &EntityRecord) -> Result<(), String> {
-    use std::io::Write;
-    let mut line = serde_json::to_string(r).map_err(|e| e.to_string())?;
-    line.push('\n');
+    use std::io::{Read, Seek, Write};
+    let json = serde_json::to_string(r).map_err(|e| e.to_string())?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|e| format!("打开实体账本失败：{e}"))?;
+    // 上一笔可能被断电拦腰截断（结尾没有换行）。直接续写会把新旧两条黏成一行，
+    // 于是一条坏行变成两条坏行。补一个换行，让已经坏掉的那行只坏它自己。
+    let mut line = String::new();
+    let len = f.metadata().map_err(|e| format!("读账本长度失败：{e}"))?.len();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        f.seek(std::io::SeekFrom::End(-1))
+            .map_err(|e| format!("定位账本末尾失败：{e}"))?;
+        f.read_exact(&mut last)
+            .map_err(|e| format!("读账本末尾失败：{e}"))?;
+        if last[0] != b'\n' {
+            line.push('\n');
+        }
+    }
+    line.push_str(&json);
+    line.push('\n');
     f.write_all(line.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
     f.sync_all().ok();
     Ok(())
@@ -1744,5 +1900,116 @@ mod tests {
             }
         }
         assert_eq!(chunk_roots(&shuffled), chunks);
+    }
+
+    // ------------------------------------------------ §9.16 创造权重
+
+    fn cell(id: &str, owner: &str, created_height: u64) -> Entity {
+        Entity {
+            entity_id_hex: id.into(),
+            name: "格".into(),
+            x: 1,
+            y: 1,
+            layer: 0,
+            kind: 0,
+            owner: owner.into(),
+            parent_hex: String::new(),
+            era: 1,
+            created_height,
+            created_ts: created_height,
+            last_height: created_height,
+            released: false,
+        }
+    }
+
+    fn state_of(cells: &[(Entity, bool)]) -> BTreeMap<String, Entity> {
+        let mut m = BTreeMap::new();
+        for (e, released) in cells {
+            let mut e = e.clone();
+            e.released = *released;
+            m.insert(e.entity_id_hex.clone(), e);
+        }
+        m
+    }
+
+    /// 刚落下的格子一分不值：权重买的是「这块地方归我守了多久」，不是「我按了几次建造」
+    #[test]
+    fn fresh_cells_weigh_nothing() {
+        let st = state_of(&[(cell("a", "me", 100), false)]);
+        let c = craft_of(&st, "me", 100);
+        assert_eq!((c.cells, c.graded, c.kept_blocks), (1, 1, 0));
+        assert_eq!(c.score, 0, "第一块也没守，凭什么加速");
+        assert_eq!(c.floor, MINE_FLOORS[0], "零权重就是最慢那一档");
+    }
+
+    /// 松手 = 立刻停止计时：拆掉一格，节奏档位当场回落
+    #[test]
+    fn releasing_a_cell_stops_the_clock() {
+        let keep = state_of(&[(cell("a", "me", 200), false), (cell("b", "me", 200), false)]);
+        let at = craft_of(&keep, "me", 1000);
+        assert_eq!(at.kept_blocks, 1600);
+        assert_eq!(at.score, 5);
+
+        let mut dropped = state_of(&[(cell("a", "me", 200), false), (cell("b", "me", 200), false)]);
+        dropped.get_mut("b").unwrap().released = true;
+        let after = craft_of(&dropped, "me", 1000);
+        assert_eq!(after.cells, 1, "RELEASE 记录永久保留，但不再占格");
+        assert_eq!(after.kept_blocks, 800);
+        assert_eq!(after.score, 4);
+        assert!(after.floor > at.floor, "拆了格子只会变慢，不会变快");
+    }
+
+    /// 链龄闸门：脚本可以在一个窗口里造满 64 格，但造不出「这里已经存在了很久」
+    #[test]
+    fn chain_age_caps_what_a_burst_can_buy() {
+        let cells: Vec<(Entity, bool)> = (0..CRAFT_CELL_CAP as u32)
+            .map(|k| (cell(&format!("{:04}", k), "me", 0), false))
+            .collect();
+        let st = state_of(&cells);
+        let tip = 600;
+        let c = craft_of(&st, "me", tip);
+        assert_eq!(c.cells, CRAFT_CELL_CAP);
+        assert_eq!(c.kept_blocks, 600 * CRAFT_CELL_CAP as u64);
+        // 光看格子数本该给 192 分，世界的时间只给了 3 分
+        assert_eq!(c.kept_blocks / CRAFT_KEEP_UNIT, 192);
+        assert_eq!(c.score, 3);
+        assert_eq!(c.score as u64, tip / CRAFT_KEEP_UNIT, "封顶的必须是链龄，不是产能");
+        assert_eq!(c.floor, MINE_FLOORS[3]);
+    }
+
+    /// 只数自己的格；每格最多记 `CRAFT_KEEP_CAP` 块——老地标不会把阶梯焊死在最快档
+    #[test]
+    fn only_your_own_cells_count_and_each_one_is_capped() {
+        let st = state_of(&[
+            (cell("a", "me", 0), false),
+            (cell("b", "别人", 0), false),
+            (cell("c", "me", 0), false),
+        ]);
+        let tip = 100_000;
+        let c = craft_of(&st, "me", tip);
+        assert_eq!(c.cells, 2, "邻居的地不是我的权重");
+        assert_eq!(c.kept_blocks, 2 * CRAFT_KEEP_CAP, "单格守护时长要封顶");
+        assert_eq!(c.score, (MINE_FLOORS.len() - 1) as u8, "计分项也封顶在最快一档");
+        assert_eq!(c.floor, *MINE_FLOORS.last().unwrap());
+    }
+
+    /// 计分不越过阶梯长度，且与状态怎么拼出来的无关：第三方独立复算得到同一个数
+    #[test]
+    fn weight_is_recomputable_independently_of_build_order() {
+        let mut forward = BTreeMap::new();
+        let mut backward = BTreeMap::new();
+        for k in 0..(CRAFT_CELL_CAP + 8) {
+            let id = format!("{:05}", k);
+            // 故意让最老的一批格子并列，检验「取哪 64 格」不改变总分
+            let e = cell(&id, "me", if k < 5 { 0 } else { (k as u64) % 37 });
+            forward.insert(id.clone(), e.clone());
+            backward.insert(id, e);
+        }
+        let a = craft_of(&forward, "me", 9_000);
+        let b = craft_of(&backward, "me", 9_000);
+        assert_eq!(a, b);
+        assert_eq!(a.cells, CRAFT_CELL_CAP + 8);
+        assert_eq!(a.graded, CRAFT_CELL_CAP, "只给最老的 64 格计分");
+        assert!((a.score as usize) < MINE_FLOORS.len());
     }
 }

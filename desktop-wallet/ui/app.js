@@ -167,8 +167,9 @@ async function refreshAll() {
   // 挖矿页
   const capPct = (cs.total_minted / cs.hard_cap) * 100;
   $("mine-earned").textContent = `${fmtAmt(cs.balance)} QLX`;
-  // 实际发行 = reward_at(h) × 50，只有挖到矿才发；这里展示单次上限（按硬顶截断）
-  const oneClaim = BigInt(cs.reward_per_block) * 50n;
+  // 单次发行 = 这把钥匙下一笔实际会结算的量（v3 起按自己的节奏窗口算），
+  // 不是 reward_per_block × 50；后端已按硬顶截断，这里只做防御性再截一次。
+  const oneClaim = BigInt(cs.claim_reward || 0);
   const remain = BigInt(cs.hard_cap) - BigInt(cs.total_minted);
   $("stat-reward").textContent = `${fmtAmt(oneClaim < remain ? oneClaim : (remain > 0n ? remain : 0n))} QLX`;
   $("stat-minted").textContent = `${fmtAmt(cs.total_minted)} QLX`;
@@ -435,6 +436,18 @@ function renderF3() {
     [t("world.f3.ent"), `${s.entities.length}`],
     [t("world.f3.layers"), `${s.max_layer} · ${t("world.f3.layers.note")}`],
     [t("world.f3.chunks"), `${s.chunks.length}`],
+    [
+      t("world.status.pace"),
+      `${t("world.status.pace.line", {
+        n: s.mine_claims_by_me || 0,
+        f: s.mine_floor || s.mine_cooldown_blocks,
+        nf: s.mine_next_floor || s.mine_cooldown_blocks,
+      })} · ${t("world.status.craft", {
+        cells: (s.craft || {}).cells || 0,
+        kept: (s.craft || {}).kept_blocks || 0,
+        score: (s.craft || {}).score || 0,
+      })}`,
+    ],
     [t("world.f3.addr"), s.address ? `<span class="cpy mono" data-copy="${s.address}">${short(s.address)}</span>` : `<span class="muted">${t("world.locked")}</span>`],
   ];
   let led;
@@ -560,6 +573,18 @@ function renderStatus() {
     : t("world.status.mine.wait", { h: s.next_claim_height, left: Math.max(0, s.next_claim_height - s.height) });
   $("world-fee-line").textContent = t("world.status.free", { max, win: s.free_quota_window });
   $("world-ore-note").textContent = t("world.status.ore", { n: s.ore_candidates, q: s.ore_quota, m: s.owned_by_me });
+  // v3：创造换的是节奏，不是更多的币。阶梯只看这把钥匙落下过几格矿。
+  const cr = s.craft || {};
+  const pace = t("world.status.pace.line", {
+    n: s.mine_claims_by_me || 0,
+    f: s.mine_floor || s.mine_cooldown_blocks,
+    nf: s.mine_next_floor || s.mine_cooldown_blocks,
+  });
+  const weight = t("world.status.craft", {
+    cells: cr.cells || 0,
+    kept: cr.kept_blocks || 0,
+    score: cr.score || 0,
+  });
   $("world-pending").innerHTML = `
     <div class="ent-row"><div class="er-main">
       <div class="er-n">${t("world.status.quota", { used, max, win: s.free_quota_window })}</div>
@@ -568,6 +593,11 @@ function renderStatus() {
     <div class="ent-row"><div class="er-main">
       <div class="er-n">${t("world.status.mine")}</div>
       <div class="er-m">${mine}</div>
+    </div></div>
+    <div class="ent-row"><div class="er-main">
+      <div class="er-n">${t("world.status.pace")}</div>
+      <div class="er-m">${pace}</div>
+      <div class="er-m">${weight}</div>
     </div></div>`;
 }
 
@@ -589,7 +619,17 @@ function mineMsg(p) {
   return t("world.ok.mine", {
     x: p.x, z: p.y, y: p.layer,
     reward: fmtAmt(p.reward), h: p.claim_height,
+    f: p.pace_floor, nf: p.pace_next_floor,
   });
+}
+
+// 刚落下、还没进块的那一格矿：出块动画要知道砖该压在哪格上
+let lastMinedCell = null;
+
+/** 挖到矿的现场反馈：矿格上方起一串 QLOR 符文，等下一个块把它铸成砖 */
+function noteMinedCell(p) {
+  lastMinedCell = { cx: p.x, cz: p.y, layer: p.layer, at: Date.now() };
+  if (w3) w3.rainAt(p.x, p.y, p.layer, `QLOR|${p.x}|${p.y}|${p.layer}`);
 }
 
 // —— 交互：物品栏、地图、编辑器
@@ -696,6 +736,7 @@ $("btn-mine-ore").addEventListener("click", async () => {
     const p = await invoke("world_mine_once", { kind: wSlot });
     QLSfx.claim();
     if (w3) w3.burst(p.x, p.layer, p.y, wSlot);
+    noteMinedCell(p);
     worldOk(mineMsg(p));
     await loadWorld();
   } catch (e) {
@@ -975,6 +1016,19 @@ listen("chain_block", (ev) => {
   }
 
   // 新块 = 新的历史 = 世界真的会变（种子含全部 VRF 折叠）
+  if (w3) {
+    // 只在"这一块真的发了币"且"本机刚挖过矿"时铸金砖：
+    // 没发行的块不落砖，避免每 2 秒在脚下凭空掉一块、让人误以为一直在挖到矿。
+    const mintedHere = Number(e.minted || 0);
+    const fresh = lastMinedCell && mintedHere > 0 && Date.now() - lastMinedCell.at < 60000;
+    if (fresh) {
+      w3.mintBlock({
+        hash: e.block_hash_hex, vrf: e.vrf_hex,
+        reward: mintedHere, height: e.height, cell: lastMinedCell,
+      });
+      lastMinedCell = null; // 一格矿只铸一次砖
+    }
+  }
   if (worldSnap && worldActive()) loadWorld().catch(() => {});
 });
 

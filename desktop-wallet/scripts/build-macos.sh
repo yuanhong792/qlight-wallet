@@ -17,8 +17,10 @@ echo "版本 v${VER}"
 
 echo "① cargo build --release ..."
 export PATH="$HOME/.cargo/bin:$PATH"
-# 外置盘会生成 ._ 资源叉文件，会破坏 tauri 的 build script —— 编译输出固定放内置盘
-export CARGO_TARGET_DIR=/Users/a666/qlx-build-target
+# 外置盘会生成 ._ 资源叉文件，会破坏 tauri 的 build script —— 编译输出默认放内置盘，
+# 但允许用 CARGO_TARGET_DIR 覆盖（CI / 已有缓存目录都能复用）。
+export COPYFILE_DISABLE=1
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/Library/Caches/qlight-build-target}"
 cargo build --release
 
 echo "② 组装 .app bundle ..."

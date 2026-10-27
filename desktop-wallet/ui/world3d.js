@@ -101,6 +101,28 @@
     return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
   }
 
+  // 3×5 像素字模：每行一个八进制位（左=4 中=2 右=1），自上而下拼成 5 位字符串。
+  // 没有贴图字体也能把块哈希刻进砖里——世界里的字必须是像素，不是 DOM。
+  var FONT35 = {
+    '0': '25652', '1': '26227', '2': '71247', '3': '71317', '4': '55711',
+    '5': '74717', '6': '74757', '7': '71244', '8': '55755', '9': '75717',
+    'A': '25575', 'B': '65656', 'C': '34443', 'D': '65556', 'E': '74747', 'F': '74744',
+    'Q': '25523', 'L': '44447', 'O': '25552', 'R': '65655', 'X': '55255',
+    '|': '22222', '.': '00002', '+': '02720', '-': '00700', '#': '57575', ' ': '00000',
+  };
+  /** 文本里没有的字模要显式报出来，不许悄悄吞字（数字雨少一位就是假象） */
+  function missingGlyphs(text) {
+    var out = [];
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i].toUpperCase();
+      if (FONT35[ch] === undefined && out.indexOf(ch) < 0) out.push(ch);
+    }
+    return out;
+  }
+
+  // 出块显形层的节奏：砖 2.4 秒落进矿格，符文雨 5.2 秒流完；同屏最多 8 条，写满就挤掉最老的
+  var FX_MINT_MS = 2400, FX_RAIN_MS = 5200, FX_CAP = 8, FX_PX = 0.075;
+
   function World3D(canvas, hooks) {
     var gl = canvas.getContext('webgl', { antialias: false, alpha: false });
     if (!gl) { hooks.onUnsupported && hooks.onUnsupported(); return null; }
@@ -156,19 +178,22 @@
       slot: 0, slots: 16, colors: [], maxLayer: MAX_LAYER,
       x: 128.5, z: 128.5, y: 30, yaw: 0.6, pitch: -0.45,
       keys: {}, dirty: true, regionKey: '', target: null, locked: false, drag: false,
-      height: 0, heightAt: performance.now(), day: null, lastYaw: 1e9, lastAnim: 0,
+      height: 0, heightAt: performance.now(), day: null, lastYaw: 1e9, lastAnim: 0, mesh: 0,
       bob: 0, bobPhase: 0, stepMark: 0, parts: [], entAt: 0,
-      bufT: gl.createBuffer(), nT: 0, bufE: gl.createBuffer(), nE: 0, bufH: gl.createBuffer(), nH: 0,
-      bufP: gl.createBuffer(), nP: 0, bufS: gl.createBuffer(), nS: 0, bufStar: gl.createBuffer(), nStar: 0,
+      bufT: gl.createBuffer(), nT: 0, bufE: gl.createBuffer(), nE: 0, bufH: gl.createBuffer(), nH: 0,      bufP: gl.createBuffer(), nP: 0, bufS: gl.createBuffer(), nS: 0, bufStar: gl.createBuffer(), nStar: 0,
+      // 铸块砖 + QLOR 数字雨：只有这一层自己的缓冲。出块的动画不该重铺 64×64 地形。
+      bufF: gl.createBuffer(), nF: 0, fx: [],
       // 缓冲区按 12 面/格预算（平均只有约 2.4 面：树只占林地的 ~12%）。
       // 真写满了 quad() 会直接停笔——最坏结果是区域最后几行（雾里那几格）缺面，
       // 不会越界写坏内存，也不会影响任何一条链上判定。
       arrT: new Float32Array(REGION * REGION * 12 * 6 * 6),
       arrE: new Float32Array(2048 * 36 * 6),
-      arrH: new Float32Array(2 * 24 * 6),
+      arrH: new Float32Array(6 * 24 * 6),
       arrP: new Float32Array(512 * 6),
       arrS: new Float32Array(2 * 6 * 6),
       arrStar: new Float32Array(140 * 6),
+      // 一个 FX 条目最多 12 行 × 24 字 × 15 像素，每像素 6 顶点 × 6 浮点
+      arrF: new Float32Array(9000 * 36),
       fps: 0, frames: 0, fpsMark: 0,
     };
 
@@ -283,6 +308,7 @@
     }
 
     function buildTerrain(x0, z0) {
+      st.mesh++;                       // 铺一次 64×64 记一次：出块动画若碰了这个数，回归闸当场就能看见
       arr = st.arrT; vp = 0;
       for (var dz = 0; dz < REGION; dz++) {
         for (var dx = 0; dx < REGION; dx++) {
@@ -392,6 +418,7 @@
                [x0, y1, z0, x1, y1, z0], [x1, y1, z0, x1, y1, z1], [x1, y1, z1, x0, y1, z1], [x0, y1, z1, x0, y1, z0],
                [x0, y0, z0, x0, y1, z0], [x1, y0, z0, x1, y1, z0], [x1, y0, z1, x1, y1, z1], [x0, y0, z1, x0, y1, z1]];
       for (var i = 0; i < L.length; i++) {
+        if (vp + 12 > arr.length) break; // 线框也只写满不写穿（与 vert/quad 同一纪律）
         var p = L[i];
         arr[vp++] = p[0]; arr[vp++] = p[1]; arr[vp++] = p[2];
         arr[vp++] = col[0]; arr[vp++] = col[1]; arr[vp++] = col[2];
@@ -407,6 +434,17 @@
         wire(t.cx - e, t.layer - e, t.cz - e, t.cx + 1 + e, t.layer + 1 + e, t.cz + 1 + e, [0.06, 0.07, 0.09]);
         if (t.place) wire(t.place.cx - e, t.place.layer - e, t.place.cz - e,
           t.place.cx + 1 + e, t.place.layer + 1 + e, t.place.cz + 1 + e, [0.98, 0.85, 0.32]);
+      }
+      // 刚被这块砖铸出来的矿格：金框亮一下再退场
+      var e2 = 0.06, nowMs = performance.now();
+      for (var i = st.fx.length - 1; i >= 0; i--) {
+        var f = st.fx[i];
+        if (f.type !== 'mint') continue;
+        var g = Math.max(0, 1 - (nowMs - f.t0) / f.life);
+        if (g <= 0.02) continue;
+        wire(f.cx - e2, f.layer - e2, f.cz - e2, f.cx + 1 + e2, f.layer + 1 + e2, f.cz + 1 + e2,
+          [0.98 * g, 0.85 * g, 0.32 * g]);
+        break;
       }
       st.nH = vp / 6;
       gl.bindBuffer(gl.ARRAY_BUFFER, st.bufH);
@@ -567,6 +605,88 @@
       st.nP = n / 6;
     }
 
+    // —— §9.16 出块显形：铸块砖（刻块哈希 / VRF / 滚动发行量）与矿格上方的 QLOR 数字雨
+    // 只写 st.arrF 这一条缓冲：动画绝不该把 64×64 的区域网格重新铺一遍。
+
+    function fxPush(e) {
+      st.fx.push(e);
+      if (st.fx.length > FX_CAP) st.fx.splice(0, st.fx.length - FX_CAP);
+    }
+    function fxPixel(cx, cy, cz, rx, ry, rz, ux, uy, uz, nv, c, k) {
+      var hp = FX_PX * 0.5;
+      function pt(sx, sy) {
+        return [cx + rx * sx + ux * sy, cy + ry * sx + uy * sy, cz + rz * sx + uz * sy];
+      }
+      var a = pt(-hp, -hp), b = pt(hp, -hp), g = pt(hp, hp), i2 = pt(-hp, hp);
+      quad([a[0], a[1], a[2], b[0], b[1], b[2], g[0], g[1], g[2], i2[0], i2[1], i2[2]], c, k, nv);
+    }
+    /** 一行像素字：以 (x,y,z) 为中心，沿相机的 right/up 铺开（永远正对眼睛） */
+    function fxText(x, y, z, rx, ry, rz, ux, uy, uz, nv, text, c, k) {
+      var s = String(text).toUpperCase();
+      var ox = -(((s.length * 4 - 1) - 1) / 2) * FX_PX, oy = ((5 - 1) / 2) * FX_PX;
+      for (var ci = 0; ci < s.length; ci++) {
+        var rows = FONT35[s[ci]];
+        if (!rows) continue; // 缺字模就不画，绝不拿别的字顶替（G3 用 missingGlyphs 兜住）
+        for (var r0 = 0; r0 < 5; r0++) {
+          var bits = rows.charCodeAt(r0) - 48;
+          for (var q = 0; q < 3; q++) {
+            if (((bits >> (2 - q)) & 1) === 0) continue;
+            var sx = ox + (ci * 4 + q) * FX_PX, sy = oy - r0 * FX_PX;
+            fxPixel(x + rx * sx + ux * sy, y + ry * sx + uy * sy, z + rz * sx + uz * sy,
+              rx, ry, rz, ux, uy, uz, nv, c, k);
+          }
+        }
+      }
+    }
+
+    function drawMint(f, age, rx, ry, rz, ux, uy, uz, nv) {
+      var k = age / f.life;
+      var drop = 1 - smooth(0, 1, Math.min(1, k / 0.62));   // 前 62% 从半空压下来
+      var y = f.layer + 1.5 + drop * 6.5;
+      var fade = k < 0.7 ? 1 : Math.max(0, 1 - (k - 0.7) / 0.3);
+      var c = f.reward > 0 ? ERA_GOLD : [150, 158, 170];
+      cube(f.cx + 0.16, y - 0.34, f.cz + 0.16, f.cx + 0.84, y + 0.34, f.cz + 0.84, c);
+      var roll = Math.min(1, k / 0.5);                      // 发行量从 0 滚到真值
+      var amt = ((f.reward / 1e9) * roll).toFixed(3);
+      var cx = f.cx + 0.5, cz = f.cz + 0.5;
+      fxText(cx, y + 1.35, cz, rx, ry, rz, ux, uy, uz, nv, '#' + f.height + ' ' + f.hash, c, fade);
+      fxText(cx, y + 0.9, cz, rx, ry, rz, ux, uy, uz, nv, 'VRF ' + f.vrf, [214, 226, 240], fade);
+      fxText(cx, y + 0.45, cz, rx, ry, rz, ux, uy, uz, nv, '+' + amt + ' QLX', f.reward > 0 ? [255, 246, 190] : [176, 184, 198], fade);
+    }
+
+    function drawRain(f, age, rx, ry, rz, ux, uy, uz, nv) {
+      var k = age / f.life;
+      var rise = (age / 1000) * 1.15;
+      for (var i = 0; i < f.rows; i++) {
+        var y = f.base + i * 0.62 + rise;
+        var away = Math.min(1, (y - f.base) / 8);
+        var kk = (1 - k) * (1 - away * 0.7);
+        if (kk <= 0.03) continue;
+        fxText(f.cx + 0.5, y, f.cz + 0.5, rx, ry, rz, ux, uy, uz, nv, f.text, [104, 240, 188], kk);
+      }
+    }
+
+    /** 每帧重算 FX 缓冲：过期条目当场剔除，画多少个三角形回给 draw */
+    function stepFx(now, d) {
+      var rx = d[2], ry = 0, rz = -d[0], rl = Math.hypot(rx, rz) || 1; rx /= rl; rz /= rl;
+      var ux = d[1] * rz, uy = d[2] * rx - d[0] * rz, uz = -d[1] * rx;
+      var ul = Math.hypot(ux, uy, uz) || 1; ux /= ul; uy /= ul; uz /= ul;
+      var nv = [-d[0], -d[1], -d[2]];
+      arr = st.arrF; vp = 0;
+      for (var i = st.fx.length - 1; i >= 0; i--) {
+        var f = st.fx[i];
+        f.age = now - f.t0;
+        if (f.age > f.life) { st.fx.splice(i, 1); continue; }
+        if (f.type === 'mint') drawMint(f, f.age, rx, ry, rz, ux, uy, uz, nv);
+        else drawRain(f, f.age, rx, ry, rz, ux, uy, uz, nv);
+      }
+      st.nF = vp / 6;
+      if (!st.nF) return 0;   // 没东西可画就连这次上传也省掉：常态帧不许为动画买单
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufF);
+      gl.bufferData(gl.ARRAY_BUFFER, st.arrF.subarray(0, vp), gl.DYNAMIC_DRAW);
+      return st.nF;
+    }
+
     function draw() {
       if (!st.heights) return;
       var w = canvas.clientWidth | 0, h = canvas.clientHeight | 0;
@@ -639,6 +759,15 @@
         drawBuf(st.bufP, st.nP, gl.POINTS);
       }
 
+      // 出块显形（铸块砖 + QLOR 数字雨）：正对相机、不吃雾，也不碰地形网格
+      var nF = stepFx(now, d);
+      if (nF) {
+        colorUse();
+        gl.uniform2f(U.fogr, 100000, 100001);
+        gl.uniform4f(U.tint, 1, 1, 1, 1);
+        drawBuf(st.bufF, nF, gl.TRIANGLES);
+      }
+
       // 准星线框
       colorUse();
       gl.disable(gl.CULL_FACE);
@@ -682,6 +811,7 @@
         x: cx, z: cz, layer: Math.floor(st.y - EYE + 0.01), surface: level(cx, cz),
         block: blk(cx, cz), target: t, fps: st.fps, locked: st.locked,
         day: ds.day, dusk: ds.dusk, height: st.height, slots: st.slots,
+        fx: st.fx.length, fxVerts: st.nF, mesh: st.mesh,
       };
     }
 
@@ -857,6 +987,26 @@
       setTime: function (height) { st.height = Math.max(0, height | 0); st.heightAt = performance.now(); },
       setMaxLayer: function (n) { if (n > 0) st.maxLayer = n; },
       burst: burst,
+      /** 出块显形：一块刻着块哈希/VRF/发行量的砖落进矿格。cell 缺省时落在脚下。 */
+      mintBlock: function (info) {
+        if (!info || !st.heights) return;
+        var cell = info.cell || { cx: st.x | 0, cz: st.z | 0, layer: support(st.x | 0, st.z | 0) - 1 };
+        fxPush({
+          type: 'mint', t0: performance.now(), age: 0, life: FX_MINT_MS,
+          cx: cell.cx | 0, cz: cell.cz | 0, layer: Math.max(0, cell.layer | 0),
+          hash: String(info.hash || '').slice(0, 8), vrf: String(info.vrf || '').slice(0, 8),
+          reward: Number(info.reward) || 0, height: Number(info.height) || 0,
+        });
+      },
+      /** 矿格上方起一串向上流的 QLOR 符文（x/y/layer 就是这一格的坐标，与账本同一口径） */
+      rainAt: function (cx, cz, layer, text) {
+        fxPush({
+          type: 'rain', t0: performance.now(), age: 0, life: FX_RAIN_MS, rows: 6,
+          cx: cx | 0, cz: cz | 0, base: Math.max(0, (layer | 0) + 1),
+          text: String(text || 'QLOR'),
+        });
+      },
+      fxCount: function () { return st.fx.length; },
       spawn: function (cx, cz) {
         st.x = cx + 0.5; st.z = cz + 0.5;
         st.y = Math.max(st.y, support(cx, cz) + EYE);
@@ -897,5 +1047,8 @@
   global.QLWorld3D = {
     create: World3D, LEVEL_SHIFT: LEVEL_SHIFT, MAX_LAYER: MAX_LAYER, REACH: REACH,
     REGION: REGION, PAL: PAL, TREE_TRUNK: TREE_TRUNK, TREE_LEAF: TREE_LEAF, ERA_GOLD: ERA_GOLD,
+    // 出块显形这一层的可测面：字模表与"这行字有没有缺笔"的判据（回归闸用它自己拼字符串）
+    FONT35: FONT35, missingGlyphs: missingGlyphs,
+    FX_MINT_MS: FX_MINT_MS, FX_RAIN_MS: FX_RAIN_MS, FX_CAP: FX_CAP,
   };
 })(window);

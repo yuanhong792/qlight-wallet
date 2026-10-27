@@ -56,6 +56,12 @@ pub struct ChainState {
     pub height: u64,
     pub total_minted: u64,
     pub reward_per_block: u64,
+    /// 本机下一次挖矿实际会发行多少（按这把钥匙自己的节奏窗口结算，已含硬顶截断）
+    pub claim_reward: u64,
+    /// 本机下一笔挖矿最早可结算的块高
+    pub next_claim_height: u64,
+    /// 本机当前节奏档（两次发行至少间隔的块数）
+    pub claim_floor: u64,
     pub block_interval_secs: u64,
     pub decimals: u64,
     pub fee: u64,
@@ -72,6 +78,10 @@ pub fn chain_state(state: AppCtx) -> ChainState {
         .map(|a| state.chain.balance_of(a))
         .unwrap_or(0);
     let height = state.chain.height();
+    let miner_addr = address.clone().unwrap_or_default();
+    let (_, claim_reward) = state.chain.claim_preview(&miner_addr);
+    let next_claim_height = state.chain.next_claim_height(&miner_addr);
+    let (_, claim_floor) = state.chain.claim_pace(&miner_addr);
     ChainState {
         unlocked: core.is_some(),
         address,
@@ -79,6 +89,9 @@ pub fn chain_state(state: AppCtx) -> ChainState {
         height,
         total_minted: state.chain.total_minted(),
         reward_per_block: simchain::reward_at(height),
+        claim_reward,
+        next_claim_height,
+        claim_floor,
         block_interval_secs: simchain::BLOCK_INTERVAL_SECS,
         decimals: simchain::DECIMALS,
         fee: simchain::FEE,
@@ -413,6 +426,7 @@ fn emit_initial_state(app: &AppHandle, state: AppCtx, core: Arc<WalletCore>) {
             block_hash_hex: String::new(),
             vrf_hex: String::new(),
             reward: simchain::reward_at(height + 1),
+            minted: 0,
             balance: state.chain.balance_of(&core_addr),
             total_minted: state.chain.total_minted(),
             ts_unix: std::time::SystemTime::now()
@@ -511,6 +525,15 @@ pub struct WorldSnapshot {
     pub next_claim_height: u64,
     /// 若此刻挖中一格，下一个块会发行多少（最小单位，已按硬顶截断）
     pub mine_reward: u64,
+    /// —— v3「创造换节奏」（§9.16）——
+    /// 这把钥匙当前挣到的最小间隔（块）：落过 0 格矿 = 50，最快 10
+    pub mine_floor: u64,
+    /// 这把钥匙在世界里已经落下的矿格数——v3 节奏阶梯的唯一输入（分身买不到速度）
+    pub mine_claims_by_me: u64,
+    /// 再落一格矿之后达到的间隔（块）：HUD 用它说清「建造换到什么」
+    pub mine_next_floor: u64,
+    /// 创造权重：占了几格、守了多少个块。只计量，不评价好坏。
+    pub craft: world::Craft,
 }
 
 /// 逐块读出 VRF 序列（世界的历史即种子；创世行的 VRF 是全零，异或进去不改变种子）
@@ -558,11 +581,14 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
             })
             .count() as u32
     });
-    let next_claim = state.chain.next_claim_height();
-    let mine_reward = simchain::claim_reward(
-        height + 1,
-        state.chain.total_minted(),
-    );
+    // v3：节奏与发行量都按这把钥匙自己算（未解锁 = 落过 0 格 = 最慢一档）
+    let miner_addr = core.as_ref().map(|c| c.address.clone()).unwrap_or_default();
+    let (mine_claims_by_me, mine_floor) = state.chain.claim_pace(&miner_addr);
+    let mine_next_floor = simchain::craft_floor(mine_claims_by_me + 1);
+    let (_, mine_reward) = state.chain.claim_preview(&miner_addr);
+    let next_claim = state.chain.next_claim_height(&miner_addr);
+    // 创造权重：世界状态 + 链头高度的纯函数。同一份账本，任何人算出同一个数。
+    let craft = world::craft_of(&state_map, &address, height);
 
     WorldSnapshot {
         genesis_hash_hex: simchain::genesis_hash_hex(),
@@ -590,6 +616,10 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
         last_claim_height: state.chain.last_claim_height(),
         next_claim_height: next_claim,
         mine_reward,
+        mine_floor,
+        mine_claims_by_me,
+        mine_next_floor,
+        craft,
     }
 }
 
@@ -616,22 +646,26 @@ pub struct MineResult {
     /// 预计结算块高与发行量（最小单位）
     pub claim_height: u64,
     pub reward: u64,
+    /// 这一笔所用的节奏档位（最小间隔，块）
+    pub pace_floor: u64,
+    /// 这一格落进世界以后的下一档（创造换节奏：v3 唯一的加速口径）
+    pub pace_next_floor: u64,
 }
 
 /// ⛏️ 挖一回合：在本回合的矿脉里按湿度从高到低取第一个还可挖的格子，
 /// 在世界里落一个贴地方块（免费），同时提交一张**发行凭据**——
-/// 下一个块收下它，`reward_at(h) × 50` 才进本机余额。
+/// 下一个块收下它，才会按这一笔**最多一个当前节奏档**发行新币进本机余额（空块不补发）。
 ///
 /// **没有造出来的方块，就没有发行**：币不是计时器印出来的，是世界里多了一格
-/// 别人可复算的坐标换来的（§9.13「世界即矿场」）。两次发行至少隔 50 个块，
-/// 所以脚本刷得再快也快不过世界自己重画地表的节奏。
+/// 别人可复算的坐标换来的（§9.13「世界即矿场」）。两次发行至少隔这把钥匙
+/// 当前挣到的节奏档（50→10 块），所以脚本刷得再快也快不过世界自己重画地表的节奏。
 #[tauri::command]
 pub fn world_mine_once(state: AppCtx, kind: u8) -> Result<MineResult, String> {
     let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
     let map = live_world(&state)?;
     let vrfs = vrf_sequence(&state.blocks_path);
     let height = state.chain.height();
-    let ready_at = state.chain.next_claim_height();
+    let ready_at = state.chain.next_claim_height(&core.address);
     if ready_at > height + 1 {
         return Err(format!(
             "本回合已结算：下一笔挖矿发行在块高 {ready_at}（约 {} 秒后）",
@@ -650,6 +684,8 @@ pub fn world_mine_once(state: AppCtx, kind: u8) -> Result<MineResult, String> {
         )
     })?;
     let kind = kind.min(world::SLOT_COUNT - 1);
+    // 这一跳之前这把钥匙的节奏（已落矿格数 + 当前最小间隔）：块一结算它就往前挪一档
+    let pace = state.chain.claim_pace(&core.address);
 
     // 先提交发行凭据：被拒就不该在世界里落方块（否则会造出一格"挖不出发行"的矿）
     let (wire, digest) = state.chain.submit_claim(&core, x, y, layer)?;
@@ -679,7 +715,11 @@ pub fn world_mine_once(state: AppCtx, kind: u8) -> Result<MineResult, String> {
         y,
         layer,
         claim_height: height + 1,
-        reward: simchain::claim_reward(height + 1, state.chain.total_minted()),
+        reward: state.chain.claim_preview(&core.address).1,
+        // 这一格落下去，节奏就往前挪一档（v3 里创造唯一买得到的东西）：
+        // UI 要能在同一跳里说出"下一笔最快 X 块后结算"，进度感才是真的进度感。
+        pace_floor: pace.1,
+        pace_next_floor: simchain::craft_floor(pace.0 + 1),
     })
 }
 

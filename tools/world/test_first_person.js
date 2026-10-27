@@ -11,6 +11,7 @@
  *   C 自己垒的塔踩得住（support 含活方块）  D 左键拆 = 释放归属，块同时从三维与占格索引里消失
  *   E 准星落空必须有反馈（不许无声失败）    F 大地（高度场）钉死在创世哈希上，不随链长漂移
  *   G 写完的方块当场显形（几何变了才重铺，轮询不卡）    G2 app.js 的快照刷新必须推给 3D 场景
+ *   G3 出块显形：铸块砖 + QLOR 数字雨只写自己的缓冲，绝不重铺 64×64，到期自动散场
  *
  * 用法：node tools/world/test_first_person.js
  */
@@ -212,6 +213,54 @@ check('G 内容未变的轮询不重铺', gPoll < gMove, { gMove, gPoll });
 const appJs = require('fs').readFileSync(path.join(UI, 'app.js'), 'utf8');
 const loadWorldBody = (appJs.match(/async function loadWorld\(\)\s*\{[\s\S]*?\n\}/) || [''])[0];
 check('G2 app.js 的 loadWorld 把实体表推给开着的 3D 场景', /setEntities\s*\(/.test(loadWorldBody), loadWorldBody.slice(0, 150));
+
+/* ============ G3 出块显形：铸块砖 + QLOR 数字雨（§9.16 v3 的体验层） ============
+ *   纪律只有一条：这一层只许写自己的缓冲。出块动画如果顺手置了 st.dirty，
+ *   玩家每 2 秒就被一次 64×64 重铺卡一下——"体验感"当场变成"体验差"。 */
+const groundLayer = heights[sz * W.W + sx] >> 3;
+const idle0 = up();                                  // 常态帧的上传次数（天空/星/粒子/线框）
+const mesh0 = w3.state().mesh;                       // 64×64 重铺了几次——这条才是硬指标
+check('G3 没有出块动画时不许画幽灵砖', w3.state().fx === 0 && w3.state().fxVerts === 0, w3.state());
+check('G3 空动画不铺地形', w3.state().mesh === mesh0, { mesh0, got: w3.state().mesh });
+
+const hash8 = 'a1b2c3d4', vrf8 = '0f1e2d3c';
+w3.mintBlock({ hash: hash8 + 'eeff', vrf: vrf8 + '99', reward: 2500000000, height: 77, cell: { cx: sx, cz: sz, layer: groundLayer } });
+const fxFrame = up();
+check('G3 一笔发行铸出一块砖', w3.state().fx === 1, w3.state().fx);
+check('G3 砖与三行刻字真的写进了缓冲', w3.state().fxVerts > 0, w3.state());
+// 实体网格本来就有 ~90ms 一次的"呼吸"重算，所以上传数只设上界；重铺次数必须一分不多
+check('G3 动画只多一次上传，绝不重铺区域网格', fxFrame <= idle0 + 2 && w3.state().mesh === mesh0, { idle0, fxFrame, mesh: w3.state().mesh });
+
+const rainText = `QLOR|${sx}|${sz}|${groundLayer}`;
+check('G3 矿格坐标写成符文不许缺笔', W3.missingGlyphs(rainText).length === 0, W3.missingGlyphs(rainText));
+check('G3 反向对照：字模表外的字符必须报出来（不许悄悄吞字）', W3.missingGlyphs('QL©').indexOf('©') >= 0, W3.missingGlyphs('QL©'));
+w3.rainAt(sx, sz, groundLayer, rainText);
+const twoFx = up();
+check('G3 砖与数字雨共用同一条缓冲（不是两条）', w3.state().fx === 2 && twoFx <= idle0 + 2 && w3.state().mesh === mesh0, { idle0, twoFx, fx: w3.state().fx, verts: w3.state().fxVerts });
+
+/* 落不完也得散场：条目自己到期，缓冲与帧成本回到常态，动画不许永久占着画面 */
+for (let i = 0; i < 400; i++) frame();
+check('G3 动画到期自动清空', w3.state().fx === 0 && w3.state().fxVerts === 0, w3.state());
+check('G3 全程没为动画铺过一次地形', w3.state().mesh === mesh0, { mesh0, got: w3.state().mesh });
+
+/* 洪水测试：脚本狂出块也不许把一帧拖成重铺 */
+for (let i = 0; i < 40; i++) {
+  w3.mintBlock({ hash: hash8, vrf: vrf8, reward: 100000000, height: i, cell: { cx: sx + (i % 5), cz: sz, layer: groundLayer } });
+  w3.rainAt(sx + (i % 5), sz, groundLayer, rainText);
+}
+check('G3 同屏动画有条上限', w3.state().fx > 0 && w3.state().fx <= W3.FX_CAP, w3.state().fx);
+check('G3 洪水之后一帧仍只多一次上传', up() <= idle0 + 2 && w3.state().mesh === mesh0, { idle0, got: up(), mesh: w3.state().mesh });
+check('G3 缺参数的出块事件不许炸', (() => { try { w3.mintBlock(null); w3.mintBlock({}); return true; } catch (e) { return false; } })(), null);
+
+/* app.js 接线（与 G2 同一个道理：渲染器对了，调用点漏了玩家照样看不见） */
+const blockBody = (appJs.match(/listen\("chain_block",\s*\(ev\)\s*=>\s*\{[\s\S]*?\n\}\);/) || [''])[0];
+check('G3 app.js 收到新块必须铸砖', /mintBlock\s*\(/.test(blockBody), blockBody.slice(-200));
+check('G3 砖上的发行量取 total_minted 的差，不是含手续费的 e.reward',
+  /total_minted/.test(blockBody) && !/reward:\s*e\.reward/.test(blockBody), blockBody.slice(-260));
+const mineBody = (appJs.match(/\$\("btn-mine-ore"\)\.addEventListener\("click",\s*async \(\)\s*=>\s*\{[\s\S]*?\n\}\);/) || [''])[0];
+check('G3 挖到矿必须在矿格上起一串符文', /noteMinedCell\(/.test(mineBody), mineBody.slice(0, 200));
+check('G3 符文只在矿签真的落账之后起（不许在签名前预告）',
+  mineBody.indexOf('world_mine_once') >= 0 && mineBody.indexOf('world_mine_once') < mineBody.indexOf('noteMinedCell('), mineBody.slice(0, 240));
 
 let fail = 0;
 for (const r0 of results) {

@@ -19,7 +19,7 @@
 use crate::crypto;
 use crate::tx::{tx_digest, TxEnvelope};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,9 +52,34 @@ pub const LEDGER_V: u8 = 2;
 pub const BLOCK_V_LEGACY: u8 = 0;
 /// v1 = 挖矿结算规则的起点：发行必须有矿签。v2 沿用同一套经济规则，只是多绑一份世界承诺。
 pub const BLOCK_V_MINING: u8 = 1;
-/// v2 = 现行：块哈希再绑上「世界承诺」——整本实体账本的集合指纹与条数。
-/// 从此"谁眼里的世界是哪一份"是可归责的：改 `entities.jsonl` 会被块头当场识破。
-pub const BLOCK_V: u8 = 2;
+/// v2 = 块哈希再绑上「世界承诺」——整本实体账本的集合指纹与条数（域 `QL-BLOCK-V3`）。
+pub const BLOCK_V_WORLD: u8 = 2;
+/// v3 = 节奏阶梯：**发行节奏由创造挣得**。两次发行的最小间隔不再固定 50 块，而是随
+/// 该地址在世界里落下的矿格数递减（50→10）；每笔只结算**最多一个当前档位** Δ 个块的量
+/// （`reward_at(h) × Δ`），空档不补发，所以每块平均发行量 ≤ `reward_at(h)`：
+/// 减半曲线、210M 硬顶、每块最多一张矿签全部照旧——创造换来的是节奏，不是超发。
+/// （域 `QL-BLOCK-V4`；v2 块继续按 ×50 原样重放，历史不被改写。）
+pub const BLOCK_V_CRAFT: u8 = 3;
+/// v4 = 现行：在 v3 的经济规则上，把 `miner` 与 `ts_unix` 也绑进块哈希
+/// （域 `QL-BLOCK-V5`）。没有这一步，无矿签的块可以改 `miner` 偷手续费；
+/// v0 块更可以改 `miner` 偷整笔奖励。v3 及以前的块仍按旧域原样重放。
+pub const BLOCK_V_MINER: u8 = 4;
+pub const BLOCK_V: u8 = 4;
+/// 旧版本（v0/v1/v2/v3）只允许在这个高度及以前出现；超过后必须 v4。
+///
+/// 这是"版本激活高度"：没有它，攻击者可以在任意高度造 v0 块，绕过矿签与冷却
+/// 无条件领 `reward_at(h)`。1000 覆盖现有演示链（当前最高 < 900），同时给旧
+/// 免费发行画上硬边界；超过 1000 的旧 v0 链会在启动校验时归档重置。
+pub const BLOCK_V_V4_ACTIVATION: u64 = 1_000;
+
+/// 某个块高允许的最低版本：激活高度之后只认 v4，之前允许历史版本逐级升级。
+pub fn version_floor_at(height: u64) -> u8 {
+    if height > BLOCK_V_V4_ACTIVATION {
+        BLOCK_V
+    } else {
+        BLOCK_V_LEGACY
+    }
+}
 /// 两次挖矿发行之间的最小间隔（块）。2 秒一块 → 约 100 秒一回合。
 ///
 /// 挖矿是"在世界里落一格别人可复算的坐标"，不是跑算法；这个间隔让脚本
@@ -169,9 +194,16 @@ pub struct Ledger {
     pub balances: HashMap<String, u64>,
     pub nonces: HashMap<String, u64>,
     pub records: Vec<TxRecord>,
-    /// 本链已挖矿发行的最后一笔所在块高（0 = 从未）——两次发行至少隔 50 块
+    /// 最后一次**结算/发行水位**（0 = 从未）。
+    ///
+    /// v0 每块都发行，所以水位跟着块高走；v1+ 只在收下矿签时推进。
+    /// 它既是冷却基准，也是"升级后第一笔 v4 不许把旧 v0 已发过的块再补一遍"的闸门。
     #[serde(default)]
     pub last_claim_height: u64,
+    /// 最近一个已应用块的版本（0 = 创世/旧档）。版本只许升不许降，
+    /// 否则攻击者可以在 v4 链后面接一个 v0 块继续免费发行。
+    #[serde(default)]
+    pub last_block_version: u8,
     /// 链上最近一次「世界承诺」的条数（v2 块才有；0 = 还没承诺过）。
     /// 用于单调性闸门：append-only 的世界里，倒退 = 有人想把世界清空。
     #[serde(default)]
@@ -180,6 +212,10 @@ pub struct Ledger {
     /// 不进 ledger.json：它可以从 blocks.jsonl 逐行重建，存两份只会漂移。
     #[serde(skip)]
     pub vrfs: Vec<String>,
+    /// 每个地址已经落下的矿格数（v3 的节奏阶梯就看这个数）。
+    /// 与 `vrfs` 同一口径：块文件里逐笔可数，绝不另存一份可能过期的副本。
+    #[serde(skip)]
+    pub claims_by: BTreeMap<String, u64>,
 }
 
 impl Default for Ledger {
@@ -194,8 +230,10 @@ impl Default for Ledger {
             nonces: HashMap::new(),
             records: vec![],
             last_claim_height: 0,
+            last_block_version: BLOCK_V_LEGACY,
             entity_count_committed: 0,
             vrfs: vec![],
+            claims_by: BTreeMap::new(),
         }
     }
 }
@@ -203,8 +241,8 @@ impl Default for Ledger {
 /// 区块头（blocks.jsonl 每行一条，含块内全部交易，供哈希链重放校验）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockHeader {
-    /// 0 = 历史（每块固定排放）；1 = 挖矿结算（有矿签才发行）；2 = 再加世界承诺。
-    /// 旧行缺省按 0 读
+    /// 0 = 历史（每块固定排放）；1 = 挖矿结算（有矿签才发行）；2 = 再加世界承诺；
+    /// 3 = 创造换节奏；4 = 块哈希再绑 miner/ts（现行）。旧行缺省按 0 读。
     #[serde(default)]
     pub version: u8,
     pub height: u64,
@@ -396,6 +434,34 @@ pub fn block_hash_of_ver(
     h
 }
 
+/// v2/v3 共用的预镜像：版本 ‖ prev ‖ 高 ‖ minted ‖ vrf ‖ tx_root ‖ 世界指纹 ‖ 条数。
+/// 只有哈希域随版本不同——预镜像多一个字节都算不出同一个块，历史因此无法被"重新解释"。
+fn hash_world_bound(
+    ver: u8,
+    domain: &[u8],
+    prev_hash_hex: &str,
+    height: u64,
+    minted_after: u64,
+    vrf: &[u8],
+    root: &[u8; 32],
+    entity_root: &[u8; 32],
+    entity_count: u64,
+) -> [u8; 32] {
+    let mut block_in: Vec<u8> = Vec::with_capacity(181);
+    block_in.push(ver);
+    block_in.extend_from_slice(prev_hash_hex.as_bytes());
+    block_in.extend_from_slice(&height.to_be_bytes());
+    block_in.extend_from_slice(&minted_after.to_be_bytes());
+    block_in.extend_from_slice(vrf);
+    block_in.extend_from_slice(root);
+    block_in.extend_from_slice(entity_root);
+    block_in.extend_from_slice(&entity_count.to_be_bytes());
+    let out = crypto::shake256(domain, &block_in, 32);
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&out);
+    h
+}
+
 /// v2 的块哈希：预镜像在世界承诺（集合指纹 ‖ 条数）上结束，域 `QL-BLOCK-V3`。
 pub fn block_hash_of_world(
     prev_hash_hex: &str,
@@ -406,16 +472,70 @@ pub fn block_hash_of_world(
     entity_root: &[u8; 32],
     entity_count: u64,
 ) -> [u8; 32] {
-    let mut block_in: Vec<u8> = Vec::with_capacity(181);
-    block_in.push(BLOCK_V);
+    hash_world_bound(
+        BLOCK_V_WORLD,
+        b"QL-BLOCK-V3",
+        prev_hash_hex,
+        height,
+        minted_after,
+        vrf,
+        root,
+        entity_root,
+        entity_count,
+    )
+}
+
+/// v3 的块哈希：同一份预镜像、另一个域 `QL-BLOCK-V4`（排放节奏换了规则，域必须换）。
+pub fn block_hash_of_craft(
+    prev_hash_hex: &str,
+    height: u64,
+    minted_after: u64,
+    vrf: &[u8],
+    root: &[u8; 32],
+    entity_root: &[u8; 32],
+    entity_count: u64,
+) -> [u8; 32] {
+    hash_world_bound(
+        BLOCK_V_CRAFT,
+        b"QL-BLOCK-V4",
+        prev_hash_hex,
+        height,
+        minted_after,
+        vrf,
+        root,
+        entity_root,
+        entity_count,
+    )
+}
+
+/// v4 的块哈希：在 v3 的预镜像上再加入 `ts_unix` 与 `miner`，域 `QL-BLOCK-V5`。
+///
+/// 为什么必须绑：块哈希原先只覆盖 prev/height/minted/vrf/tx_root/世界承诺，
+/// 无矿签的块可以改 `miner` 而不改哈希——手续费（v0 还有整笔奖励）就能被偷。
+/// 时间戳同理：它是块的一部分，不能留在哈希之外任人改写。
+pub fn block_hash_of_miner_bound(
+    prev_hash_hex: &str,
+    height: u64,
+    ts_unix: u64,
+    minted_after: u64,
+    vrf: &[u8],
+    root: &[u8; 32],
+    entity_root: &[u8; 32],
+    entity_count: u64,
+    miner: &str,
+) -> [u8; 32] {
+    let mut block_in: Vec<u8> = Vec::with_capacity(189 + miner.len());
+    block_in.push(BLOCK_V_MINER);
     block_in.extend_from_slice(prev_hash_hex.as_bytes());
     block_in.extend_from_slice(&height.to_be_bytes());
+    block_in.extend_from_slice(&ts_unix.to_be_bytes());
     block_in.extend_from_slice(&minted_after.to_be_bytes());
     block_in.extend_from_slice(vrf);
     block_in.extend_from_slice(root);
     block_in.extend_from_slice(entity_root);
     block_in.extend_from_slice(&entity_count.to_be_bytes());
-    let out = crypto::shake256(b"QL-BLOCK-V3", &block_in, 32);
+    block_in.extend_from_slice(miner.as_bytes());
+    let out = crypto::shake256(b"QL-BLOCK-V5", &block_in, 32);
     let mut h = [0u8; 32];
     h.copy_from_slice(&out);
     h
@@ -430,7 +550,7 @@ pub fn block_hash_of_header(
     vrf: &[u8],
     root: &[u8; 32],
 ) -> Option<[u8; 32]> {
-    if bh.version < BLOCK_V {
+    if bh.version < BLOCK_V_WORLD {
         return Some(block_hash_of_ver(
             bh.version,
             &bh.prev_hash_hex,
@@ -440,7 +560,7 @@ pub fn block_hash_of_header(
             root,
         ));
     }
-    if bh.version != BLOCK_V {
+    if !(BLOCK_V_WORLD..=BLOCK_V).contains(&bh.version) {
         return None;
     }
     let raw = hex::decode(&bh.entity_root_hex).ok()?;
@@ -449,15 +569,38 @@ pub fn block_hash_of_header(
     }
     let mut er = [0u8; 32];
     er.copy_from_slice(&raw);
-    Some(block_hash_of_world(
-        &bh.prev_hash_hex,
-        bh.height,
-        bh.minted_after,
-        vrf,
-        root,
-        &er,
-        bh.entity_count,
-    ))
+    Some(match bh.version {
+        BLOCK_V_WORLD => block_hash_of_world(
+            &bh.prev_hash_hex,
+            bh.height,
+            bh.minted_after,
+            vrf,
+            root,
+            &er,
+            bh.entity_count,
+        ),
+        BLOCK_V_CRAFT => block_hash_of_craft(
+            &bh.prev_hash_hex,
+            bh.height,
+            bh.minted_after,
+            vrf,
+            root,
+            &er,
+            bh.entity_count,
+        ),
+        BLOCK_V_MINER => block_hash_of_miner_bound(
+            &bh.prev_hash_hex,
+            bh.height,
+            bh.ts_unix,
+            bh.minted_after,
+            vrf,
+            root,
+            &er,
+            bh.entity_count,
+            &bh.miner,
+        ),
+        _ => return None,
+    })
 }
 
 /// 矿签目标：世界坐标本身（`QLOR` ‖ x ‖ y ‖ layer）。没有私钥，也没人需要私钥。
@@ -510,6 +653,75 @@ pub fn claim_reward(h: u64, minted_before: u64) -> u64 {
         .min(HARD_CAP.saturating_sub(minted_before))
 }
 
+/// v3 的发行量：只结算本次窗口（最多一个当前档位）的排放，按硬顶截断。
+///
+/// 为什么这样不会打乱挖币机制：相邻两笔发行覆盖的块区间互不重叠，每笔只拿自己那
+/// 一个档位的量，空档不补发，所以 Σ 发行 ≤ Σ `reward_at(h)`——同一条减半曲线，
+/// 同一个 210M 硬顶。节奏阶梯只能决定"多久结算一次"，决定不了"总共发多少"。
+pub fn claim_reward_delta(h: u64, minted_before: u64, delta: u64) -> u64 {
+    reward_at(h)
+        .saturating_mul(delta)
+        .min(HARD_CAP.saturating_sub(minted_before))
+}
+
+/// v3 的节奏阶梯：这个地址在世界里已经落下几格矿，下一次结算就来得多快。
+/// 0 格 = 50 块（与 v1/v2 完全同口径），每多一格降一档，最快 10 块。
+///
+/// 反脚本的关键在**按地址计**：脚本可以开一万个钥匙，但每把新钥匙都从最慢那一档
+/// 开始——分身买不到速度。速度只有同一个身份长期回到同一张世界才换得到，
+/// 而每一次结算都必须真的在世界里落下一格可复算的矿（`is_ore` + 贴地 + 一格一主）。
+pub fn craft_floor(prior_claims: u64) -> u64 {
+    let idx = (prior_claims as usize).min(crate::world::MINE_FLOORS.len() - 1);
+    crate::world::MINE_FLOORS[idx]
+}
+
+/// 这一笔矿签覆盖的窗口：返回 (当前档位, 本次实际结算的块数)；间隔未到 → `None`。
+///
+/// v1/v2 固定 50 块（历史口径，只为重放）；v3+ 的档位由**这个地址自己**落下过
+/// 几格矿决定（50→10）。
+///
+/// **空块不补发**：每笔最多结清一个当前档位的窗口。没有矿签的块，其发行额度
+/// 当场作废，不会累积给下一个矿工——否则「等得越久、一笔越大」，发行就不再是
+/// 挖矿的回报，而是计时器的欠条。首笔同样只结真实存在的块（`min(height, 档位)`），
+/// 绝不预支尚未发生的窗口；否则首笔会与下一笔重复覆盖同一段块高。
+fn claim_window(ver: u8, height: u64, last_claim: u64, prior_claims: u64) -> Option<(u64, u64)> {
+    let floor = if ver >= BLOCK_V_CRAFT {
+        craft_floor(prior_claims)
+    } else {
+        MINE_COOLDOWN_BLOCKS
+    };
+    if last_claim == 0 {
+        // 历史 v1/v2 首笔固定结清 50 块（那时还没有阶梯）；v3+ 只结真实存在的块。
+        let delta = if ver >= BLOCK_V_CRAFT {
+            height.min(floor)
+        } else {
+            floor
+        };
+        return Some((floor, delta));
+    }
+    if height < last_claim + floor {
+        return None;
+    }
+    // v3+ 一笔最多一个档位：超过档位的空档不补发。v1/v2 的 delta 只用于历史重放
+    // （`header_emission` 对 v1/v2 走固定 `claim_reward`，不读这个值）。
+    let delta = if ver >= BLOCK_V_CRAFT {
+        floor
+    } else {
+        height - last_claim
+    };
+    Some((floor, delta))
+}
+
+/// 当前账本的结算水位：v0 每块都发过，水位至少跟到链尖；
+/// v1+ 只认最后一张矿签。升级路径和冷启动都走这一处，避免两套口径。
+fn emission_watermark(l: &Ledger) -> u64 {
+    if l.last_block_version == BLOCK_V_LEGACY && l.height > 0 {
+        l.height.max(l.last_claim_height)
+    } else {
+        l.last_claim_height
+    }
+}
+
 pub struct SimChain {
     pub ledger: Arc<Mutex<Ledger>>,
     mempool: Arc<Mutex<Vec<PendingTx>>>,
@@ -529,7 +741,10 @@ pub struct BlockEvent {
     pub height: u64,
     pub block_hash_hex: String,
     pub vrf_hex: String,
+    /// 本块总奖励（发行 + 手续费），用于余额/日志展示
     pub reward: u64,
+    /// 本块真正新发行的币（不含手续费）：UI 只对 `minted > 0` 的块落"铸块砖"
+    pub minted: u64,
     pub balance: u64,
     pub total_minted: u64,
     pub ts_unix: u64,
@@ -597,15 +812,18 @@ impl SimChain {
         Arc::new(chain)
     }
 
-    /// 从 blocks.jsonl 重建两项"由链本身决定"的运行态：
-    /// 全部历史 VRF（地表种子）与上一笔挖矿发行的块高。
+    /// 从 blocks.jsonl 重建"由链本身决定"的运行态：
+    /// 全部历史 VRF（地表种子）、结算水位、每个地址的矿格数、链尖版本。
     ///
-    /// 两者都不进 ledger.json 的持久口径（VRF 会随链无限增长），启动时宁可多读
+    /// 这些都不进 ledger.json 的持久口径（VRF 会随链无限增长），启动时宁可多读
     /// 一遍块文件，也不让一份可能过期的副本变成第二真相。
     fn sync_chain_meta(&self) {
         let Ok(text) = std::fs::read_to_string(&self.blocks_path) else { return };
         let mut vrfs: Vec<String> = Vec::new();
         let mut last_claim = 0u64;
+        let mut last_v0 = 0u64;
+        let mut last_version = BLOCK_V_LEGACY;
+        let mut claims_by: BTreeMap<String, u64> = BTreeMap::new();
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -615,13 +833,26 @@ impl SimChain {
                 continue;
             }
             vrfs.push(bl.header.vrf_hex.clone());
-            if bl.header.txs.iter().any(|t| claim_cell_of_attestation(t).is_some()) {
+            last_version = bl.header.version;
+            if bl.header.version == BLOCK_V_LEGACY {
+                last_v0 = bl.header.height;
+            }
+            if let Some(t) = bl
+                .header
+                .txs
+                .iter()
+                .find(|t| claim_cell_of_attestation(t).is_some())
+            {
                 last_claim = last_claim.max(bl.header.height);
+                *claims_by.entry(t.from.clone()).or_default() += 1;
             }
         }
         let mut l = self.ledger.lock().unwrap();
         l.vrfs = vrfs;
-        l.last_claim_height = last_claim;
+        // v0 每块都发过：水位至少跟到最后一条 v0 块，避免升级后重复补发。
+        l.last_claim_height = last_claim.max(last_v0);
+        l.last_block_version = last_version;
+        l.claims_by = claims_by;
     }
 
     /// 保证 blocks.jsonl 第 0 行是创世块。
@@ -883,19 +1114,48 @@ impl SimChain {
         Ok((wire, digest))
     }
 
-    /// 上一笔挖矿发行所在块高（0 = 从未）
+    /// 上一次结算/发行水位所在块高（0 = 从未）
     pub fn last_claim_height(&self) -> u64 {
-        self.ledger.lock().unwrap().last_claim_height
+        emission_watermark(&self.ledger.lock().unwrap())
     }
 
-    /// 下一笔挖矿最早能结算的块高：从未发行就是下一个块；否则距离上次满 50 块。
-    pub fn next_claim_height(&self) -> u64 {
+    /// 下一笔挖矿最早能结算的块高：按**这把钥匙自己**的节奏阶梯（一格矿都没落过 = 50 块）。
+    pub fn next_claim_height(&self, miner: &str) -> u64 {
         let l = self.ledger.lock().unwrap();
-        if l.last_claim_height == 0 {
+        let floor = craft_floor(l.claims_by.get(miner).copied().unwrap_or(0));
+        let last = emission_watermark(&l);
+        if last == 0 {
             l.height + 1
         } else {
-            (l.last_claim_height + MINE_COOLDOWN_BLOCKS).max(l.height + 1)
+            (last + floor).max(l.height + 1)
         }
+    }
+
+    /// 这把钥匙的挖矿节奏：(已落下的矿格数, 当前的最小间隔)。
+    /// 只有这两个数能告诉用户"再落一格，结算就快到 X 块"——它买的是节奏，不是更多的币。
+    pub fn claim_pace(&self, miner: &str) -> (u64, u64) {
+        let l = self.ledger.lock().unwrap();
+        let prior = l.claims_by.get(miner).copied().unwrap_or(0);
+        (prior, craft_floor(prior))
+    }
+
+    /// 下一次发行的预览：(最早结算块高, 那一笔的量)。
+    /// 量按「最多一个当前档位」算——阶梯越低单笔越小、结算越勤，总速度因此一分不变；
+    /// 空档不补发，所以预览值就是到账值（除非硬顶先到）。
+    pub fn claim_preview(&self, miner: &str) -> (u64, u64) {
+        let l = self.ledger.lock().unwrap();
+        let prior = l.claims_by.get(miner).copied().unwrap_or(0);
+        let floor = craft_floor(prior);
+        let last = emission_watermark(&l);
+        let next_h = if last == 0 {
+            l.height + 1
+        } else {
+            (last + floor).max(l.height + 1)
+        };
+        let delta = claim_window(BLOCK_V, next_h, last, prior)
+            .map(|(_, d)| d)
+            .unwrap_or(floor);
+        (next_h, claim_reward_delta(next_h, l.total_minted, delta))
     }
 
     /// 出块（由 net 网络循环每 2s 调用）：池内逐笔真验签 → 状态转移 → 块哈希绑定交易 → 原子持久化。
@@ -922,10 +1182,21 @@ impl SimChain {
         vrf_in.extend_from_slice(prev_hash_before.as_bytes());
         let vrf = crypto::shake256(b"QL-VRF-v1", &vrf_in, 32);
 
-        // —— 先挑本机矿签：必须在冷却之外、且此刻（h−1 的地表）仍是矿 ——
+        // —— 先挑本机矿签：必须在这一档节奏之外、且此刻（h−1 的地表）仍是矿 ——
         let words = crate::world::terrain::seed_words(GENESIS_HASH_HEX, &ledger.vrfs);
-        let can_claim = ledger.last_claim_height == 0
-            || height_next >= ledger.last_claim_height + MINE_COOLDOWN_BLOCKS;
+        let prior_mine = ledger
+            .claims_by
+            .get(&core.address)
+            .copied()
+            .unwrap_or(0);
+        // 旧 v0 链每块都发过：水位必须跟到链尖，否则升级后的第一笔 v4
+        // 会把 v0 已经发过的 50 个块再补一遍（双重发行）。
+        let last_claim_before = emission_watermark(&ledger);
+        if last_claim_before != ledger.last_claim_height {
+            ledger.last_claim_height = last_claim_before;
+        }
+        let window = claim_window(BLOCK_V, height_next, last_claim_before, prior_mine);
+        let can_claim = window.is_some();
         let mut claim_tx: Option<PendingTx> = None;
         let mut taken: Vec<PendingTx> = Vec::with_capacity(TXS_PER_BLOCK);
         {
@@ -1003,12 +1274,15 @@ impl SimChain {
             ledger.records.drain(0..cut);
         }
 
-        // —— 排放：有矿签才发，且把 50 个块的量一次结清（减半 + 硬顶同一口径）——
+        // —— 排放：有矿签才发，且最多结清一个当前档位的窗口（减半 + 硬顶同一口径）——
+        // v3 的阶梯快，只是因为结算得更勤；每块平均发行量仍不超过 `reward_at(h)`。
+        // 没有矿签的块零发行，空档不补发（否则一笔就能把整段空档印出来）。
         let has_claim = included
             .iter()
             .any(|t| claim_cell_of_attestation(t).is_some());
+        let delta = window.map(|(_, d)| d).unwrap_or(0);
         let reward = if has_claim {
-            claim_reward(height_next, ledger.total_minted)
+            claim_reward_delta(height_next, ledger.total_minted, delta)
         } else {
             0
         };
@@ -1028,18 +1302,21 @@ impl SimChain {
                 entity_root.copy_from_slice(&b);
             }
         }
-        let block_hash = block_hash_of_world(
+        let block_hash = block_hash_of_miner_bound(
             &prev_hash_before,
             height_next,
+            ts,
             ledger.total_minted,
             &vrf,
             &root,
             &entity_root,
             entity_count,
+            &miner,
         );
 
         ledger.height = height_next;
         ledger.prev_hash_hex = hex::encode(&block_hash);
+        ledger.last_block_version = BLOCK_V;
         ledger.entity_count_committed = entity_count;
 
         // —— 原子持久化 + 追加可审计块头 ——
@@ -1070,6 +1347,7 @@ impl SimChain {
                 block_hash_hex: hex::encode(&block_hash[..16]),
                 vrf_hex: hex::encode(&vrf[..12]),
                 reward: reward + fee_pool,
+                minted: reward,
                 balance,
                 total_minted: self.total_minted(),
                 ts_unix: header.ts_unix,
@@ -1117,8 +1395,11 @@ impl SimChain {
             if from != miner {
                 return Err("矿签必须由出块者本人提交（奖励不能被代领）".into());
             }
-            Self::claim_allowed(l, height, x, y, layer)?;
+            let prior = l.claims_by.get(&from).copied().unwrap_or(0);
+            Self::claim_allowed(l, height, x, y, layer, version, prior)?;
             l.last_claim_height = height;
+            // 节奏阶梯的账就在这里记：一格矿 = 下一档更快的结算，只认这把钥匙自己落过的
+            *l.claims_by.entry(from.clone()).or_default() += 1;
         }
         // 余额为 0 的新钱包也能从矿签起步：entry 先建账，再扣（矿签 need = 0）
         {
@@ -1157,19 +1438,27 @@ impl SimChain {
         ))
     }
 
-    /// 矿签的额外三问：冷却到了吗、在 `h−1` 的矿脉里吗、落在贴地层吗
+    /// 矿签的额外四问：冷却到了吗（v3 起=这个地址挣来的节奏）、在 `h−1` 的矿脉里吗、
+    /// 落在贴地层吗、坐标是不是自己的（一格一主由实体账本重放判，这里不重复记账）
     fn claim_allowed(
         l: &Ledger,
         height: u64,
         x: u16,
         y: u16,
         layer: u16,
+        version: u8,
+        prior_claims: u64,
     ) -> Result<(), String> {
-        if l.last_claim_height != 0 && height < l.last_claim_height + MINE_COOLDOWN_BLOCKS {
+        let last = emission_watermark(l);
+        if claim_window(version, height, last, prior_claims).is_none() {
+            let floor = if version >= BLOCK_V_CRAFT {
+                craft_floor(prior_claims)
+            } else {
+                MINE_COOLDOWN_BLOCKS
+            };
+            let earliest = if last == 0 { floor } else { last + floor };
             return Err(format!(
-                "冷却未到：上次发行在块高 {}，本回合最早 {}",
-                l.last_claim_height,
-                l.last_claim_height + MINE_COOLDOWN_BLOCKS
+                "冷却未到：上次结算在块高 {last}，这一档节奏要求每 {floor} 块一次，本回合最早 {earliest}（已落矿格 {prior_claims} 格）"
             ));
         }
         let words = crate::world::terrain::seed_words(GENESIS_HASH_HEX, &l.vrfs);
@@ -1202,55 +1491,55 @@ impl SimChain {
     /// 这里只看块头凭据，不看矿格坐标——坐标是否真是矿必须拿原件重放（`apply_wire`），
     /// 块头里的 `TxAttestation` 只是声称。但"发不发、发多少、谁领"能在这里独立判死：
     /// - v0（历史块）：无条件按减半曲线发行，出现矿签即非法；
-    /// - v1：最多一张矿签，必须由出块者本人提交、金额/手续费为 0，且冷却已到；
-    ///   没有矿签 → 本块发行量为 0（币不靠计时器印）。
+    /// - v1/v2：最多一张矿签，必须由出块者本人提交、金额/手续费为 0，冷却固定 50 块，
+    ///   一次结清 50 个块的量；没有矿签 → 本块发行量为 0（币不靠计时器印）。
+    /// - v3+：同上，但节奏档由 `prior_claims`（该地址已经落下几格矿）决定，
+    ///   且每笔最多结算一个当前档位、空档不补发 → 每块平均发行量 ≤ `reward_at(h)`。
     fn header_emission(
         bh: &BlockHeader,
         minted_before: u64,
         last_claim_before: u64,
+        prior_claims: u64,
     ) -> Option<(u64, u64)> {
         // 未来版本无从解释排放口径，不猜（调用点的版本闸门之外也要自守住）
         if bh.version > BLOCK_V {
             return None;
         }
-        match bh.version {
-            BLOCK_V_LEGACY => {
-                if bh
-                    .txs
-                    .iter()
-                    .any(|t| claim_cell_of_attestation(t).is_some())
-                {
-                    return None;
-                }
-                Some((
-                    reward_at(bh.height).min(HARD_CAP.saturating_sub(minted_before)),
-                    last_claim_before,
-                ))
+        if bh.version == BLOCK_V_LEGACY {
+            if bh
+                .txs
+                .iter()
+                .any(|t| claim_cell_of_attestation(t).is_some())
+            {
+                return None;
             }
-            BLOCK_V_MINING.. => {
-                let claims: Vec<&TxAttestation> = bh
-                    .txs
-                    .iter()
-                    .filter(|t| claim_cell_of_attestation(t).is_some())
-                    .collect();
-                if claims.len() > 1 {
-                    return None; // 每块最多一张矿签
-                }
-                match claims.first() {
-                    Some(c) => {
-                        if c.from != bh.miner || c.amount != 0 || c.fee != 0 {
-                            return None;
-                        }
-                        if last_claim_before != 0
-                            && bh.height < last_claim_before + MINE_COOLDOWN_BLOCKS
-                        {
-                            return None;
-                        }
-                        Some((claim_reward(bh.height, minted_before), bh.height))
-                    }
-                    None => Some((0, last_claim_before)),
-                }
+            return Some((
+                reward_at(bh.height).min(HARD_CAP.saturating_sub(minted_before)),
+                last_claim_before,
+            ));
+        }
+        let claims: Vec<&TxAttestation> = bh
+            .txs
+            .iter()
+            .filter(|t| claim_cell_of_attestation(t).is_some())
+            .collect();
+        if claims.len() > 1 {
+            return None; // 每块最多一张矿签
+        }
+        let Some(c) = claims.first() else {
+            return Some((0, last_claim_before));
+        };
+        if c.from != bh.miner || c.amount != 0 || c.fee != 0 {
+            return None;
+        }
+        if bh.version >= BLOCK_V_CRAFT {
+            let (_, delta) = claim_window(bh.version, bh.height, last_claim_before, prior_claims)?;
+            Some((claim_reward_delta(bh.height, minted_before, delta), bh.height))
+        } else {
+            if last_claim_before != 0 && bh.height < last_claim_before + MINE_COOLDOWN_BLOCKS {
+                return None;
             }
+            Some((claim_reward(bh.height, minted_before), bh.height))
         }
     }
 
@@ -1260,8 +1549,12 @@ impl SimChain {
         let mut expect_prev = genesis_hash_hex();
         let mut minted_running: u64 = 0;
         let mut last_claim: u64 = 0;
-        // 最近一次「世界承诺」的条数（只在 v2 块之间比较；v0/v1 没承诺过世界）
+        // 版本只许升不许降：v4 链后面接 v0 = 绕过矿签免费发行，直接拒。
+        let mut prev_version = BLOCK_V_LEGACY;
+        // 最近一次「世界承诺」的条数（只在 v2+ 块之间比较；v0/v1 没承诺过世界）
         let mut prev_entity_count: u64 = 0;
+        // 每个地址已经落下的矿格数：v3 的节奏阶梯只读这个纯块头可复算的量
+        let mut claims_by: BTreeMap<String, u64> = BTreeMap::new();
         for bh in headers {
             // 创世行只做锚定：与源码常量逐字相等；它没有出块者，也没有排放
             if bh.height == 0 {
@@ -1277,15 +1570,20 @@ impl SimChain {
             if bh.version > BLOCK_V {
                 return false; // 未来版本无从解释，不猜
             }
+            // 版本单调 + 激活高度：旧版本可以在历史区间重放，但不能在 v4 之后回退；
+            // 超过激活高度还拿 v0/v1/v2/v3 来出块，同样拒。
+            if bh.version < prev_version || bh.version < version_floor_at(bh.height) {
+                return false;
+            }
             // v2 起必须真的承诺一份世界：64 个 hex，且条数不减（append-only 世界里
             // 诚实出块人只会知道更多记录；倒退 = 想把世界清空）
-            let world_ok = bh.version < BLOCK_V
+            let world_ok = bh.version < BLOCK_V_WORLD
                 || (bh.entity_root_hex.len() == 64
                     && bh.entity_count >= prev_entity_count);
             if !world_ok {
                 return false;
             }
-            if bh.version >= BLOCK_V {
+            if bh.version >= BLOCK_V_WORLD {
                 prev_entity_count = bh.entity_count;
             }
             if bh.prev_hash_hex != expect_prev {
@@ -1310,7 +1608,9 @@ impl SimChain {
             if hex::encode(expect) != bh.block_hash_hex {
                 return false;
             }
-            let Some((reward, next_claim)) = Self::header_emission(bh, minted_running, last_claim)
+            let prior = claims_by.get(&bh.miner).copied().unwrap_or(0);
+            let Some((reward, next_claim)) =
+                Self::header_emission(bh, minted_running, last_claim, prior)
             else {
                 return false;
             };
@@ -1321,8 +1621,22 @@ impl SimChain {
             if bh.minted_after != minted_running + reward {
                 return false;
             }
+            if bh
+                .txs
+                .iter()
+                .any(|t| claim_cell_of_attestation(t).is_some())
+            {
+                *claims_by.entry(bh.miner.clone()).or_default() += 1;
+            }
             minted_running = bh.minted_after;
-            last_claim = next_claim;
+            // v0 每块都发过，水位跟着块高走；这样 v0→v4 升级后的第一笔 v4
+            // 只结算升级之后的新块，不会把 v0 已发过的 50 块再补一遍。
+            last_claim = if bh.version == BLOCK_V_LEGACY {
+                bh.height
+            } else {
+                next_claim
+            };
+            prev_version = bh.version;
             expect_prev = bh.block_hash_hex.clone();
         }
         true
@@ -1344,14 +1658,24 @@ impl SimChain {
             }
             l.height = 0;
             l.prev_hash_hex = h.block_hash_hex.clone();
+            l.last_block_version = h.version;
             return Ok(());
         }
         if h.version > BLOCK_V {
             return Err(format!("块 #{} 版本号未知 → 快照拒收", h.height));
         }
-        if h.version >= BLOCK_V {
+        if h.version < l.last_block_version || h.version < version_floor_at(h.height) {
+            return Err(format!(
+                "块 #{} 版本回退/过旧（块 v{}，前一版本 v{}，此高度最低 v{}）→ 快照拒收",
+                h.height,
+                h.version,
+                l.last_block_version,
+                version_floor_at(h.height)
+            ));
+        }
+        if h.version >= BLOCK_V_WORLD {
             if h.entity_root_hex.len() != 64 {
-                return Err(format!("块 #{} 声称 v2 却没有世界承诺 → 快照拒收", h.height));
+                return Err(format!("块 #{} 声称 v2+ 却没有世界承诺 → 快照拒收", h.height));
             }
             if h.entity_count < l.entity_count_committed {
                 return Err(format!(
@@ -1371,6 +1695,8 @@ impl SimChain {
         }
 
         // 逐笔原件走与本地出块完全相同的状态转移（矿签的坐标/冷却也在这里判）
+        let last_claim_before = l.last_claim_height;
+        let prior_before = l.claims_by.get(&h.miner).copied().unwrap_or(0);
         let mut rebuilt: Vec<TxAttestation> = Vec::with_capacity(bl.wires.len());
         let mut fee_sum: u64 = 0;
         for w in &bl.wires {
@@ -1389,22 +1715,32 @@ impl SimChain {
             let cut = l.records.len() - 500;
             l.records.drain(0..cut);
         }
-        // 排放口径与出块时一致：v0 无条件发行；v1 只有收下矿签才发行
+        // 排放口径与出块时一致：v0 无条件发行；v1/v2 有矿签就结清 50 个块的量；
+        // v3+ 有矿签最多结清一个当前档位（空档不补发，总量一分不多）
         let reward = match h.version {
             BLOCK_V_LEGACY => reward_at(h.height).min(HARD_CAP.saturating_sub(l.total_minted)),
             _ => {
-                if rebuilt.iter().any(|t| claim_cell_of_attestation(t).is_some()) {
-                    claim_reward(h.height, l.total_minted)
-                } else {
+                if !rebuilt.iter().any(|t| claim_cell_of_attestation(t).is_some()) {
                     0
+                } else if h.version >= BLOCK_V_CRAFT {
+                    let (_, delta) = claim_window(h.version, h.height, last_claim_before, prior_before)
+                        .ok_or_else(|| format!("块 #{} 的矿签间隔不合法 → 快照拒收", h.height))?;
+                    claim_reward_delta(h.height, l.total_minted, delta)
+                } else {
+                    claim_reward(h.height, l.total_minted)
                 }
             }
         };
         l.total_minted += reward;
         *l.balances.entry(h.miner.clone()).or_insert(0) += reward + fee_sum;
         l.vrfs.push(h.vrf_hex.clone());
+        // v0 每块都发过：水位跟到块高；v1+ 由 apply_wire 在矿签结算时推进。
+        if h.version == BLOCK_V_LEGACY {
+            l.last_claim_height = h.height;
+        }
         l.height = h.height;
         l.prev_hash_hex = h.block_hash_hex.clone();
+        l.last_block_version = h.version;
         Ok(())
     }
 
@@ -1516,9 +1852,19 @@ impl SimChain {
         if header.version > BLOCK_V {
             return Err("块版本未知 → 整块拒绝".into());
         }
-        if header.version >= BLOCK_V {
+        if header.version < ledger.last_block_version
+            || header.version < version_floor_at(height_next)
+        {
+            return Err(format!(
+                "块版本回退/过旧（来块 v{}，前一版本 v{}，此高度最低 v{}）→ 整块拒绝",
+                header.version,
+                ledger.last_block_version,
+                version_floor_at(height_next)
+            ));
+        }
+        if header.version >= BLOCK_V_WORLD {
             if header.entity_root_hex.len() != 64 {
-                return Err("v2 块缺世界承诺 → 整块拒绝".into());
+                return Err("v2+ 块缺世界承诺 → 整块拒绝".into());
             }
             if header.entity_count < ledger.entity_count_committed {
                 return Err(format!(
@@ -1530,6 +1876,12 @@ impl SimChain {
 
         // —— staging 复本上逐笔重验+重放（任何一笔不过 → 整块拒绝）——
         // 与本地出块共用 `apply_wire`：矿签的坐标、冷却、出块者身份都在同一处判。
+        let last_claim_before = emission_watermark(&ledger);
+        let prior_before = ledger
+            .claims_by
+            .get(&header.miner)
+            .copied()
+            .unwrap_or(0);
         let mut staged = ledger.clone();
         let mut included: Vec<TxAttestation> = Vec::with_capacity(wires.len());
         let mut digests: Vec<[u8; 32]> = Vec::with_capacity(wires.len());
@@ -1580,7 +1932,19 @@ impl SimChain {
                     if c.from != header.miner {
                         return Err("矿签不是出块者本人 → 整块拒绝".into());
                     }
-                    claim_reward(height_next, staged.total_minted)
+                    if header.version >= BLOCK_V_CRAFT {
+                        // v3+：一笔最多结清一个当前档位，空档不补发；间隔不合法 = 节奏没挣到 → 整块拒绝
+                        let (_, delta) = claim_window(
+                            header.version,
+                            height_next,
+                            last_claim_before,
+                            prior_before,
+                        )
+                        .ok_or("矿签间隔未到这一档节奏 → 整块拒绝")?;
+                        claim_reward_delta(height_next, staged.total_minted, delta)
+                    } else {
+                        claim_reward(height_next, staged.total_minted)
+                    }
                 } else {
                     0
                 }
@@ -1619,7 +1983,12 @@ impl SimChain {
         // —— 一次成型入账 ——
         staged.height = height_next;
         staged.prev_hash_hex = header.block_hash_hex.clone();
-        if header.version >= BLOCK_V {
+        staged.last_block_version = header.version;
+        if header.version == BLOCK_V_LEGACY {
+            // v0 每块都发过：水位跟到块高，防止升级后的第一笔 v4 重复补发。
+            staged.last_claim_height = height_next;
+        }
+        if header.version >= BLOCK_V_WORLD {
             staged.entity_count_committed = header.entity_count;
         }
         *ledger = staged;
@@ -1641,6 +2010,7 @@ impl SimChain {
             block_hash_hex: header.block_hash_hex[..16].to_string(),
             vrf_hex: header.vrf_hex[..12].to_string(),
             reward: header.reward_total,
+            minted: reward,
             balance: 0, // 由 net 层以本机钱包补算
             total_minted: header.minted_after,
             ts_unix: header.ts_unix,
@@ -1690,8 +2060,10 @@ impl SimChain {
             nonces: HashMap::new(),
             records: vec![],
             last_claim_height: 0,
+            last_block_version: BLOCK_V_LEGACY,
             entity_count_committed: 0,
             vrfs: vec![],
+            claims_by: BTreeMap::new(),
         };
         for bl in &block_lines {
             Self::apply_block_line(&mut staged, bl)?;
@@ -2060,23 +2432,30 @@ mod tests {
         }
     }
 
-    /// 在本节点当前视图里找一格此刻可挖的矿（测试专用；真实客户端走 ore::scan）
-    fn find_ore(chain: &SimChain) -> (u16, u16, u16) {
+    /// 在本节点当前视图里找一格此刻可挖的矿（测试专用；真实客户端走 ore::scan）。
+    ///
+    /// 注意：矿脉是概率性的——高块高时配额收窄，某一回合**真的可能一格都没有**。
+    /// 这不是错误，而是协议本身的性质：这一回合挖不到，就等下一个块的 VRF 重画地表。
+    fn try_find_ore(chain: &SimChain) -> Option<(u16, u16, u16)> {
         let vrfs = chain.ledger.lock().unwrap().vrfs.clone();
         let words = crate::world::terrain::seed_words(GENESIS_HASH_HEX, &vrfs);
         let h = chain.height();
         for y in 0..crate::world::WORLD_H as u32 {
             for x in 0..crate::world::WORLD_W as u32 {
                 if crate::world::ore::is_ore(x, y, &words, h) {
-                    return (
+                    return Some((
                         x as u16,
                         y as u16,
                         crate::world::ore::ore_layer(x, y, &words),
-                    );
+                    ));
                 }
             }
         }
-        panic!("创世纪元格 + 配额下竟无矿可挖");
+        None
+    }
+
+    fn find_ore(chain: &SimChain) -> (u16, u16, u16) {
+        try_find_ore(chain).expect("创世纪元格 + 配额下竟无矿可挖")
     }
 
     /// 出第一块：提交一张真矿签，让出块者拿到发行（v1 只有收下矿签才发币）
@@ -2086,6 +2465,376 @@ mod tests {
             .submit_claim(miner, x, y, layer)
             .expect("矿签应入池");
         chain.mine_block(miner).expect("第 1 块应出块");
+    }
+
+    // ------------------------------------------------ §9.16 v3：节奏换收益，曲线不动
+
+    /// 「一等到就落签」的最快手速出块，返回每次结算的 (块高, 该笔新增发行)。
+    ///
+    /// 某一回合地表恰好无矿时只能先出空块——这是矿脉概率性的正常结果，
+    /// 不是节奏失效；下一块 VRF 换了地表再试。
+    fn strike_fast(chain: &SimChain, miner: &crate::keystore::WalletCore, target: u64) -> Vec<(u64, u64)> {
+        let mut strikes = Vec::new();
+        let mut minted_before = chain.total_minted();
+        while chain.height() < target {
+            if chain.height() + 1 >= chain.next_claim_height(&miner.address) {
+                if let Some((x, y, layer)) = try_find_ore(chain) {
+                    chain.submit_claim(miner, x, y, layer).expect("节奏到了，矿签应入池");
+                }
+            }
+            let (_, head, _) = chain.mine_block(miner).expect("应出块");
+            if head.minted_after > minted_before {
+                strikes.push((head.height, head.minted_after - minted_before));
+                minted_before = head.minted_after;
+            }
+        }
+        strikes
+    }
+
+    /// 减半曲线到块高 `h` 为止的**应发行总量**——发行永远不许越过它
+    fn curve_to(h: u64) -> u64 {
+        (1..=h).map(reward_at).fold(0u64, |acc, r| acc.saturating_add(r))
+    }
+
+    /// 阶梯与结算窗口的口径只有一句话：**一笔最多结清一个当前档位，空档不补发**。
+    /// 首笔也只结真实存在的块（`min(height, 档位)`），绝不预支尚未发生的窗口。
+    #[test]
+    fn v3_window_pays_the_covered_interval_and_nothing_more() {
+        assert_eq!(craft_floor(0), crate::world::MINE_FLOORS[0], "零矿格 = 最慢一档");
+        assert_eq!(craft_floor(1), 40);
+        assert_eq!(craft_floor(7), 10);
+        assert_eq!(craft_floor(9_999), 10, "阶梯到底就是底，永不进 10 以下");
+
+        // 首笔（v3+）：只结真实存在的块，不预支未来窗口
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 1, 0, 0), Some((50, 1)));
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 10, 0, 0), Some((50, 10)));
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 50, 0, 0), Some((50, 50)));
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 1_000, 0, 0), Some((50, 50)));
+        // 首笔（v1/v2 历史口径）：当年就是固定结一个整档，只为重放
+        assert_eq!(claim_window(BLOCK_V_WORLD, 1, 0, 0), Some((50, 50)));
+        // 第二笔起：档由**这个地址自己**落过几格决定，早一块都不给
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 40, 1, 0), None, "50 档还差一块");
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 41, 1, 0), None);
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 51, 1, 0), Some((50, 50)));
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 41, 1, 1), Some((40, 40)));
+        // 空档不补发：隔了 20 块也只结当前 10 档，多出来的 10 块作废
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 21, 1, 7), Some((10, 10)));
+        assert_eq!(claim_window(BLOCK_V_CRAFT, 91, 1, 7), Some((10, 10)));
+        // 老版本没有阶梯：v2 及以前永远 50 块一刀
+        assert_eq!(claim_window(BLOCK_V_WORLD, 41, 1, 7), None);
+        assert_eq!(claim_window(BLOCK_V_WORLD, 51, 1, 7), Some((50, 50)));
+        // 干等不会把钱等到更大：Δ 由窗口决定，封顶仍在硬顶
+        assert_eq!(claim_reward_delta(1, 0, 3), reward_at(1) * 3);
+        assert_eq!(claim_reward_delta(1, HARD_CAP, 3), 0, "挖完就是挖完了");
+    }
+
+    /// 回归：空块（没有矿签的块）永远不补发。隔得再久，一笔也只结一个档位。
+    #[test]
+    fn empty_blocks_are_never_backfilled() {
+        // 首笔在高度 1 只拿 1 块，而不是把 50 块预支掉
+        let (_, first) = claim_window(BLOCK_V_CRAFT, 1, 0, 0).unwrap();
+        assert_eq!(first, 1);
+
+        // 中间空 200 块后落一笔：仍是当前档位，不是 200
+        let (floor, delta) = claim_window(BLOCK_V_CRAFT, 201, 1, 0).unwrap();
+        assert_eq!((floor, delta), (50, 50));
+        let (floor, delta) = claim_window(BLOCK_V_CRAFT, 201, 1, 7).unwrap();
+        assert_eq!((floor, delta), (10, 10), "档位再快也不许把空档一次性印出来");
+
+        // 空档累计起来也追不上减半曲线
+        let mut minted = 0u64;
+        let mut last = 0u64;
+        let mut prior = 0u64;
+        for h in [1u64, 7, 40, 400, 401, 900] {
+            if let Some((_, d)) = claim_window(BLOCK_V, h, last, prior) {
+                minted = minted.saturating_add(claim_reward_delta(h, minted, d));
+                last = h;
+                prior += 1;
+            }
+        }
+        assert!(
+            minted <= curve_to(900),
+            "空档补发让发行 {} 越过了曲线 {}",
+            minted,
+            curve_to(900)
+        );
+    }
+
+    /// 造一个不承诺世界的 v4 空块（测试版本闸门/水位用）
+    fn v4_header(prev: &str, height: u64, minted: u64, ts: u64, miner: &str) -> BlockHeader {
+        let vrf = [9u8; 32];
+        let root = tx_root_of(&[]);
+        let er = [0u8; 32];
+        let hash = block_hash_of_miner_bound(
+            prev,
+            height,
+            ts,
+            minted,
+            &vrf,
+            &root,
+            &er,
+            0,
+            miner,
+        );
+        BlockHeader {
+            version: BLOCK_V_MINER,
+            height,
+            ts_unix: ts,
+            prev_hash_hex: prev.to_string(),
+            block_hash_hex: hex::encode(hash),
+            vrf_hex: hex::encode(vrf),
+            minted_after: minted,
+            reward_total: 0,
+            miner: miner.to_string(),
+            entity_root_hex: hex::encode(er),
+            entity_count: 0,
+            txs: vec![],
+        }
+    }
+
+    /// v4 之后不许回退到 v0；激活高度之后旧版本一律拒。
+    #[test]
+    fn version_cannot_downgrade_after_v4() {
+        let g = genesis_header();
+        let v4 = v4_header(
+            &g.block_hash_hex,
+            1,
+            0,
+            GENESIS_TS_UNIX + 2,
+            "ql1v4miner",
+        );
+        assert!(SimChain::verify_header_slice(&[g.clone(), v4.clone()]));
+
+        let v0 = BlockHeader {
+            version: BLOCK_V_LEGACY,
+            height: 2,
+            ts_unix: GENESIS_TS_UNIX + 4,
+            prev_hash_hex: v4.block_hash_hex.clone(),
+            block_hash_hex: String::new(),
+            vrf_hex: hex::encode([5u8; 32]),
+            minted_after: reward_at(2),
+            reward_total: reward_at(2),
+            miner: "ql1v0miner".to_string(),
+            entity_root_hex: String::new(),
+            entity_count: 0,
+            txs: vec![],
+        };
+        let mut v0 = v0;
+        v0.block_hash_hex = hex::encode(block_hash_of(
+            &v0.prev_hash_hex,
+            v0.height,
+            v0.minted_after,
+            &hex::decode(&v0.vrf_hex).unwrap(),
+            &tx_root_of(&[]),
+        ));
+        assert!(
+            !SimChain::verify_header_slice(&[g, v4, v0]),
+            "v4 链后面接 v0 = 绕过矿签免费发行，必须拒绝"
+        );
+
+        assert_eq!(version_floor_at(BLOCK_V_V4_ACTIVATION), BLOCK_V_LEGACY);
+        assert_eq!(version_floor_at(BLOCK_V_V4_ACTIVATION + 1), BLOCK_V);
+    }
+
+    /// v0→v4 升级：水位跟到最后一条 v0，第一笔 v4 只结算升级后的新块。
+    #[test]
+    fn v0_to_v4_upgrade_sets_the_emission_watermark() {
+        let (dir, chain) = temp_chain("v0-upgrade");
+        let g = genesis_header();
+        let v0 = BlockHeader {
+            version: BLOCK_V_LEGACY,
+            height: 1,
+            ts_unix: GENESIS_TS_UNIX + 2,
+            prev_hash_hex: g.block_hash_hex.clone(),
+            block_hash_hex: String::new(),
+            vrf_hex: hex::encode([5u8; 32]),
+            minted_after: reward_at(1),
+            reward_total: reward_at(1),
+            miner: "ql1v0miner".to_string(),
+            entity_root_hex: String::new(),
+            entity_count: 0,
+            txs: vec![],
+        };
+        let mut v0 = v0;
+        v0.block_hash_hex = hex::encode(block_hash_of(
+            &v0.prev_hash_hex,
+            v0.height,
+            v0.minted_after,
+            &hex::decode(&v0.vrf_hex).unwrap(),
+            &tx_root_of(&[]),
+        ));
+        let v4 = v4_header(
+            &v0.block_hash_hex,
+            2,
+            reward_at(1),
+            GENESIS_TS_UNIX + 4,
+            "ql1v4miner",
+        );
+        let snap = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&g).unwrap(),
+            serde_json::to_string(&v0).unwrap(),
+            serde_json::to_string(&v4).unwrap()
+        );
+        chain.install_snapshot(&snap).expect("v0→v4 升级链应通过");
+        assert_eq!(chain.height(), 2);
+        assert_eq!(chain.last_claim_height(), 1, "水位必须停在最后一条 v0");
+        assert_eq!(
+            chain.next_claim_height("ql1v4miner"),
+            51,
+            "v0 已发过块 1，v4 第一笔要从 51 起算，不能把 2..51 再补一遍"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 性质测试：最快手速连挖，发行总量也追不上减半曲线——
+    /// 阶梯把「多久能领」从 50 块压到 10 块，一分钱额外发行都没造出来。
+    #[test]
+    fn max_cadence_never_outruns_the_emission_curve() {
+        let (dir, chain) = temp_chain("v3-curve");
+        let miner = test_core(41);
+        let target = 260;
+        let strikes = strike_fast(&chain, &miner, target);
+        assert!(strikes.len() > 10, "阶梯越爬越快，260 块里该落十几格：{}", strikes.len());
+        assert_eq!(chain.height(), target);
+
+        // 逐笔核账：每笔最多结清一个当前档位，空档不补发
+        let mut prior = 0u64;
+        let mut last_claim = 0u64;
+        for (h, gain) in &strikes {
+            let (floor, delta) = claim_window(BLOCK_V, *h, last_claim, prior).expect("结算窗口存在");
+            assert_eq!(*gain, reward_at(*h) * delta, "块高 {h} 多印了：不是按窗口结算");
+            assert_eq!(
+                delta,
+                if last_claim == 0 { (*h).min(floor) } else { floor },
+                "块高 {h} 结了超过一个档位的量"
+            );
+            prior += 1;
+            last_claim = *h;
+        }
+
+        // 总量闸门：每一笔都落在减半曲线的积分之内，一分不多、不需要任何豁免。
+        let covered = strikes.last().unwrap().0;
+        let settled: u64 = strikes.iter().map(|(_, g)| g).sum();
+        assert!(
+            settled <= curve_to(covered),
+            "已结算 {settled}，而 {covered} 块的曲线只给了 {}",
+            curve_to(covered)
+        );
+        assert!(
+            chain.total_minted() <= curve_to(target),
+            "发行 {} 越过了曲线总量 {}",
+            chain.total_minted(),
+            curve_to(target)
+        );
+        // 节奏确实变快了：同样的块数里，落下的矿格比 50 块一刀时多
+        assert!(
+            strikes.len() as u64 > (target / MINE_COOLDOWN_BLOCKS),
+            "阶梯没起作用：{} 次结算 / {} 块",
+            strikes.len(),
+            target
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 换钥匙 = 从零开始爬阶梯：新钥匙的第一笔只能按最慢那一档结，且一笔最多一个档位。
+    /// 空档不补发之后，"同一个人隔 50 块再落" 反而会把自己 40 档之外的 10 块作废——
+    /// 开小号既买不到更快的档位，也换不到越过曲线的发行。
+    #[test]
+    fn a_second_key_adds_nothing_a_gap_was_already_worth() {
+        let (dir_a, solo) = temp_chain("v3-solo");
+        let (dir_b, alt) = temp_chain("v3-syb");
+        let key_a = test_core(42);
+        let key_b = test_core(43);
+
+        for (chain, striker) in [(&solo, &key_a), (&alt, &key_b)] {
+            strike_fast(chain, &key_a, 1);
+            while chain.height() < 51 {
+                let next = chain.height() + 1;
+                if next == 51 {
+                    // 矿签必须由出块者本人提交：谁落这一格，谁就得出这一块的块
+                    let (x, y, layer) = find_ore(chain);
+                    chain
+                        .submit_claim(striker, x, y, layer)
+                        .expect("第 51 块该轮到这一格矿");
+                }
+                let producer = if next == 51 { striker } else { &key_a };
+                chain.mine_block(producer).expect("出块");
+            }
+        }
+
+        assert_eq!(solo.height(), 51);
+        assert_eq!(alt.height(), 51);
+        // 曲线是硬上界：无论几把钥匙，发行都不许越过它
+        assert!(
+            alt.total_minted() <= curve_to(51),
+            "两把钥匙也在曲线之内：{}",
+            alt.total_minted()
+        );
+        assert!(
+            solo.total_minted() <= curve_to(51),
+            "单钥匙也在曲线之内：{}",
+            solo.total_minted()
+        );
+        // 新钥匙的第一笔在块高 51 落下，只结 min(51, 50) = 50 块——正好是那段空档本身，
+        // 一分不多。原钥匙为了等同一高度，把自己 40 档之外的 10 块作废了（空档不补发的
+        // 代价），所以这里 solo 反而更少；这不是小号多拿，两把钥匙都仍在曲线之内。
+        assert_eq!(
+            alt.total_minted(),
+            curve_to(51),
+            "新钥匙只结清空档本身，不多一分"
+        );
+        assert!(
+            solo.total_minted() < alt.total_minted(),
+            "超出自有档位的等待会被作废：solo={} alt={}",
+            solo.total_minted(),
+            alt.total_minted()
+        );
+        // 全新钥匙的第一步只能是最慢那一档：阶梯不看钥匙多，只看这把钥匙落下过几格
+        assert_eq!(alt.claim_pace(&key_b.address).0, 1);
+        assert_eq!(alt.claim_pace(&key_b.address).1, 40, "落过 1 格 = 40 块档");
+        assert_eq!(solo.claim_pace(&key_a.address).0, 2, "同一个人已落 2 格");
+        // 真正的反脚本性质：新钥匙的档位永远不比老钥匙快，开小号买不到节奏
+        assert!(
+            alt.claim_pace(&key_b.address).1 >= solo.claim_pace(&key_a.address).1,
+            "开小号换到了更快的档位：alt={} solo={}",
+            alt.claim_pace(&key_b.address).1,
+            solo.claim_pace(&key_a.address).1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// 快照重建走同一套账：v3 块头序列被独立节点逐块复算通过，
+    /// 且节奏阶梯从 `blocks.jsonl` 当场重建（`claims_by` 不落盘，避免第二本账）
+    #[test]
+    fn v3_chain_rebuilds_its_ladder_from_block_headers_alone() {
+        let (dir_src, src) = temp_chain("v3-snap-src");
+        let (dir_dst, dst) = temp_chain("v3-snap-dst");
+        let miner = test_core(44);
+        let strikes = strike_fast(&src, &miner, 130);
+        assert!(strikes.len() >= 3);
+
+        let snap = std::fs::read_to_string(dir_src.join("blocks.jsonl")).unwrap();
+        let tip = dst.install_snapshot(&snap).expect("v3 自证快照应被接受");
+        assert_eq!(tip, 130);
+        assert_eq!(dst.total_minted(), src.total_minted());
+        assert_eq!(dst.height(), src.height());
+        // 阶梯跟着账本一起过来：对端算出的下一档 = 源头算出的下一档
+        assert_eq!(dst.claim_pace(&miner.address), src.claim_pace(&miner.address));
+        assert_eq!(
+            dst.next_claim_height(&miner.address),
+            src.next_claim_height(&miner.address)
+        );
+        let (prior, floor) = src.claim_pace(&miner.address);
+        assert_eq!(prior, strikes.len() as u64, "已落矿格数只从块头复算");
+        assert!(floor < crate::world::MINE_FLOORS[0], "落过几格就该比起步档快");
+
+        let _ = std::fs::remove_dir_all(&dir_src);
+        let _ = std::fs::remove_dir_all(&dir_dst);
     }
 
     /// 自证快照能整链重建：真出两块（含一笔转账），对端装进去后高度/余额逐字一致

@@ -81,6 +81,8 @@ fn free_world_record_lands_without_spending_a_cent() {
         layer: rec.layer,
         claim_height: chain.height() + 1,
         reward: 1,
+        pace_floor: simchain::craft_floor(0),
+        pace_next_floor: simchain::craft_floor(1),
     };
     let v = serde_json::to_value(&mr).unwrap();
     for k in [
@@ -91,6 +93,8 @@ fn free_world_record_lands_without_spending_a_cent() {
         "layer",
         "claim_height",
         "reward",
+        "pace_floor",
+        "pace_next_floor",
     ] {
         assert!(v.get(k).is_some(), "ui/app.js 读的字段 {k} 不在 MineResult 里");
     }

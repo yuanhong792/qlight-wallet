@@ -81,29 +81,69 @@ fn v2_block(
     entity_root_hex: &str,
     entity_count: u64,
 ) -> simchain::BlockHeader {
-    let vrf = [6u8; 32];
+    committed_block(simchain::BLOCK_V_WORLD, prev_hex, height, entity_root_hex, entity_count, 6, "ql1v2miner")
+}
+
+/// 造一个承诺指定世界的 v3 块（域 `QL-BLOCK-V4`：排放节奏换了，域必须换）
+fn v3_block(
+    prev_hex: &str,
+    height: u64,
+    entity_root_hex: &str,
+    entity_count: u64,
+) -> simchain::BlockHeader {
+    committed_block(simchain::BLOCK_V_CRAFT, prev_hex, height, entity_root_hex, entity_count, 7, "ql1v3miner")
+}
+
+fn v4_block(
+    prev_hex: &str,
+    height: u64,
+    entity_root_hex: &str,
+    entity_count: u64,
+) -> simchain::BlockHeader {
+    committed_block(simchain::BLOCK_V_MINER, prev_hex, height, entity_root_hex, entity_count, 8, "ql1v4miner")
+}
+
+fn committed_block(
+    ver: u8,
+    prev_hex: &str,
+    height: u64,
+    entity_root_hex: &str,
+    entity_count: u64,
+    vrf_byte: u8,
+    miner: &str,
+) -> simchain::BlockHeader {
+    let vrf = [vrf_byte; 32];
     let root = simchain::tx_root_of(&[]);
     let mut er = [0u8; 32];
     er.copy_from_slice(&hex::decode(entity_root_hex).unwrap());
-    let hash = simchain::block_hash_of_world(
-        prev_hex,
-        height,
-        0,
-        &vrf,
-        &root,
-        &er,
-        entity_count,
-    );
+    let ts = simchain::GENESIS_TS_UNIX + height * 2;
+    let hash = match ver {
+        simchain::BLOCK_V_CRAFT => {
+            simchain::block_hash_of_craft(prev_hex, height, 0, &vrf, &root, &er, entity_count)
+        }
+        simchain::BLOCK_V_MINER => simchain::block_hash_of_miner_bound(
+            prev_hex,
+            height,
+            ts,
+            0,
+            &vrf,
+            &root,
+            &er,
+            entity_count,
+            miner,
+        ),
+        _ => simchain::block_hash_of_world(prev_hex, height, 0, &vrf, &root, &er, entity_count),
+    };
     simchain::BlockHeader {
-        version: simchain::BLOCK_V,
+        version: ver,
         height,
-        ts_unix: simchain::GENESIS_TS_UNIX + height * 2,
+        ts_unix: ts,
         prev_hash_hex: prev_hex.to_string(),
         block_hash_hex: hex::encode(hash),
         vrf_hex: hex::encode(vrf),
         minted_after: 0,
         reward_total: 0,
-        miner: "ql1v2miner".to_string(),
+        miner: miner.to_string(),
         entity_root_hex: entity_root_hex.to_string(),
         entity_count,
         txs: vec![],
@@ -134,14 +174,27 @@ fn the_world_the_producer_sees_is_written_into_the_block() {
 
     let (_, head, _) = chain.mine_block(&core).expect("第 2 块应出块");
     let (count, digest) = world::set_digest(&entities.load());
-    assert_eq!(head.version, simchain::BLOCK_V, "现行出块必须是 v2");
+    assert_eq!(head.version, simchain::BLOCK_V, "现行出块必须是 v4");
     assert_eq!(head.entity_count, count, "块头条数 = 出块人账本条数");
     assert_eq!(head.entity_root_hex, digest, "块头指纹 = 出块人账本指纹");
 
     // 独立复算：只靠块头字段就能重算出同一个块哈希（换世界 = 换块，第三方一算就知道）
     let mut vrf = [0u8; 32];
     vrf.copy_from_slice(&hex::decode(&head.vrf_hex).unwrap());
-    let again = simchain::block_hash_of_world(
+    let again = simchain::block_hash_of_miner_bound(
+        &head.prev_hash_hex,
+        head.height,
+        head.ts_unix,
+        head.minted_after,
+        &vrf,
+        &simchain::tx_root_of(&[]),
+        &h32(&head.entity_root_hex),
+        head.entity_count,
+        &head.miner,
+    );
+    assert_eq!(hex::encode(again), head.block_hash_hex);
+    // 换域即换块：v4 的块不许被重新解释成 v3（v3 的预镜像没有 miner/ts）
+    let old_domain = simchain::block_hash_of_craft(
         &head.prev_hash_hex,
         head.height,
         head.minted_after,
@@ -150,20 +203,51 @@ fn the_world_the_producer_sees_is_written_into_the_block() {
         &h32(&head.entity_root_hex),
         head.entity_count,
     );
-    assert_eq!(hex::encode(again), head.block_hash_hex);
+    assert_ne!(
+        hex::encode(old_domain),
+        head.block_hash_hex,
+        "v4 块在 v3 域下算得出来 = 历史可以被重新解释"
+    );
+    // miner / ts 必须真的进哈希：否则无矿签的块可以改 miner 偷手续费
+    let other_miner = simchain::block_hash_of_miner_bound(
+        &head.prev_hash_hex,
+        head.height,
+        head.ts_unix,
+        head.minted_after,
+        &vrf,
+        &simchain::tx_root_of(&[]),
+        &h32(&head.entity_root_hex),
+        head.entity_count,
+        "ql1attacker",
+    );
+    assert_ne!(hex::encode(other_miner), head.block_hash_hex, "改 miner 不改哈希 = 可偷手续费");
+    let other_ts = simchain::block_hash_of_miner_bound(
+        &head.prev_hash_hex,
+        head.height,
+        head.ts_unix + 1,
+        head.minted_after,
+        &vrf,
+        &simchain::tx_root_of(&[]),
+        &h32(&head.entity_root_hex),
+        head.entity_count,
+        &head.miner,
+    );
+    assert_ne!(hex::encode(other_ts), head.block_hash_hex, "改时间戳不改哈希 = 块头可被改写");
 
     // 反向对照：同一个块，只把世界指纹换一个字节，块哈希就变了 ——
     // 说明"离线换掉 entities.jsonl"这件事从此在块上留痕
     let mut alt = vrf;
     alt[0] ^= 1;
-    let shifted = simchain::block_hash_of_world(
+    let shifted = simchain::block_hash_of_miner_bound(
         &head.prev_hash_hex,
         head.height,
+        head.ts_unix,
         head.minted_after,
         &alt,
         &simchain::tx_root_of(&[]),
         &h32(&head.entity_root_hex),
         head.entity_count,
+        &head.miner,
     );
     assert_ne!(hex::encode(shifted), head.block_hash_hex);
 
@@ -188,12 +272,21 @@ fn v1_blocks_still_replay_under_their_own_domain() {
     let b1 = v1_block(&g.block_hash_hex, 1);
     let (count, digest) = chain.world_head();
     let b2 = v2_block(&b1.block_hash_hex, 2, &digest, count);
-    let text = format!("{}{}{}", line(&g), line(&b1), line(&b2));
+    let b3 = v3_block(&b2.block_hash_hex, 3, &digest, count);
+    let b4 = v4_block(&b3.block_hash_hex, 4, &digest, count);
+    let text = format!(
+        "{}{}{}{}{}",
+        line(&g),
+        line(&b1),
+        line(&b2),
+        line(&b3),
+        line(&b4)
+    );
 
     let h = chain
         .install_snapshot(&text)
         .expect("混版本链应逐块重放通过（旧块不重写）");
-    assert_eq!(h, 2);
+    assert_eq!(h, 4);
     // v1 那条的哈希仍在 `QL-BLOCK-V2` 域：换域就算不出来
     let wrong = simchain::block_hash_of_world(
         &b1.prev_hash_hex,
@@ -205,6 +298,18 @@ fn v1_blocks_still_replay_under_their_own_domain() {
         0,
     );
     assert_ne!(hex::encode(wrong), b1.block_hash_hex, "v1 块不许被重新解释成 v2");
+
+    // v2 块也不许被 v3 域重新解释：哈希域 = 「谁也改不掉」的那一层
+    let as_craft = simchain::block_hash_of_craft(
+        &b2.prev_hash_hex,
+        b2.height,
+        b2.minted_after,
+        &hex::decode(&b2.vrf_hex).unwrap()[..],
+        &simchain::tx_root_of(&[]),
+        &h32(&b2.entity_root_hex),
+        b2.entity_count,
+    );
+    assert_ne!(hex::encode(as_craft), b2.block_hash_hex, "v2 块不许被重新解释成 v3");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

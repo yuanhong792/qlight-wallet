@@ -895,7 +895,7 @@ impl Net {
         topics: &Topics,
         chain: &Arc<SimChain>,
     ) {
-        if header.version < crate::simchain::BLOCK_V || header.entity_root_hex.len() != 64 {
+        if header.version < crate::simchain::BLOCK_V_WORLD || header.entity_root_hex.len() != 64 {
             return; // v0/v1 块不承诺世界，无从追
         }
         let (mine_count, mine_digest) = chain.world_head();
@@ -1223,6 +1223,7 @@ fn emit_status(app: &AppHandle, net: &Net, chain: &Arc<SimChain>) {
         block_hash_hex: String::new(),
         vrf_hex: String::new(),
         reward: 0,
+        minted: 0,
         balance: core
             .as_ref()
             .map(|c| chain.balance_of(&c.address))
