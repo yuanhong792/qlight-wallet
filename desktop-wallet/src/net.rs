@@ -10,7 +10,7 @@
 //!   等同比特币 peers.dat 固定种子：同机 TCP 回环不经组播、不过防火墙，必通。
 //!   条目 15 分钟未刷新自动裁剪（防止单次运行残留），容量上限 64。
 //!
-//! 消息面（4 个 gossip 主题，载荷均 JSON）：
+//! 消息面（5 个 gossip 主题，载荷均 JSON）：
 //! - `qlx/reg/v1`    注册：{pk(1952B hex), salt(8B hex)} → 对端独立重算 ql1 地址，
 //!   得到「地址 ↔ 公钥」的可验证绑定（跨节点验签的公钥来源）
 //! - `qlx/tx/v1`     交易中继：{envelope, sig_hex} → 对端真验签入池
@@ -18,6 +18,8 @@
 //!   tx_root/块哈希重算 + 排放口径），一笔不对整块拒绝
 //! - `qlx/sync/v1`   追账三件套：Announce（链公告）/ SyncAsk（对账询问）/ SyncResp
 //!   （blocks.jsonl 全量快照，整链验证后采用）
+//! - `qlx/ent/v1`    世界中继 + 追赶四件套：Entity（新记录推送）/ EntHead（集合指纹
+//!   公告）/ EntAsk（索要整本）/ EntSnap（entities.jsonl 全量快照）
 //!
 //! 出块节拍 —— 提交驱动（关键设计，避免各节点按各自墙钟出块导致双挖分叉）：
 //! 1. 节点在「高度 H-1 落账」的那一刻（本地挖出或收到对端块），广播高度 H 的门票
@@ -32,10 +34,23 @@
 //!   邻居 → 索要整链快照；快照逐块验证通过才整链采用（本机旧档先归档 .bak-fork-*）。
 //! - 双方用同一条裁决规则（高者胜；同高 tip 小者胜），天然收敛到同一条链。
 //!
+//! 世界追赶（推送会漏，指纹能发现漏）：
+//! - 新记录只在对端签名那一刻广播一次；本机当时掉线，那块方块就永久丢了，
+//!   **而且谁都不知道丢了** —— 链侧有 Announce/SyncAsk 兜底，世界侧原来没有。
+//! - 现在每 9s（仅联邦模式）公告 `EntHead{count, digest}`：digest =
+//!   SHAKE-256("QL-ENTSET-V1" ‖ 全部 record_hash 升序拼接)，只依赖**记录集合**，
+//!   与落盘顺序、多人记录怎么交错都无关。
+//! - 看到「条数更多，或同数指纹更小」的邻居 → `EntAsk` → 持有者回 `EntSnap`
+//!   （gzip+base64 的整本 entities.jsonl）。快照只是搬运工：收下前逐条验签验链，
+//!   接不上的那条永远进不了本机账本；含坏行/超条数上限的快照整份丢弃（部分收下会
+//!   让本机指纹永远对不上任何人，把追赶变成风暴）。
+//!
 //! 诚实边界（M2.1 演示口径，代码里不装假）：
 //! - 联邦块接受依赖注册表公钥；快照整链只验哈希链（哈希链自洽即可采用），
 //!   正式公测需「门票 VRF 证明 + 注册链锚定 + 罚没」闭环（M2.2+）；
-//! - 演示规模（同机/局域网 2–3 节点）下按上述规则处理时间分叉。
+//! - 演示规模（同机/局域网 2–3 节点）下按上述规则处理时间分叉；
+//! - 世界追赶只在**至少一个在线邻居持有那份集合**时才补得回来；整本实体账本
+//!   仍未进块（没有 `entity_root`），所以离线替换 `entities.jsonl` 链看不出来。
 
 use crate::keystore::WalletCore;
 use crate::simchain::{BlockEvent, BlockHeader, SimChain};
@@ -74,6 +89,10 @@ pub const BOOT_TTL_MS: u64 = 15 * 60 * 1000;
 const BOOT_MAX_ENTRIES: usize = 64;
 /// 直连失败重试间隔
 const BOOT_RETRY_MS: u64 = 4000;
+/// 世界指纹公告周期（缺口检测；比链公告慢一档——补的是记录，不阻塞出块）
+const ENT_HEAD_EVERY_MS: u64 = 9000;
+/// 实体快照的条数上限（演示规模；也是给对端的 CPU/磁盘放大器设的闸门）
+const ENT_SNAP_MAX_LINES: usize = 65_536;
 
 const TOPIC_REG: &str = "qlx/reg/v1";
 const TOPIC_TX: &str = "qlx/tx/v1";
@@ -126,6 +145,26 @@ pub enum NetMsg {
     /// 实体记录中继：一批（本机新签的那条，或应答对端索要的历史）。
     /// 对端**逐条独立验签验链**后才落盘，所以这一批不需要被信任。
     Entity(Vec<crate::world::EntityRecord>),
+    /// 世界集合指纹公告：`(条数, 整本 records 的排序哈希指纹)`。
+    ///
+    /// 它是「推送会漏」的解药：邻居靠推送（`Entity`）拿到记录，掉线那一刻别人放的
+    /// 方块永久错过，而且谁都不知道错过了。公告指纹让任何一台机器都能当场发现
+    /// 自己缺，并主动索要补齐。
+    EntHead {
+        count: u64,
+        digest_hex: String,
+    },
+    /// 我缺了：请把你那份 `(count, digest_hex)` 的整本实体账本发来
+    EntAsk {
+        count: u64,
+        digest_hex: String,
+    },
+    /// 整本实体快照：base64(gzip(entities.jsonl))。`digest_hex` 必须是索要的那个，
+    /// 否则收方直接丢弃 —— 快照只是搬运工，逐条验签验链才是裁判。
+    EntSnap {
+        digest_hex: String,
+        snap: String,
+    },
 }
 
 #[derive(NetworkBehaviour)]
@@ -177,6 +216,10 @@ struct MachineState {
     ann_next: u64,
     /// 上次索要的对账目标（height:tip），防追账风暴
     sync_asked: Option<String>,
+    /// 下次公告世界指纹的时刻
+    ent_next: u64,
+    /// 上次索要的实体集合指纹（同一个缺失只问一次，防追赶风暴）
+    ent_asked: Option<String>,
 }
 
 impl Default for MachineState {
@@ -188,6 +231,8 @@ impl Default for MachineState {
             reg_next: now + 2000,  // 解锁后尽快广播注册
             ann_next: now + 1500,  // 尽快公告链，让新邻居尽早对齐
             sync_asked: None,
+            ent_next: now + 2500,  // 尽快对一次世界，掉线期间漏掉的方块当场补回
+            ent_asked: None,
         }
     }
 }
@@ -326,6 +371,13 @@ impl Net {
 
     fn registry_pk(&self, addr: &str) -> Option<Vec<u8>> {
         self.registry.lock().unwrap().get(addr).map(|(pk, _)| pk.clone())
+    }
+
+    // -------------------------------------------------------------- 世界追赶
+
+    /// 本机世界指纹：`(去重条数, 排序哈希指纹)`
+    fn ent_head(&self) -> (u64, String) {
+        crate::world::set_digest(&self.entities.load())
     }
 
     // -------------------------------------------------------------- 事件分发
@@ -570,6 +622,104 @@ impl Net {
                         }
                     }
                     Err(e) => eprintln!("[QLight] 实体合并失败：{e}"),
+                }
+            }
+
+            // —— 世界追赶：指纹公告 → 缺口检测 → 索要整本 → 逐条验后落盘 ——
+            NetMsg::EntHead { count, digest_hex } => {
+                let mine = self.ent_head();
+                if mine.1 == digest_hex {
+                    // 对上了：清掉欠账标记，之后若再分叉还能重新索要
+                    if ms.ent_asked.as_deref() == Some(format!("{count}:{digest_hex}").as_str()) {
+                        ms.ent_asked = None;
+                    }
+                    return;
+                }
+                // 只有对方那份确实更完整才追（同一条裁决规则，双方算出同一方向）
+                if !ent_head_wins((count, digest_hex.clone()), &mine) {
+                    return;
+                }
+                let key = format!("{count}:{digest_hex}");
+                if ms.ent_asked.as_deref() == Some(key.as_str()) {
+                    return; // 同一个缺失只问一次，防追赶风暴
+                }
+                ms.ent_asked = Some(key);
+                pub_msg(
+                    swarm,
+                    &topics.ent,
+                    &NetMsg::EntAsk {
+                        count,
+                        digest_hex: digest_hex.clone(),
+                    },
+                );
+                eprintln!(
+                    "[QLight] 世界对不上（本机 {} 条，邻居 {count} 条）：索要整本实体快照",
+                    mine.0
+                );
+            }
+
+            NetMsg::EntAsk { count, digest_hex } => {
+                let mine = self.ent_head();
+                // 我要么正好持有被索要的那一份，要么比它更完整 —— 才值得回整本快照；
+                // 比对方还少就别刷屏（对方问到更完整的邻居时会拿到答案）
+                let requested = (count, digest_hex.clone());
+                if mine.1 != digest_hex && !ent_head_wins(mine.clone(), &requested) {
+                    return;
+                }
+                match std::fs::read(self.entities.path()) {
+                    Ok(raw) if !raw.is_empty() => match snapshot_pack(&raw) {
+                        Some(snap) if snap.len() <= SYNC_MAX_BYTES => pub_msg(
+                            swarm,
+                            &topics.ent,
+                            &NetMsg::EntSnap {
+                                digest_hex: mine.1,
+                                snap,
+                            },
+                        ),
+                        Some(_) => eprintln!("[QLight] 实体快照过大（压缩后仍超上限），暂不回"),
+                        None => eprintln!("[QLight] 实体快照压缩失败，暂不回"),
+                    },
+                    _ => {} // 空账本 = 我这边世界还没开始，无从可回
+                }
+            }
+
+            NetMsg::EntSnap { digest_hex, snap } => {
+                let mine = self.ent_head();
+                // 自报的指纹必须和搬运内容对得上，否则这份快照连"声称自己是谁"都做不到
+                let Some(list) = ent_snap_records(&snap) else {
+                    eprintln!("[QLight] 实体快照解析失败（超限或坏行），整份丢弃");
+                    return;
+                };
+                let claimed = crate::world::set_digest(&list);
+                if claimed.1 != digest_hex || !ent_head_wins(claimed.clone(), &mine) {
+                    return; // 不是更完整的一份，或者指纹造假/传输损坏
+                }
+                // 快照只是搬运工，裁判还是逐条验签验链：接不上的那条永远进不了本机账本
+                let view = crate::world::ChainView::load(&chain.blocks_path_pub());
+                match self.entities.merge(&list, &view) {
+                    Ok(rep) => {
+                        let after = self.ent_head();
+                        eprintln!(
+                            "[QLight] 实体快照合并：收下 {}，已见过 {}，拒收 {}（本机指纹 …{} → …{}）",
+                            rep.accepted,
+                            rep.known,
+                            rep.rejected,
+                            &mine.1[mine.1.len().saturating_sub(8)..],
+                            &after.1[after.1.len().saturating_sub(8)..]
+                        );
+                        if rep.accepted > 0 {
+                            ms.ent_asked = None;
+                            let _ = app.emit(
+                                "world_entity",
+                                serde_json::json!({
+                                    "accepted": rep.accepted,
+                                    "known": rep.known,
+                                    "rejected": rep.rejected,
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("[QLight] 实体快照合并失败：{e}"),
                 }
             }
 
@@ -829,6 +979,17 @@ impl Net {
                 pub_msg(swarm, &topics.tx, &NetMsg::Tx(wire));
             }
         }
+        // —— 世界指纹公告：漏了记录的机器靠它发现自己漏了 ——
+        // 单机（A 档）没有可对齐的对象，不去整本读实体账本，保持原行为零开销
+        if self.peers.load(Ordering::Relaxed) > 0 && now >= ms.ent_next {
+            ms.ent_next = now + ENT_HEAD_EVERY_MS;
+            let (count, digest_hex) = self.ent_head();
+            pub_msg(
+                swarm,
+                &topics.ent,
+                &NetMsg::EntHead { count, digest_hex },
+            );
+        }
 
         // —— 解锁沿检测：给刚解锁的钱包一个很快的首拍 ——
         let unlocked_now = self.core_slot.read().unwrap().is_some();
@@ -922,8 +1083,14 @@ impl Net {
 
 // ---------------------------------------------------------------- 消息发布
 
+/// 世界指纹的裁决规则（与链对齐同款口径）：条数多者胜；同数比指纹，字典序小者胜。
+/// 双方各自算出同一个方向，所以不会出现互相对齐的死循环。
+pub fn ent_head_wins(theirs: (u64, String), mine: &(u64, String)) -> bool {
+    theirs.0 > mine.0 || (theirs.0 == mine.0 && theirs.1 < mine.1)
+}
+
 /// 整链快照打包：gzip（JSON 键名高度重复，压缩比 ~10 倍）+ base64（JSON 载体安全）
-fn snapshot_pack(raw: &[u8]) -> Option<String> {
+pub fn snapshot_pack(raw: &[u8]) -> Option<String> {
     use base64::Engine as _;
     use flate2::write::GzEncoder;
     use std::io::Write as _;
@@ -945,6 +1112,26 @@ fn snapshot_unpack(b64: &str) -> Option<String> {
         .read_to_string(&mut raw)
         .ok()?;
     Some(raw)
+}
+
+/// 实体快照负载 → 记录列表：条数超限或任一行解析不了，整份丢弃。
+///
+/// 宁可整份丢掉也不"收下能解析的部分"：一部分收下会让本机指纹永远对不上任何人，
+/// 从此每 9 秒重新问一遍，把追赶变成风暴。
+pub fn ent_snap_records(snap: &str) -> Option<Vec<crate::world::EntityRecord>> {
+    let lines = snapshot_unpack(snap)?;
+    let mut out: Vec<crate::world::EntityRecord> = Vec::new();
+    for line in lines.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if out.len() >= ENT_SNAP_MAX_LINES {
+            return None;
+        }
+        out.push(serde_json::from_str::<crate::world::EntityRecord>(line).ok()?);
+    }
+    Some(out)
 }
 
 /// 毫秒级 nonce：消息 ID 每次不同 → 绕过 gossipsub duplicate cache，

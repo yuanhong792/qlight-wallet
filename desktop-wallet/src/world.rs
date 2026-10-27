@@ -204,6 +204,28 @@ pub fn record_hash(r: &EntityRecord) -> [u8; 32] {
     out
 }
 
+/// 实体「集合指纹」的域分隔符（DESIGN.md §9.15 缺口检测）
+pub const ENT_SET_PREFIX: &[u8] = b"QL-ENTSET-V1";
+
+/// `(条数, 指纹)`：指纹 = SHAKE-256(域 ‖ 全部 record_hash 升序拼接)。
+///
+/// 排序 + 去重让它只依赖**记录集合本身**，与落盘顺序、多个归属者的记录怎么交错
+/// 都无关 —— 这正是缺口检测需要的不变量：两台机器指纹相同 ⇒ 它们眼里的世界是同
+/// 一份。指纹不承诺"这些记录合法"，那仍由逐条验签验链负责。
+pub fn set_digest(records: &[EntityRecord]) -> (u64, String) {
+    let mut hashes: Vec<[u8; 32]> = records.iter().map(record_hash).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let mut buf = Vec::with_capacity(hashes.len() * 32);
+    for h in &hashes {
+        buf.extend_from_slice(h);
+    }
+    (
+        hashes.len() as u64,
+        hex::encode(crypto::shake256(ENT_SET_PREFIX, &buf, 32)),
+    )
+}
+
 /// 内容寻址的实体 id：由「上一条哈希 ‖ 创建者公钥摘要 ‖ 序号 ‖ 铸造内容」算出，
 /// 不需要任何注册机构批准，也不可被抢注（同一 seq 位置只能有一条合法记录）。
 ///
