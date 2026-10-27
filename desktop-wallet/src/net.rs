@@ -876,9 +876,53 @@ impl Net {
                     "[QLight] 已采用联邦块 #{}（逐笔重验签 + 块哈希重算通过，全网账本对齐）",
                     header.height
                 );
+                self.chase_world(&header, ms, swarm, topics, chain);
             }
             Err(e) => eprintln!("[QLight] 拒绝联邦块：{e}"),
         }
+    }
+
+    /// 块上的世界承诺与本机对不上 → 立刻索要那一份，不等 9 秒的公告周期。
+    ///
+    /// 这是 `entity_root` 进块之后才有的闭环：块不只是"接受与否"，它现在还点名了
+    /// 出块人认的那一份世界。本机少了几格，就有明确的对象可问、有明确的指纹可核对；
+    /// 补齐后再公告，双方指纹一致，这件事才算完。
+    fn chase_world(
+        &self,
+        header: &BlockHeader,
+        ms: &mut MachineState,
+        swarm: &mut libp2p::Swarm<QlBehaviour>,
+        topics: &Topics,
+        chain: &Arc<SimChain>,
+    ) {
+        if header.version < crate::simchain::BLOCK_V || header.entity_root_hex.len() != 64 {
+            return; // v0/v1 块不承诺世界，无从追
+        }
+        let (mine_count, mine_digest) = chain.world_head();
+        if mine_digest == header.entity_root_hex {
+            return;
+        }
+        let key = format!("{}:{}", header.entity_count, header.entity_root_hex);
+        if ms.ent_asked.as_deref() == Some(key.as_str()) {
+            return; // 同一份缺失只问一次
+        }
+        ms.ent_asked = Some(key);
+        pub_msg(
+            swarm,
+            &topics.ent,
+            &NetMsg::EntAsk {
+                count: header.entity_count,
+                digest_hex: header.entity_root_hex.clone(),
+            },
+        );
+        eprintln!(
+            "[QLight] 块 #{} 承诺的世界与本机不同（链上 {} 条 …{}，本机 {} 条 …{}）：立即索要那一份",
+            header.height,
+            header.entity_count,
+            &header.entity_root_hex[..8],
+            mine_count,
+            &mine_digest[..8]
+        );
     }
 
     /// 收票：注册表公钥验签 → vrf' 入席位（假票直接丢）。

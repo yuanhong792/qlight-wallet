@@ -107,7 +107,7 @@ cargo test --lib ore::tests::ore_matches_cross_language_golden   # Rust 共识�
 - 与 Minecraft 刻意不同的一条：**地形不能被挖**。地形是算出来的 Nature，能进账本的只有被签名的创造；"拆"= 释放自己那条记录的归属（断租不删除，记录永久可查，体素重新可造）。
 - 只有**头**所在的那一格算被身体占用，脚下那格允许落块：块一落地人就被抬上去，于是"低头、连点"就是原地起柱，一次点击一块。准星够不到东西时一定有提示——这个编辑器不许无声失败。
 - 完整规格：[DESIGN.md §9 元宇宙运行时](DESIGN.md#9-元宇宙运行时l2)（确定性算术规范、规则版本化、VRF 随机源、可验证边界、世界经济学、彼此指认的存在证明）。
-- **诚实边界**：状态可验，像素不可验——渲染器不是共识的一部分；实体账本与 `chunk_root` 已落地（`src/world.rs`，`QL-ENTREC-v4` 逐条验签 + 哈希链 + 窗口配额），但**还没有 `entity_root` 进块**，所以"矿格是否已被占住"尚未由共识强制；租约与 `StreamGrant` 仍是**只有规格，0 行代码**。块版本 v1 起发行规则改变：新旧客户端会在首个 v1 块后分叉（见 §9.12 / §9.13）。
+- **诚实边界**：状态可验，像素不可验——渲染器不是共识的一部分；实体账本与 `chunk_root` 已落地（`src/world.rs`，`QL-ENTREC-v4` 逐条验签 + 哈希链 + 窗口配额），**整本世界承诺也已进块**（v2 块绑 `entity_root` + `entity_count`，见 §9.12），所以离线替换整本账本会在块上留痕；仍未做到的是逐 `chunk_root` 的分块承诺与"一格两主"的最终裁决，租约与 `StreamGrant` 仍是**只有规格，0 行代码**。块版本 v1 起发行规则改变、v2 起世界承诺进块：新旧客户端会在首个对应版本的块之后分叉（见 §9.12 / §9.13）。
 
 ## 📚 文档
 
@@ -132,7 +132,8 @@ cargo test --lib ore::tests::ore_matches_cross_language_golden   # Rust 共识�
 - **Windows**：运行只需三件（exe + WebView2Loader.dll + libunwind.dll）同目录，zip 里另附 `README.txt` 讲清建造与挖矿；SmartScreen「更多信息 → 仍要运行」；防火墙选「允许」。
 - **macOS**：首次打开「无法验证开发者」→ 右键 → 打开（未公证提示，仅一次）。
 - **数据位置**：macOS `~/Library/Application Support/net.qlight.wallet/`；Windows `%APPDATA%\net.qlight.wallet\`。
-- **块格式 v1**：本版新块的 `version = 1`，因此块哈希域从 `QL-BLOCK-V1` 换成 `QL-BLOCK-V2`（同一组字段换个版本就是另一条链；v0 旧块仍按老域重放，不重写任何历史）。发行规则随之改变（§9.13）。组网演示请**两端用同一版本**——0.1.0 的旧客户端在首个 v1 块之后会与本机节点分叉。
+- **块格式 v1**：本版新块的 `version = 1`，因此块哈希域从 `QL-BLOCK-V1` 换成 `QL-BLOCK-V2`（同一组字段换个版本就是另一条链；v0 旧块仍按老域重放，不重写任何历史）。发行规则随之改变（§9.13）。
+- **块格式 v2（0.3.0）**：`version = 2` 的块把**世界承诺**绑进块哈希——`entity_root`（出块人此刻整本实体账本的集合指纹 `QL-ENTSET-V1`）+ `entity_count`，哈希域换成 `QL-BLOCK-V3`。从此离线替换 `entities.jsonl` 会在块上留痕，条数倒退当场拒收。v0/v1 旧块继续在各自旧域重放，历史一行都不重写（`tests/world_block_commitment.rs` 里那条 v1 块就是这一条的对照）。组网演示仍请**两端用同一版本**：v1 客户端在首个 v2 块之后会与本机分叉。
 
 ## 🔨 从源码构建
 

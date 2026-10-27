@@ -52,6 +52,9 @@ pub fn run() {
             // 引导注册表放公共根目录：所有实例（根目录 + node-N）都读写同一份，
             // 互相读到对方的「节点号 + 监听地址」就 TCP 直连（macOS 同机组播不通的替代正路）
             let entities = Arc::new(world::EntityLedger::new(entities_path));
+            // v2 出块要向整本实体账本承诺世界（块哈希绑 `entity_root`），
+            // 所以链必须在网络与命令层拿到副本之前就先看到它
+            chain.attach_world(entities.clone());
             let net = net::Net::start(
                 app.handle().clone(),
                 chain.clone(),

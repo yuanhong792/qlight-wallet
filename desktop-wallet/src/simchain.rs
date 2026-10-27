@@ -50,7 +50,11 @@ pub const LEDGER_V: u8 = 2;
 /// v1 = 挖矿结算：**块内必须有一张矿签才发行**，没有就只收手续费、零排放。
 /// 版本进块哈希（见 `block_hash_of_ver`），所以旧块不可能被"重新解释"成 v1 来偷排放。
 pub const BLOCK_V_LEGACY: u8 = 0;
-pub const BLOCK_V: u8 = 1;
+/// v1 = 挖矿结算规则的起点：发行必须有矿签。v2 沿用同一套经济规则，只是多绑一份世界承诺。
+pub const BLOCK_V_MINING: u8 = 1;
+/// v2 = 现行：块哈希再绑上「世界承诺」——整本实体账本的集合指纹与条数。
+/// 从此"谁眼里的世界是哪一份"是可归责的：改 `entities.jsonl` 会被块头当场识破。
+pub const BLOCK_V: u8 = 2;
 /// 两次挖矿发行之间的最小间隔（块）。2 秒一块 → 约 100 秒一回合。
 ///
 /// 挖矿是"在世界里落一格别人可复算的坐标"，不是跑算法；这个间隔让脚本
@@ -116,6 +120,9 @@ pub fn genesis_header() -> BlockHeader {
         minted_after: 0,
         reward_total: 0,
         miner: String::new(),
+        // 创世块不承诺世界：那时还没有任何实体（v0 语义，字段恒空）
+        entity_root_hex: String::new(),
+        entity_count: 0,
         txs: vec![TxAttestation {
             digest_hex: hex::encode(genesis_manifesto_digest()),
             from: String::new(),
@@ -165,6 +172,10 @@ pub struct Ledger {
     /// 本链已挖矿发行的最后一笔所在块高（0 = 从未）——两次发行至少隔 50 块
     #[serde(default)]
     pub last_claim_height: u64,
+    /// 链上最近一次「世界承诺」的条数（v2 块才有；0 = 还没承诺过）。
+    /// 用于单调性闸门：append-only 的世界里，倒退 = 有人想把世界清空。
+    #[serde(default)]
+    pub entity_count_committed: u64,
     /// 全部历史 VRF（世界地表种子 = 创世哈希 ⊕ 这些值）。
     /// 不进 ledger.json：它可以从 blocks.jsonl 逐行重建，存两份只会漂移。
     #[serde(skip)]
@@ -183,6 +194,7 @@ impl Default for Ledger {
             nonces: HashMap::new(),
             records: vec![],
             last_claim_height: 0,
+            entity_count_committed: 0,
             vrfs: vec![],
         }
     }
@@ -191,7 +203,8 @@ impl Default for Ledger {
 /// 区块头（blocks.jsonl 每行一条，含块内全部交易，供哈希链重放校验）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockHeader {
-    /// 0 = 历史（每块固定排放）；1 = 挖矿结算（有矿签才发行）。旧行缺省按 0 读
+    /// 0 = 历史（每块固定排放）；1 = 挖矿结算（有矿签才发行）；2 = 再加世界承诺。
+    /// 旧行缺省按 0 读
     #[serde(default)]
     pub version: u8,
     pub height: u64,
@@ -203,6 +216,15 @@ pub struct BlockHeader {
     pub reward_total: u64, // 排放 + 手续费池
     /// 出块者地址（B 档联邦网络：对端要用它记账励）
     pub miner: String,
+    /// v2 起：出块者此刻整本实体账本的集合指纹（`QL-ENTSET-V1`，见 `world::set_digest`）。
+    /// 块哈希绑它，所以"这台机器眼里的世界是哪一份"从此写进共识、可归责、改不了。
+    /// 旧行缺省按空串读（v0/v1 本来不承诺任何世界）。
+    #[serde(default)]
+    pub entity_root_hex: String,
+    /// v2 起：该集合的去重条数。append-only 世界里它只增不减，
+    /// 这条单调性本身就是"把世界清空"攻击的检测器。
+    #[serde(default)]
+    pub entity_count: u64,
     pub txs: Vec<TxAttestation>,
 }
 
@@ -374,6 +396,70 @@ pub fn block_hash_of_ver(
     h
 }
 
+/// v2 的块哈希：预镜像在世界承诺（集合指纹 ‖ 条数）上结束，域 `QL-BLOCK-V3`。
+pub fn block_hash_of_world(
+    prev_hash_hex: &str,
+    height: u64,
+    minted_after: u64,
+    vrf: &[u8],
+    root: &[u8; 32],
+    entity_root: &[u8; 32],
+    entity_count: u64,
+) -> [u8; 32] {
+    let mut block_in: Vec<u8> = Vec::with_capacity(181);
+    block_in.push(BLOCK_V);
+    block_in.extend_from_slice(prev_hash_hex.as_bytes());
+    block_in.extend_from_slice(&height.to_be_bytes());
+    block_in.extend_from_slice(&minted_after.to_be_bytes());
+    block_in.extend_from_slice(vrf);
+    block_in.extend_from_slice(root);
+    block_in.extend_from_slice(entity_root);
+    block_in.extend_from_slice(&entity_count.to_be_bytes());
+    let out = crypto::shake256(b"QL-BLOCK-V3", &block_in, 32);
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&out);
+    h
+}
+
+/// 三个校验点（本地重放 / 联邦块 / 追账快照）共用的分域入口。
+///
+/// v2 起 `entity_root_hex` 必须是 64 个 hex：一个"声称自己是 v2 却没有世界承诺"的
+/// 块形同作废，不该由哈希函数替它编一个域。
+pub fn block_hash_of_header(
+    bh: &BlockHeader,
+    vrf: &[u8],
+    root: &[u8; 32],
+) -> Option<[u8; 32]> {
+    if bh.version < BLOCK_V {
+        return Some(block_hash_of_ver(
+            bh.version,
+            &bh.prev_hash_hex,
+            bh.height,
+            bh.minted_after,
+            vrf,
+            root,
+        ));
+    }
+    if bh.version != BLOCK_V {
+        return None;
+    }
+    let raw = hex::decode(&bh.entity_root_hex).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    let mut er = [0u8; 32];
+    er.copy_from_slice(&raw);
+    Some(block_hash_of_world(
+        &bh.prev_hash_hex,
+        bh.height,
+        bh.minted_after,
+        vrf,
+        root,
+        &er,
+        bh.entity_count,
+    ))
+}
+
 /// 矿签目标：世界坐标本身（`QLOR` ‖ x ‖ y ‖ layer）。没有私钥，也没人需要私钥。
 pub fn claim_target(x: u16, y: u16, layer: u16) -> [u8; 32] {
     let mut t = [0u8; 32];
@@ -431,6 +517,9 @@ pub struct SimChain {
     sent_cache: Arc<Mutex<VecDeque<BlockWire>>>,
     ledger_path: PathBuf,
     blocks_path: PathBuf,
+    /// 整本实体账本（v2 出块要向它承诺）。用 Arc&lt;RwLock&gt; 是因为 `SimChain` 会被
+    /// clone 给网络线程与命令层，挂载必须对所有副本同时可见。
+    world: Arc<std::sync::RwLock<Option<Arc<crate::world::EntityLedger>>>>,
     /// 启动哈希链校验失败置 true，禁出新块与收交易
     pub corrupted: Arc<Mutex<bool>>,
 }
@@ -486,6 +575,7 @@ impl SimChain {
             sent_cache: Arc::new(Mutex::new(VecDeque::new())),
             ledger_path,
             blocks_path,
+            world: Arc::new(std::sync::RwLock::new(None)),
             corrupted: Arc::new(Mutex::new(false)),
         };
 
@@ -926,19 +1016,31 @@ impl SimChain {
         *ledger.balances.entry(miner.clone()).or_insert(0) += reward + fee_pool;
         ledger.vrfs.push(hex::encode(&vrf));
 
-        // —— 块哈希绑定块内全部交易与版本 ——
+        // —— 块哈希绑定块内全部交易、版本与「世界承诺」——
+        // 承诺 = 本机此刻整本实体账本的集合指纹（`QL-ENTSET-V1`）。它进了块哈希，
+        // 于是"这台机器认的世界是哪一份"写死在共识里：离线换掉 entities.jsonl
+        // 会对不上任何一块 v2 块的承诺，而谁在哪个高度承诺了什么，永久可归责。
         let root = tx_root_of(&digests);
-        let block_hash = block_hash_of_ver(
-            BLOCK_V,
+        let (entity_count, entity_root_hex) = self.world_head();
+        let mut entity_root = [0u8; 32];
+        if let Ok(b) = hex::decode(&entity_root_hex) {
+            if b.len() == 32 {
+                entity_root.copy_from_slice(&b);
+            }
+        }
+        let block_hash = block_hash_of_world(
             &prev_hash_before,
             height_next,
             ledger.total_minted,
             &vrf,
             &root,
+            &entity_root,
+            entity_count,
         );
 
         ledger.height = height_next;
         ledger.prev_hash_hex = hex::encode(&block_hash);
+        ledger.entity_count_committed = entity_count;
 
         // —— 原子持久化 + 追加可审计块头 ——
         if let Ok(bytes) = serde_json::to_vec(&*ledger) {
@@ -954,6 +1056,8 @@ impl SimChain {
             minted_after: ledger.total_minted,
             reward_total: reward + fee_pool,
             miner: miner.clone(),
+            entity_root_hex,
+            entity_count,
             txs: included,
         };
         drop(ledger);
@@ -1105,6 +1209,10 @@ impl SimChain {
         minted_before: u64,
         last_claim_before: u64,
     ) -> Option<(u64, u64)> {
+        // 未来版本无从解释排放口径，不猜（调用点的版本闸门之外也要自守住）
+        if bh.version > BLOCK_V {
+            return None;
+        }
         match bh.version {
             BLOCK_V_LEGACY => {
                 if bh
@@ -1119,7 +1227,7 @@ impl SimChain {
                     last_claim_before,
                 ))
             }
-            BLOCK_V => {
+            BLOCK_V_MINING.. => {
                 let claims: Vec<&TxAttestation> = bh
                     .txs
                     .iter()
@@ -1143,7 +1251,6 @@ impl SimChain {
                     None => Some((0, last_claim_before)),
                 }
             }
-            _ => None,
         }
     }
 
@@ -1153,6 +1260,8 @@ impl SimChain {
         let mut expect_prev = genesis_hash_hex();
         let mut minted_running: u64 = 0;
         let mut last_claim: u64 = 0;
+        // 最近一次「世界承诺」的条数（只在 v2 块之间比较；v0/v1 没承诺过世界）
+        let mut prev_entity_count: u64 = 0;
         for bh in headers {
             // 创世行只做锚定：与源码常量逐字相等；它没有出块者，也没有排放
             if bh.height == 0 {
@@ -1165,8 +1274,19 @@ impl SimChain {
             if bh.miner.is_empty() {
                 return false;
             }
-            if bh.version != BLOCK_V_LEGACY && bh.version != BLOCK_V {
+            if bh.version > BLOCK_V {
+                return false; // 未来版本无从解释，不猜
+            }
+            // v2 起必须真的承诺一份世界：64 个 hex，且条数不减（append-only 世界里
+            // 诚实出块人只会知道更多记录；倒退 = 想把世界清空）
+            let world_ok = bh.version < BLOCK_V
+                || (bh.entity_root_hex.len() == 64
+                    && bh.entity_count >= prev_entity_count);
+            if !world_ok {
                 return false;
+            }
+            if bh.version >= BLOCK_V {
+                prev_entity_count = bh.entity_count;
             }
             if bh.prev_hash_hex != expect_prev {
                 return false;
@@ -1184,14 +1304,9 @@ impl SimChain {
             if hex::decode_to_slice(&bh.vrf_hex, &mut vrf).is_err() {
                 return false;
             }
-            let expect = block_hash_of_ver(
-                bh.version,
-                &bh.prev_hash_hex,
-                bh.height,
-                bh.minted_after,
-                &vrf,
-                &root,
-            );
+            let Some(expect) = block_hash_of_header(bh, &vrf, &root) else {
+                return false;
+            };
             if hex::encode(expect) != bh.block_hash_hex {
                 return false;
             }
@@ -1231,8 +1346,20 @@ impl SimChain {
             l.prev_hash_hex = h.block_hash_hex.clone();
             return Ok(());
         }
-        if h.version != BLOCK_V_LEGACY && h.version != BLOCK_V {
+        if h.version > BLOCK_V {
             return Err(format!("块 #{} 版本号未知 → 快照拒收", h.height));
+        }
+        if h.version >= BLOCK_V {
+            if h.entity_root_hex.len() != 64 {
+                return Err(format!("块 #{} 声称 v2 却没有世界承诺 → 快照拒收", h.height));
+            }
+            if h.entity_count < l.entity_count_committed {
+                return Err(format!(
+                    "块 #{} 的世界条数倒退（链上已承诺 {}，这块只认 {}）→ 想把世界清空？快照拒收",
+                    h.height, l.entity_count_committed, h.entity_count
+                ));
+            }
+            l.entity_count_committed = h.entity_count;
         }
         if bl.wires.len() != h.txs.len() {
             return Err(format!(
@@ -1386,8 +1513,19 @@ impl SimChain {
         if header.miner.is_empty() {
             return Err("块头缺 miner".into());
         }
-        if header.version != BLOCK_V_LEGACY && header.version != BLOCK_V {
+        if header.version > BLOCK_V {
             return Err("块版本未知 → 整块拒绝".into());
+        }
+        if header.version >= BLOCK_V {
+            if header.entity_root_hex.len() != 64 {
+                return Err("v2 块缺世界承诺 → 整块拒绝".into());
+            }
+            if header.entity_count < ledger.entity_count_committed {
+                return Err(format!(
+                    "世界条数倒退（链上已承诺 {}，来块只认 {}）→ 整块拒绝",
+                    ledger.entity_count_committed, header.entity_count
+                ));
+            }
         }
 
         // —— staging 复本上逐笔重验+重放（任何一笔不过 → 整块拒绝）——
@@ -1471,14 +1609,9 @@ impl SimChain {
         if hex::decode_to_slice(&header.vrf_hex, &mut vrf_bytes).is_err() {
             return Err("块头 vrf 非法".into());
         }
-        let expect = block_hash_of_ver(
-            header.version,
-            &header.prev_hash_hex,
-            header.height,
-            header.minted_after,
-            &vrf_bytes,
-            &root,
-        );
+        let Some(expect) = block_hash_of_header(header, &vrf_bytes, &root) else {
+            return Err("v2 块的世界承诺形态非法（须 64 hex）→ 整块拒绝".into());
+        };
         if hex::encode(expect) != header.block_hash_hex {
             return Err("块哈希重算不符 → 整块拒绝".into());
         }
@@ -1486,6 +1619,9 @@ impl SimChain {
         // —— 一次成型入账 ——
         staged.height = height_next;
         staged.prev_hash_hex = header.block_hash_hex.clone();
+        if header.version >= BLOCK_V {
+            staged.entity_count_committed = header.entity_count;
+        }
         *ledger = staged;
 
         if let Ok(bytes) = serde_json::to_vec(&*ledger) {
@@ -1554,6 +1690,7 @@ impl SimChain {
             nonces: HashMap::new(),
             records: vec![],
             last_claim_height: 0,
+            entity_count_committed: 0,
             vrfs: vec![],
         };
         for bl in &block_lines {
@@ -1672,6 +1809,22 @@ impl SimChain {
     /// blocks 文件路径（联邦读出整链做追账快照）
     pub fn blocks_path_pub(&self) -> PathBuf {
         self.blocks_path.clone()
+    }
+
+    /// 挂载整本实体账本：v2 起出块要向它承诺世界。钱包启动时调用一次，
+    /// 网络线程与命令层拿到的都是同一个 Arc，因此承诺对所有副本一致。
+    pub fn attach_world(&self, ledger: Arc<crate::world::EntityLedger>) {
+        *self.world.write().unwrap() = Some(ledger);
+    }
+
+    /// 本机此刻的世界承诺：`(去重条数, 集合指纹)`。没挂世界就是诚实的空集合，
+    /// 而不是"不承诺"——v2 块永远带一个可被别人复算的指纹。
+    pub fn world_head(&self) -> (u64, String) {
+        let slot = self.world.read().unwrap();
+        match slot.as_ref() {
+            Some(led) => crate::world::set_digest(&led.load()),
+            None => crate::world::set_digest(&[]),
+        }
     }
 
     /// 池内全部交易原件（周期性再广播，让各家节点 mempool 对齐）
@@ -1835,6 +1988,8 @@ mod tests {
             minted_after: reward_at(1),
             reward_total: reward_at(1),
             miner: "ql1qqqminer".to_string(),
+            entity_root_hex: String::new(),
+            entity_count: 0,
             txs: vec![],
         };
         one.block_hash_hex = hex::encode(block_hash_of(
@@ -2025,6 +2180,8 @@ mod tests {
             minted_after: reward_at(1),
             reward_total: reward_at(1),
             miner: victim.address.clone(),
+            entity_root_hex: String::new(),
+            entity_count: 0,
             txs: vec![],
         };
         b1.block_hash_hex = hex::encode(block_hash_of(
@@ -2054,6 +2211,8 @@ mod tests {
             minted_after: reward_at(1) + reward_at(2),
             reward_total: reward_at(2) + FEE,
             miner: attacker.address.clone(),
+            entity_root_hex: String::new(),
+            entity_count: 0,
             txs: vec![TxAttestation {
                 digest_hex: hex::encode(digest),
                 from: victim.address.clone(),
