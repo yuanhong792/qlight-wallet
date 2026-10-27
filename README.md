@@ -41,7 +41,7 @@
 
 ## 🚀 快速开始（两台电脑联邦转账）
 
-1. **安装**：从 [Releases](https://github.com/yuanhong792/qlight-wallet/releases/latest) 下载并安装（macOS 拖入应用程序；Windows 解压双击 exe，三文件同目录）。
+1. **安装**：从 [Releases](https://github.com/yuanhong792/qlight-wallet/releases/latest) 下载并安装（macOS 拖入应用程序；Windows 解压双击 exe，exe 与两个 DLL 同目录）。
 2. **组网**：两台设备连同一 Wi-Fi，各自打开钱包，左上角出现「🌐 联邦 · 2 节点」即成功（同一台电脑开两个实例也可以，第二个实例自动落到 `node-1` 数据目录）。
 3. **转账**：收款方「收款」页复制 `ql1` 地址 → 付款方「转账」页粘贴、输入金额 → 签发。
 4. **到账**：约 2 秒入块，双方「活动」页自动刷新，完整明细直接可见。
@@ -129,10 +129,10 @@ cargo test --lib ore::tests::ore_matches_cross_language_golden   # Rust 共识�
 
 ## 🪟 / 🍎 平台备注
 
-- **Windows**：三文件（exe + WebView2Loader.dll + libunwind.dll）须同目录；SmartScreen「更多信息 → 仍要运行」；防火墙选「允许」。
+- **Windows**：运行只需三件（exe + WebView2Loader.dll + libunwind.dll）同目录，zip 里另附 `README.txt` 讲清建造与挖矿；SmartScreen「更多信息 → 仍要运行」；防火墙选「允许」。
 - **macOS**：首次打开「无法验证开发者」→ 右键 → 打开（未公证提示，仅一次）。
 - **数据位置**：macOS `~/Library/Application Support/net.qlight.wallet/`；Windows `%APPDATA%\net.qlight.wallet\`。
-- **块格式 v1**：本版起发行规则改变（§9.13，块哈希域 `QL-BLOCK-V2`）。组网演示请**两端用同一版本**——0.1.0 的旧客户端在首个 v1 块之后会与本机节点分叉。
+- **块格式 v1**：本版新块的 `version = 1`，因此块哈希域从 `QL-BLOCK-V1` 换成 `QL-BLOCK-V2`（同一组字段换个版本就是另一条链；v0 旧块仍按老域重放，不重写任何历史）。发行规则随之改变（§9.13）。组网演示请**两端用同一版本**——0.1.0 的旧客户端在首个 v1 块之后会与本机节点分叉。
 
 ## 🔨 从源码构建
 
