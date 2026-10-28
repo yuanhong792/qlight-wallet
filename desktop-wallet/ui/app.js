@@ -29,16 +29,53 @@ $("lang-select").addEventListener("change", (e) => { setLang(e.target.value); se
 // ---------------------------------------------------------------- 联邦网络 chip
 
 let netCount = 0;
+// 版本普查两堆：规则指纹不同（一定分叉）／指纹相同但发行包不同（家族内改过判据也会分叉）
+let netFork = [];
+let netOdd = [];
+let netRules = "";
+let netVer = "";
+const netRows = (list) => list.map((p) => `${p.app_version} / ${p.rules}`).join(" · ");
 function setNetChip() {
   const el = $("net-chip");
-  el.textContent = netCount > 0 ? t("net.fed", { n: netCount }) : t("net.solo");
   el.classList.toggle("fed", netCount > 0);
+  el.classList.toggle("warn", netFork.length > 0);
+  el.classList.toggle("odd", !netFork.length && netOdd.length > 0);
+  const mine = `${netVer || "—"} / ${netRules || "—"}`;
+  if (netFork.length) {
+    el.textContent = t("net.fed.warn", { n: netFork.length });
+    el.title = t("net.fed.warn.tip", { mine, peers: netRows(netFork) });
+  } else if (netOdd.length) {
+    el.textContent = t("net.fed.odd", { n: netOdd.length });
+    el.title = t("net.fed.odd.tip", { mine, peers: netRows(netOdd) });
+  } else {
+    el.textContent = netCount > 0 ? t("net.fed", { n: netCount }) : t("net.solo");
+    el.title = "";
+  }
+  // 欢迎页的同一句话：还没进主界面时也得知道"现在和谁在一个世界"
+  const wt = $("welcome-net-tag");
+  if (wt) {
+    wt.textContent = netCount > 0 ? t("net.fed", { n: netCount }) : t("net.solo");
+    wt.classList.toggle("fed", netCount > 0);
+  }
+}
+let lastNet = null;
+function applyNet(s) {
+  lastNet = s;
+  netCount = s.count || 0;
+  netFork = s.rules_mismatch || [];
+  netOdd = s.version_diff || [];
+  netRules = s.rules || "";
+  netVer = s.app_version || "";
+  setNetChip();
+  renderNetstate();
 }
 listen("net_peers", (ev) => {
   netCount = ev.payload.count || 0;
   setNetChip();
 });
-invoke("net_status").then((s) => { netCount = s.count || 0; setNetChip(); }).catch(() => {});
+// 分歧集合变了（新邻居/邻居升级或掉线/公告过期）才推这一个事件，形状与 net_status 一致
+listen("net_versions", (ev) => applyNet(ev.payload));
+invoke("net_status").then(applyNet).catch(() => {});
 
 // ---------------------------------------------------------------- 页面路由（侧边导航）
 
@@ -48,6 +85,12 @@ document.querySelectorAll(".sb-item").forEach((btn) => {
     document.querySelectorAll(".sb-item").forEach((b) => b.classList.toggle("active", b === btn));
     pages.forEach((p) => $(`page-${p}`).classList.toggle("hidden", p !== btn.dataset.page));
     if (btn.dataset.page !== "world") closeWorld3D(); // 离开世界页就把第一人称视图收掉，不停止渲染还白烧 GPU
+    // 第 4 步是导航事实：看过活动就记下来（不改账本、不影响任何判据）
+    if (btn.dataset.page === "history" && !prefsCache.opened_history) {
+      setPref("opened_history", true).then(renderGuide);
+    }
+    if (btn.dataset.page === "world") renderGuide();
+    if (btn.dataset.page === "about") { renderFeedback(); renderNetstate(); }
     // 切页即刷新：活动列表/余额立刻反映最新账本
     if (!$("view-main").classList.contains("hidden")) refreshAll().catch(() => {});
   });
@@ -81,10 +124,25 @@ $("btn-mine-open").addEventListener("click", () => { openPage("mine"); });
 // ---------------------------------------------------------------- 视图路由
 
 function show(view) {
-  for (const v of ["view-create", "view-lock", "view-main"]) {
+  for (const v of ["view-welcome", "view-create", "view-lock", "view-main"]) {
     $(v).classList.toggle("hidden", v !== view);
   }
 }
+
+// 外壳偏好（prefs.json）：欢迎页还要不要弹、引导走到哪一步。
+// 进度跟账本走（同机多开的实例各有各的 prefs），所以存文件而不是 localStorage。
+let prefsCache = { welcome_done: false, opened_world: false, opened_history: false, guide_done: false };
+async function loadPrefs() {
+  try { prefsCache = await invoke("get_prefs"); } catch { /* 旧后端：按首次运行处理 */ }
+  return prefsCache;
+}
+async function setPref(key, value) {
+  try { prefsCache = await invoke("set_pref", { key, value }); } catch { /* 写失败就别假装存下了 */ }
+  return prefsCache;
+}
+
+// 从欢迎页点进来要不要直接进世界：解锁/创建完成后由 enterMain 兑现
+let wantWorld = false;
 
 async function route() {
   const st = await invoke("wallet_status");
@@ -97,7 +155,169 @@ async function enterMain() {
   show("view-main");
   await refreshAll();
   $("input-unlock").value = "";
+  renderGuide();
+  if (wantWorld) {
+    wantWorld = false;
+    document.querySelector('.sb-item[data-page="world"]').click();
+    openWorld3D();
+  }
 }
+
+async function boot() {
+  await loadPrefs();
+  await renderWelcome();
+  show("view-welcome");
+}
+
+// ---------------------------------------------------------------- 欢迎页 / 引导 / 反馈 / 联机三态
+
+/** 反馈包与欢迎页「技术参数」共用同一份聚合诊断：一个字段来源，少一处漂移 */
+function diagRows(d) {
+  if (!d) return "";
+  const row = (k, v) => `<div class="f3k">${esc(k)}</div><div class="f3v">${esc(String(v))}</div>`;
+  const bad = (n) => (n ? ` · ${t("fb.d.bad")} ${n}` : "");
+  return [
+    row(t("fb.d.version"), d.app_version),
+    row(t("fb.d.rules"), d.rules),
+    row(t("fb.d.os"), `${d.os} · ${d.arch}`),
+    row(t("fb.d.height"), `#${d.height}`),
+    row(t("fb.d.peers"), d.peers),
+    row(t("fb.d.present"), d.present),
+    row(t("fb.d.entity"), `${d.entity_lines}${bad(d.entity_bad_lines)}`),
+    row(t("fb.d.dust"), `${d.dust_lines}${bad(d.dust_bad_lines)}`),
+    row(t("fb.d.unlocked"), d.unlocked ? t("fb.yes") : t("fb.no")),
+    row(t("fb.d.multi"), d.multi_instance ? t("fb.yes") : t("fb.no")),
+  ].join("");
+}
+
+async function renderWelcome() {
+  const d = await invoke("diag_report").catch(() => null);
+  if (d) $("welcome-adv-list").innerHTML = diagRows(d);
+  const s = await invoke("net_status").catch(() => null);
+  if (s) applyNet(s);
+}
+
+/** 离开开场画面；想进世界就记下来，等解锁/创建完再兑现。 */
+async function leaveWelcome(world) {
+  wantWorld = !!world;
+  await route();
+}
+$("btn-w-world").addEventListener("click", () => leaveWelcome(true));
+$("btn-w-wallet").addEventListener("click", () => leaveWelcome(false));
+$("btn-w-how").addEventListener("click", () => $("welcome-how").classList.toggle("hidden"));
+$("btn-main-gate").addEventListener("click", async () => {
+  closeWorld3D();
+  await renderWelcome();
+  show("view-welcome");
+});
+
+// —— 首次任务引导：第 2、3 步以账本为准，第 1、4 步只是导航状态（见 index.html 注释）
+function guideSteps() {
+  const s = worldSnap;
+  const dug = s ? (s.dug || []).length : 0;
+  const owned = s ? s.entities.filter((e) => !e.released && e.owner === s.address).length : 0;
+  return [
+    { done: !!prefsCache.opened_world, nav: true },
+    { done: dug > 0, ledger: true, n: dug },
+    { done: owned > 0, ledger: true, n: owned },
+    { done: !!prefsCache.opened_history, nav: true },
+  ];
+}
+
+function renderGuide() {
+  const panel = $("panel-guide");
+  if (!panel) return;
+  panel.hidden = !!prefsCache.guide_done;
+  if (prefsCache.guide_done) return;
+  const steps = guideSteps();
+  const done = steps.filter((s) => s.done).length;
+  $("guide-count").textContent = t("guide.count", { done, total: steps.length });
+  const go = ["world", "world", "world", "history"];
+  $("guide-list").innerHTML = steps.map((s, i) => `
+    <li class="${s.done ? "done" : ""}">
+      <span class="gd-mark">${s.done ? "✓" : i + 1}</span>
+      <div class="gd-text">
+        <b>${esc(t(`guide.s${i + 1}t`))}</b>
+        <span class="gd-kind ${s.ledger ? "ledger" : ""}">${t(s.ledger ? "guide.ledger" : "guide.nav")}</span>
+        <div class="muted small">${esc(t(`guide.s${i + 1}`))}${s.n ? ` · <span class="mono">${s.n}</span>` : ""}</div>
+      </div>
+      ${s.done ? "" : `<button type="button" class="btn-ghost gd-go" data-go="${go[i]}">${t("guide.go")}</button>`}
+    </li>`).join("");
+}
+$("guide-list").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-go]");
+  if (!b) return;
+  document.querySelector(`.sb-item[data-page="${b.dataset.go}"]`).click();
+  if (b.dataset.go === "world") openWorld3D();
+});
+$("btn-guide-hide").addEventListener("click", async () => {
+  await setPref("guide_done", true);
+  renderGuide();
+});
+
+// —— 联机三态：前两档能用，公网没实现就说没实现
+function renderNetstate() {
+  const list = $("netstate-list");
+  if (!list) return;
+  const sc = (lastNet && lastNet.scope) || { loopback: 0, lan: 0, public: 0, unknown: 0 };
+  const local = sc.loopback || 0, lan = sc.lan || 0, pub = sc.public || 0;
+  const li = (cls, title, note, n) => `<li class="${cls}">
+      <b>${esc(title)}</b>
+      <span class="muted small">${esc(note)}</span>
+      ${n ? `<span class="tag">${t("netstate.now", { n })}</span>` : ""}
+    </li>`;
+  list.innerHTML =
+    li(local ? "on" : "off", t("netstate.local"), t("netstate.local.note"), local) +
+    li(lan ? "on" : "off", t("netstate.lan"), t("netstate.lan.note"), lan) +
+    li("todo", t("netstate.public"), t("netstate.public.note"), pub);
+  if (!local && !lan && !pub) {
+    list.insertAdjacentHTML("afterbegin", `<li class="off"><b>${t("netstate.none")}</b></li>`);
+  }
+}
+
+// —— 反馈：只导出聚合数字；地址与截图都要显式勾选
+let fbBusy = false;
+async function renderFeedback() {
+  const d = await invoke("diag_report").catch(() => null);
+  if (d) $("fb-diag").innerHTML = diagRows(d);
+  const inWorld = !!(w3 && $("w3d") && !$("w3d").hidden);
+  $("fb-shot").disabled = !inWorld;
+  $("fb-shot").checked = $("fb-shot").checked && inWorld;
+  $("fb-shot").title = inWorld ? "" : t("fb.shot.off");
+}
+
+$("btn-fb").addEventListener("click", async () => {
+  if (fbBusy) return;
+  const err = $("err-fb"), ok = $("ok-fb");
+  err.textContent = "";
+  ok.hidden = true;
+  const problem = $("fb-text").value.trim();
+  if (!problem) { err.textContent = t("fb.err.empty"); return; }
+  let screenshot = null;
+  if ($("fb-shot").checked && !$("fb-shot").disabled) {
+    screenshot = await new Promise((resolve) => {
+      if (!w3) return resolve(null);
+      if (w3three) return resolve(w3three.snapshot());
+      let got = false;
+      w3.snapshot((u) => { got = true; resolve(u); });
+      setTimeout(() => { if (!got) resolve(null); }, 500);
+    });
+    if (!screenshot) { err.textContent = t("fb.shot.off"); return; }
+  }
+  fbBusy = true;
+  $("btn-fb").disabled = true;
+  try {
+    const p = await invoke("feedback_write", {
+      problem, includeAddr: $("fb-addr").checked, screenshot,
+    });
+    ok.hidden = false;
+    ok.textContent = p ? t("fb.ok", { path: p }) : t("fb.cancel");
+  } catch (e) {
+    err.textContent = String(e);
+  }
+  $("btn-fb").disabled = false;
+  fbBusy = false;
+});
 
 // ---------------------------------------------------------------- 认证
 
@@ -334,9 +554,21 @@ let wSlot = 0;
 let wSel = ""; // 选中实体 id（空 = 未选中）
 let wProof = { id: "", json: "" }; // 展开的可验证记录（2 秒轮询重渲染时不能丢）
 let w3 = null; // 第一人称体素编辑器（惰性创建）
+let w3three = null; // Three.js 视觉层；编辑与账本判定继续使用 w3
+let w3VeilDone = false; // 封面已淡入真实画面（每次进世界重置）
 
 const worldActive = () => !$("page-world").classList.contains("hidden");
-const worldErr = (m) => { $("err-world").textContent = m; $("ok-world").hidden = true; };
+// 旧世界账本是"解释"不是"故障"：写入被重放拒掉时不要甩一行红色原始报错，
+// 直接把出口说清楚——红字会让人以为是新写坏了，其实账本一条都没动。
+const worldErr = (m) => {
+  const el = $("err-world");
+  const s = worldSnap;
+  const foreign = !!(s && s.ledger_foreign && s.report && s.report.reason);
+  const replayRefused = foreign && String(m).includes(s.report.reason);
+  el.className = replayRefused ? "muted small" : "error";
+  el.textContent = replayRefused ? t("world.fix.banner") : m;
+  $("ok-world").hidden = true;
+};
 const worldOk = (m) => { $("err-world").textContent = ""; const o = $("ok-world"); o.hidden = false; o.textContent = m; setTimeout(() => (o.hidden = true), 6000); };
 const entById = (id) => (worldSnap ? worldSnap.entities.find((e) => e.entity_id_hex === id) : null);
 const idShort = (id) => (id ? `${id.slice(0, 10)}…${id.slice(-8)}` : "—");
@@ -555,6 +787,118 @@ $("trader-offers").addEventListener("click", (e) => {
   const b = e.target.closest(".trader-offer");
   if (b) buyInfo(b.dataset.id);
 });
+
+// —— 兑换池（QL-POOL-v1）：曲线在共识里，前端只提议方向与数量；报价是同一公式的只读预演
+let poolSnap = null;
+
+function qlxUnits(s) {
+  const v = String(s).trim();
+  if (!/^\d+(\.\d{0,9})?$/.test(v)) return null;
+  const [i, f = ""] = v.split(".");
+  return BigInt(i) * 1000000000n + BigInt((f + "000000000").slice(0, 9));
+}
+
+/** 与 pool.rs::quote 同一算式（u128 在这里用 BigInt）：只用来显示"约得多少" */
+function poolPreview() {
+  const p = poolSnap;
+  if (!p || !p.active || !p.ready) return null;
+  const dir = $("pool-dir").value === "dust" ? "dust" : "qlx";
+  const raw = $("pool-amount").value.trim();
+  if (!raw) return null;
+  let amt;
+  if (dir === "qlx") {
+    amt = qlxUnits(raw);
+    if (!amt || amt <= 0n) return null;
+  } else {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    amt = BigInt(Math.round(n));
+  }
+  const inAfter = (amt * 9970n) / 10000n;
+  if (inAfter <= 0n) return null;
+  const [resIn, resOut] = dir === "qlx"
+    ? [BigInt(Math.round(p.qlx)), BigInt(Math.round(p.dust))]
+    : [BigInt(Math.round(p.dust)), BigInt(Math.round(p.qlx))];
+  const out = (resOut * inAfter) / (resIn + inAfter);
+  return out > 0n ? { dir, out } : null;
+}
+
+function renderPoolQuote() {
+  const p = poolSnap;
+  if (!p) return;
+  if (!p.active) { $("pool-quote").textContent = t("pool.inactive", { h: p.activation_height, now: p.height }); return; }
+  if (!p.ready) { $("pool-quote").textContent = t("pool.notready"); return; }
+  const q = poolPreview();
+  if (!q) { $("pool-quote").textContent = ""; return; }
+  $("pool-quote").textContent = q.dir === "qlx"
+    ? t("pool.quote.qlx", { out: fmtDust(q.out) })
+    : t("pool.quote.dust", { out: fmtAmt(q.out) });
+}
+
+function renderPool() {
+  const p = poolSnap;
+  if (!p) return;
+  $("pool-price").textContent = p.price ? Number(p.price).toFixed(6) : "–";
+  $("pool-meta").textContent = t("pool.meta", {
+    h: p.activation_height,
+    bps: (p.fee_bps / 100).toFixed(2).replace(/\.?0+$/, ""),
+  });
+  $("pool-reserves").textContent = t("pool.reserves", { q: fmtAmt(p.qlx), d: fmtDust(p.dust) });
+  $("pool-mine").textContent = t(p.my_lp > 0 ? "pool.mine.locked" : "pool.mine", {
+    q: fmtAmt(p.my_qlx), d: fmtDust(p.my_dust), lp: fmtDust(p.my_lp), locked: fmtDust(p.locked_lp),
+  });
+  const off = !p.active || !p.unlocked;
+  for (const id of ["btn-pool-swap", "btn-pool-add", "btn-pool-remove"]) $(id).disabled = off;
+  renderPoolQuote();
+}
+
+async function loadPool() {
+  try { poolSnap = await invoke("pool_state"); } catch { return; }
+  renderPool();
+}
+
+let poolBusy = false;
+async function poolAct(op) {
+  if (poolBusy || !poolSnap) return;
+  const err = $("err-pool"), ok = $("ok-pool");
+  err.textContent = "";
+  ok.hidden = true;
+  try {
+    let r;
+    if (op === "swap") {
+      const amount = $("pool-amount").value.trim();
+      if (!(Number(amount) > 0)) throw t("pool.err.amount");
+      // 滑点保护交给链上重算：min_out=0 是明示的"接受任意成交价"，不假装有保护
+      r = await invoke("pool_swap", { dir: $("pool-dir").value, amount, minOut: 0 });
+    } else if (op === "add") {
+      const qlx = $("pool-qlx").value.trim(), dust = Math.round(Number($("pool-dust").value));
+      if (!(Number(qlx) > 0) || !(dust > 0)) throw t("pool.err.amount");
+      r = await invoke("pool_add", { qlx, dust });
+    } else {
+      const lp = poolSnap.my_lp || 0;
+      if (lp <= 0) throw t("pool.err.balance");
+      if (!confirm(t("pool.confirm.remove"))) return;
+      r = await invoke("pool_remove", { lp });
+    }
+    QLSfx.claim();
+    ok.hidden = false;
+    ok.textContent = t("pool.ok", {
+      op: t(`pool.op.${op}`), h: r.height, hash: String(r.tx_hash || "").slice(0, 12),
+    });
+    $("pool-amount").value = "";
+    $("pool-qlx").value = "";
+    $("pool-dust").value = "";
+    await loadWorld();
+  } catch (e) {
+    QLSfx.deny();
+    err.textContent = String(e);
+  }
+}
+$("btn-pool-swap").addEventListener("click", () => poolAct("swap"));
+$("btn-pool-add").addEventListener("click", () => poolAct("add"));
+$("btn-pool-remove").addEventListener("click", () => poolAct("remove"));
+$("pool-amount").addEventListener("input", renderPoolQuote);
+$("pool-dir").addEventListener("change", renderPoolQuote);
 
 const KIND_CANVAS = [];
 function kindCanvas(kind) {
@@ -798,6 +1142,15 @@ function renderStatus() {
     kept: cr.kept_blocks || 0,
     score: cr.score || 0,
   });
+  // 坏行只跳过它自己那一行，但界面上必须说得出跳了几行：静默少读几行等于
+  // 本机悄悄拿另一本账去参与共识（两本的条数都会进块承诺）。
+  const badEnt = s.entity_bad_lines || 0;
+  const badDust = s.dust_bad_lines || 0;
+  const badLine = badEnt + badDust
+    ? `<div class="ent-row"><div class="er-main">
+      <div class="er-n bad-inline">${t("world.status.ledgerbad", { ent: badEnt, dust: badDust })}</div>
+    </div></div>`
+    : "";
   $("world-pending").innerHTML = `
     <div class="ent-row"><div class="er-main">
       <div class="er-n">${t("world.status.quota", { used, max, win: s.free_quota_window })}</div>
@@ -811,8 +1164,32 @@ function renderStatus() {
       <div class="er-n">${t("world.status.pace")}</div>
       <div class="er-m">${pace}</div>
       <div class="er-m">${weight}</div>
-    </div></div>`;
+    </div></div>${badLine}`;
+  renderWorldFix();
 }
+
+// 旧世界账本（链被重置过）：旧账在新链上没有一条能通过重放，写入会被拒。
+// 出口只有归档——改名保留、不删除——而且必须由玩家自己按下去，不自动替他决定。
+function renderWorldFix() {
+  const s = worldSnap;
+  const show = !!(s && s.report && !s.report.ok && s.ledger_foreign);
+  for (const id of ["btn-world-archive", "world-fix-note"]) {
+    const el = $(id);
+    if (el) el.hidden = !show;
+  }
+}
+
+$("btn-world-archive").addEventListener("click", async () => {
+  if (!worldSnap || !worldSnap.ledger_foreign) return;
+  if (!confirm(t("world.fix.confirm"))) return;
+  try {
+    const r = await invoke("world_archive_ledger");
+    await loadWorld();
+    worldOk(t("world.fix.done", { files: (r.files || []).join(" · ") }));
+  } catch (e) {
+    worldErr(String(e));
+  }
+});
 
 async function loadWorld() {
   worldSnap = await invoke("world_snapshot");
@@ -820,8 +1197,13 @@ async function loadWorld() {
   // 3D 视图开着时必须同步实体表：写完的方块只进了 2D 面板的话，玩家会看到
   // 「坐标回执 + 一击火花」但币面上什么都没有，要关了重开才显形。
   if (w3) w3.setEntities(worldSnap.entities, worldSnap.address);
+  // 挖地账本（v5）与实体表同一条纪律：快照每 2 秒推一次，挖过的坑必须在币面上
+  // 当场变成坑，而不是等关了 3D 视图再开才看见。
+  if (w3) w3.setDug(worldSnap.dug || []);
+  renderGuide();
   await loadDust();
   await loadTrader();
+  await loadPool();
 }
 
 /** 免费写入的即时回执：签名即落账，不存在"等一个块"的第二阶段 */
@@ -1082,22 +1464,63 @@ function w3Name(slot, x, z, layer) {
   return `${t(`world.kind.${slot}`)}·${x}_${z}_${layer}`.slice(0, 40);
 }
 
-/** 出生点：以当前编辑框里的格子为圆心往外找一块不是水的陆地 */
+/** 出生点：不是"最近的一块陆地"，而是附近视野最好的一块干地。
+ *  第一眼决定别人会不会觉得被骗——站在低洼水边只能看见一堵黑墙，
+ *  站到高一点、前方有落差的位置，才有封面里那种峡谷与远山的构图。 */
 function pickSpawn(x, z) {
   const t = buildTerrain(worldSnap);
-  if (!t.blocks) return { x: 128, z: 128 };
-  const W = QLWorld.W, H = QLWorld.H;
-  const land = (cx, cz) => cx >= 0 && cz >= 0 && cx < W && cz < H && (t.blocks[cz * W + cx] & 7) !== 0;
-  if (land(x, z)) return { x, z };
-  for (let r = 1; r <= 60; r++) {
-    for (let d = 0; d < 8 * r; d++) {
-      const side = d % r, ring = (d / r) | 0;
-      const cx = ring === 0 ? x + r - side : ring === 1 ? x - r + side : ring === 2 ? x + r : x - r;
-      const cz = ring === 0 ? z - r : ring === 1 ? z + r : ring === 2 ? z + r - side : z - r + side;
-      if (land(cx, cz)) return { x: cx, z: cz };
+  if (!t.blocks || !t.heights) return { x: 128, z: 128 };
+  const W = QLWorld.W, H = QLWorld.H, seaLv = QLWorld.RULES.SEA >> 3;
+  const lvl = (cx, cz) => t.heights[cz * W + cx] >> 3;
+  const kindAt = (cx, cz) => t.blocks[cz * W + cx] & 7;
+  const water = (cx, cz) => kindAt(cx, cz) === 0;
+  const tree = (cx, cz) => (t.blocks[cz * W + cx] & 8) !== 0;
+  const at = (cx, cz) => [Math.min(W - 1, Math.max(0, cx)), Math.min(H - 1, Math.max(0, cz))];
+  const inside = (cx, cz) => cx > 6 && cz > 6 && cx < W - 7 && cz < H - 7;
+  let best = null, bestScore = -1e9;
+  for (let dz = -34; dz <= 34; dz += 2) for (let dx = -34; dx <= 34; dx += 2) {
+    const cx = Math.min(W - 7, Math.max(6, x + dx)), cz = Math.min(H - 7, Math.max(6, z + dz));
+    if (!inside(cx, cz) || water(cx, cz) || kindAt(cx, cz) === 2) continue; // 雪峰只长云杉、露出白石，出生在那种地方第一眼是堵墙
+    const lv = lvl(cx, cz);
+    if (lv < seaLv + 2) continue; // 水边低地只能看见一堵黑墙，站在岸上才看得下去
+    // 出生点不能落在树里：两格内有树干 = 睁眼就是一根柱子，树冠还会糊住整个上半屏
+    let woods = 0, buried = false;
+    for (let tz = -4; tz <= 4 && !buried; tz++) for (let tx = -4; tx <= 4; tx++) {
+      const nx = cx + tx, nz = cz + tz;
+      if (nx < 0 || nz < 0 || nx >= W || nz >= H || !tree(nx, nz)) continue;
+      if (Math.abs(tx) <= 2 && Math.abs(tz) <= 2) { buried = true; break; }
+      woods += 1;
+    }
+    if (buried) continue;
+    // 站的地方四周不能比脚下高：贴脸一堵坡，视野就没了（雪峰那种白石墙最糟）
+    let walls = 0;
+    for (let a = 0; a < 8; a++) {
+      const [nx, nz] = at(cx + Math.round(Math.cos((a * Math.PI) / 4) * 2), cz + Math.round(Math.sin((a * Math.PI) / 4) * 2));
+      walls += Math.max(0, lvl(nx, nz) - lv);
+    }
+    if (walls > 0) continue;
+    // 看八个方向：近处（5 格）和远处（12 格）各取一次落差——近处要有边才看得下去，
+    // 远处要有景才不空。看得到水面再加分。
+    let vista = 0, near = 0, face = { x: 0, z: 1 }, faceScore = -1e9;
+    for (let a = 0; a < 8; a++) {
+      const ux = Math.cos((a * Math.PI) / 4), uz = Math.sin((a * Math.PI) / 4);
+      const [n5x, n5z] = at(cx + Math.round(ux * 5), cz + Math.round(uz * 5));
+      const [n12x, n12z] = at(cx + Math.round(ux * 12), cz + Math.round(uz * 12));
+      const drop5 = Math.max(0, lv - lvl(n5x, n5z));
+      const drop12 = Math.max(0, lv - lvl(n12x, n12z));
+      vista += drop12;
+      if (water(n12x, n12z)) near += 1;
+      const s2 = drop5 * 1.6 + drop12 + (water(n12x, n12z) ? 2.4 : 0) + (water(n5x, n5z) ? 1.2 : 0);
+      if (s2 > faceScore) { faceScore = s2; face = { x: ux, z: uz }; }
+    }
+    const gentle = kindAt(cx, cz) === 5 ? 1.5 : 0;
+    const score = vista * 1.4 + near * 2.2 + (lv - seaLv) * 1.0 - Math.hypot(dx, dz) * 0.3 - woods * 2.5 + gentle;
+    if (score > bestScore) {
+      bestScore = score;
+      best = { x: cx, z: cz, yaw: Math.atan2(face.x, face.z) };
     }
   }
-  return { x, z };
+  return best || { x: 128, z: 128, yaw: 0.6 };
 }
 
 function ensureWorld3D() {
@@ -1108,13 +1531,37 @@ function ensureWorld3D() {
       onSlot: (i) => { wSlot = i; buildHotbar(); buildW3Hotbar(); if (w3) w3.setSlot(i); QLSfx.chop(); },
       onPlace: (x, z, layer) => w3Place(x, z, layer, wSlot),
       onBreak: (x, z, layer, ent) => w3Break(ent),
+      // 左键对准地形 = 挖掉露出来的那一层（签名进 v5 账本，材料当场进账）
+      onDig: (x, z, layer) => w3Dig(x, z, layer),
+      onDigBlocked: () => w3Toast(t("world3d.err.terrain"), true),
       // 左键对准资源 = 采（打树、撬石头、摘花），不拆地
       onHarvest: (x, z) => harvestNode(x, z),
       onBlocked: () => w3Toast(t("world3d.err.blocked"), true),
       onEmpty: () => w3Toast(t("world3d.err.notarget"), true),
       onSound: (on) => w3Toast(on ? t("world3d.sound.on") : t("world3d.sound.off")),
       onLock: (on) => { $("w3d-cross").classList.toggle("locked", on); w3Hint(); },
-      onFrame: (s) => { const n = performance.now(); if (n - w3HudAt > 120) { w3HudAt = n; renderW3Hud(s); } },
+      onFrame: (s) => {
+        if (w3three) {
+          try {
+            w3three.render(s);
+            // 第一张真画面已经画出来了，才把封面淡掉：先看到的是"同一片地方"，
+            // 不是先看到一块粗糙的替身。rAF 保证中间至少有完整一帧。
+            if (!w3VeilDone) {
+              w3VeilDone = true;
+              requestAnimationFrame(() => $("w3d-veil").classList.add("gone"));
+            }
+          } catch (e) {
+            console.warn('Three.js rendering stopped:', e);
+            $("w3d-three-canvas").hidden = true;
+            $("w3d-veil").classList.add("gone");
+            w3three = null;
+            w3Toast(`画质层已切回基础渲染：${String(e)}`, true);
+          }
+        }
+        const n = performance.now();
+        if (n - w3HudAt > 120) { w3HudAt = n; renderW3Hud(s); }
+        presenceTick(s);
+      },
       onClose: () => closeWorld3D(),
     });
   } catch (e) {
@@ -1134,11 +1581,21 @@ function syncWorld3D() {
   w3.setMaxLayer(worldSnap.max_layer || QLWorld3D.MAX_LAYER);
   w3.setColors(KIND_COLORS);
   w3.setEntities(worldSnap.entities, worldSnap.address);
+  w3.setDug(worldSnap.dug || []);
   w3.setResources(worldRes);
   w3.setSlots(worldSnap.slot_count || 16);
   w3.setTime(worldSnap.height || 0);
   w3.setSlot(wSlot);
+  if (w3three) w3three.setWorld(t.heights, t.blocks, worldSnap.entities, worldSnap.dug || [], worldRes);
   renderHeld();
+}
+
+/** 一件物件的造价（土/石/矿）：物品栏角标用它，挖地之前先知道要攒什么 */
+function costText(c) {
+  if (!c) return "";
+  const parts = [];
+  for (let i = 0; i < c.length; i++) if (c[i]) parts.push(`${c[i]}${t(`world.mat.${i}`)}`);
+  return parts.join(" ");
 }
 
 function buildW3Hotbar() {
@@ -1152,9 +1609,8 @@ function buildW3Hotbar() {
     b.type = "button";
     // 只有 1–9 与 0 是真实快捷键，第 11–16 格靠滚轮，别在角上标一个按不出的数字
     const keyLab = i < 9 ? String(i + 1) : i === 9 ? "0" : "";
-    b.title = keyLab
-      ? `${keyLab} · ${t(`world.kind.${i}`)}`
-      : t(`world.kind.${i}`);
+    const cost = costText(worldSnap && worldSnap.build_costs && worldSnap.build_costs[i]);
+    b.title = [keyLab, t(`world.kind.${i}`), cost].filter(Boolean).join(" · ");
     b.innerHTML = `<i class="kd" style="background-image:url('${KIND_ICON(i, 32)}')"></i><b class="hs-n">${esc(t(`world.kind.${i}`))}</b><em class="hs-k">${keyLab}</em>`;
     bar.appendChild(b);
   }
@@ -1172,7 +1628,12 @@ function renderW3Hud(s) {
   const ch = s0.chunks.find((k) => k.cx === (s.x >> 4) && k.cy === (s.z >> 4));
   const row = (k, v, cls = "") => `<div class="f3k">${k}</div><div class="f3v ${cls}">${v}</div>`;
   const pos = row(t("world3d.f3.pos"), `X ${s.x} · Y ${s.layer} · Z ${s.z}`);
-  const surf = row(t("world3d.f3.surface"), `${s.surface} · ${t(`world3d.biome.${s.block & 7}`)}`);
+  const surf = row(t("world3d.f3.surface"),
+    `${s.surface} · ${t(`world3d.biome.${s.block & 7}`)}` +
+    (s.dug ? ` · ${t("world3d.f3.top")} ${s.top} (−${s.dug})` : ""));
+  // 材料是建造的硬通货：挖地得来、造方块花掉。摆在 HUD 上，挖之前就知道够不够
+  const mats = (s0.materials || [0, 0, 0]).map((n, i) => `${n}${t(`world.mat.${i}`)}`).join(" · ");
+  const matRow = row(t("world3d.f3.mats"), mats, "gold");
   const tgt = row(t("world3d.f3.target"), tg
     ? `${tg.cx}, ${tg.layer}, ${tg.cz}` +
       (tg.node ? ` · ✦ ${t(`world.kind.${tg.node.kind}`)} +${fmtDust(tg.node.reward)}` : "") +
@@ -1185,7 +1646,7 @@ function renderW3Hud(s) {
   const chn = row(t("world3d.f3.chunk"), ch ? `${ch.count} · ${ch.root_hex.slice(0, 8)}…` : "0");
   const fp = row(t("world3d.f3.fp"), `<span class="mono gold">${terrain.fp}</span>`);
   const fps = row("FPS", `${s.fps}${s.locked ? "" : " · " + t("world3d.f3.unlocked")}`);
-  $("w3d-f3").innerHTML = [pos, surf, tgt, plc, slot, time, chn, fp, fps].join("");
+  $("w3d-f3").innerHTML = [pos, surf, matRow, tgt, plc, slot, time, chn, fp, fps].join("");
 }
 
 async function w3Place(x, z, layer, slot) {
@@ -1199,6 +1660,25 @@ async function w3Place(x, z, layer, slot) {
     QLSfx.place();
     if (w3) w3.burst(x, layer, z, slot);
     w3Toast(paidMsg(p));
+    await loadWorld();
+  } catch (e) {
+    w3Toast(String(e), true);
+  }
+  w3Busy = false;
+}
+
+async function w3Dig(x, z, layer) {
+  if (w3Busy) return;
+  if (!worldSnap || !worldSnap.unlocked) { w3Toast(t("world.err.locked"), true); return; }
+  w3Busy = true;
+  try {
+    // 只报坐标：挖哪一层由链上（地表层 − 已挖层数）算，前端说"挖第几层"不算数
+    const p = await invoke("world_dig", { x, y: z });
+    QLSfx.break();
+    if (w3) w3.digBurst(x, z, p.layer, p.kind);
+    w3Toast(t("world3d.ok.dig", {
+      x, z, y: p.layer, mat: t(`world.mat.${p.kind}`), top: p.top,
+    }));
     await loadWorld();
   } catch (e) {
     w3Toast(String(e), true);
@@ -1233,15 +1713,36 @@ async function openWorld3D() {
   }
   $("w3d").hidden = false;
   document.body.classList.add("w3d-on");
+  // 每次进世界都从封面开始：封面是这片地的黄昏，淡入后落在同一个地方
+  $("w3d-veil").classList.remove("gone");
+  w3VeilDone = false;
+  if (!w3three) {
+    try {
+      const { ThreeWorld } = await import('./world3d-three.js');
+      w3three = new ThreeWorld($("w3d-three-canvas"));
+      $("w3d-three-canvas").hidden = false;
+    } catch (e) {
+      $("w3d-three-canvas").hidden = true;
+      w3Toast(`画质层不可用，已切回基础渲染：${String(e)}`, true);
+    }
+  }
+  if (!w3three) $("w3d-veil").classList.add("gone");
   if (!ensureWorld3D()) { closeWorld3D(); return; }
   buildW3Hotbar();
   w3Hint();
   if (!w3Spawned) {
     const c = pickSpawn(Number($("ent-x").value) || 128, Number($("ent-z").value) || 128);
     w3.jumpTo(c.x, c.z, null);
+    // 面向这块地视野最开的方向：出生第一眼就要是"景"，不是一堵山壁
+    if (c.yaw != null) w3.setView(c.yaw, -0.05);
+    if (w3three) w3three.setSpawn(c.x, c.z);
     w3Spawned = true;
   }
+  syncWorld3D();
   w3.open();
+  // 第 1 步是导航事实：进过世界就记下来（不改账本）
+  if (!prefsCache.opened_world) setPref("opened_world", true).then(renderGuide);
+  renderFeedback();
 }
 
 function closeWorld3D() {
@@ -1249,6 +1750,9 @@ function closeWorld3D() {
   if (w3) w3.close();
   $("w3d").hidden = true;
   document.body.classList.remove("w3d-on");
+  $("w3d-pos").hidden = true;
+  $("w3d-share").hidden = true;
+  renderFeedback();
 }
 
 $("btn-w3d").addEventListener("click", openWorld3D);
@@ -1261,6 +1765,85 @@ $("w3d-hotbar").addEventListener("click", (e) => {
   buildW3Hotbar();
   if (w3) w3.setSlot(wSlot);
 });
+
+// —— 在场（§9.19）：只在内存与 gossip 里流动，不进账本、不进块、不换收益。
+// 位置按 POS_PUBLISH_MIN_MS 的速率地板节流；没解锁时后端会拒，静默即可。
+let posAt = 0;
+function presenceTick(s) {
+  const now = Date.now();
+  if (now - posAt < 1500) return;
+  posAt = now;
+  invoke("pos_publish", {
+    x: s.px, y: s.py, z: s.pz, heading: (s.yaw * 180) / Math.PI,
+  }).catch(() => {});
+}
+setInterval(async () => {
+  if (!w3 || !$("w3d") || $("w3d").hidden) return;
+  try {
+    const r = await invoke("world_presence");
+    if (w3) w3.setPeers(r.peers || []);
+    const n = r.count || 0;
+    const el = $("w3d-pos");
+    el.hidden = false;
+    el.textContent = n > 0 ? t("presence.tag", { n }) : t("presence.none");
+    el.title = t("presence.note");
+  } catch { /* 旧后端没有这个命令：不画人，也不报错 */ }
+}, 2000);
+
+// —— 作品分享：截图必须在这一帧里抓（缓冲不保留），抓不到就明说，不给一张透明图
+let shareShot = null;
+function currentShot() {
+  return new Promise((resolve) => {
+    if (!w3 || $("w3d").hidden) return resolve(null);
+    if (w3three) return resolve(w3three.snapshot());
+    let got = false;
+    w3.snapshot((u) => { got = true; resolve(u); });
+    setTimeout(() => { if (!got) resolve(null); }, 500);
+  });
+}
+
+$("w3d-shot").addEventListener("click", async () => {
+  const url = await currentShot();
+  if (!url) { w3Toast(t("share.need"), true); return; }
+  const s = w3.state();
+  shareShot = { url, s };
+  $("w3d-share-img").src = url;
+  $("w3d-share-meta").textContent = t("share.meta", {
+    x: s.px.toFixed(1), y: s.py.toFixed(1), z: s.pz.toFixed(1), layer: s.layer,
+  });
+  $("share-out").textContent = "";
+  $("w3d-share").hidden = false;
+});
+
+$("btn-share-save").addEventListener("click", async () => {
+  if (!shareShot) return;
+  const s = shareShot.s;
+  const caption = t("share.caption", {
+    x: Math.floor(s.px), z: Math.floor(s.pz), layer: s.layer, h: s.height,
+  });
+  try {
+    const p = await invoke("export_share", { imageDataUrl: shareShot.url, caption });
+    $("share-out").textContent = p ? t("share.saved", { path: p }) : t("share.cancel");
+  } catch (e) {
+    $("share-out").textContent = String(e);
+  }
+});
+
+$("btn-share-copy").addEventListener("click", async () => {
+  if (!shareShot) return;
+  const s = shareShot.s;
+  const line = t("share.meta", {
+    x: Math.floor(s.px), y: Math.floor(s.py), z: Math.floor(s.pz), layer: s.layer,
+  });
+  try {
+    await navigator.clipboard.writeText(line);
+    $("share-out").textContent = t("share.copied");
+  } catch (e) {
+    $("share-out").textContent = String(e);
+  }
+});
+
+$("btn-share-close").addEventListener("click", () => { $("w3d-share").hidden = true; });
 
 // ---------------------------------------------------------------- 出块事件（实时推送）
 
@@ -1308,4 +1891,4 @@ listen("chain_block", (ev) => {
   if (worldSnap && worldActive()) loadWorld().catch(() => {});
 });
 
-route().catch((e) => console.error(e));
+boot().catch((e) => console.error(e));

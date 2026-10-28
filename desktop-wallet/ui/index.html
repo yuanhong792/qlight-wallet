@@ -7,6 +7,43 @@
 </head>
 <body>
 
+<!-- ============ 欢迎页（每次启动第一眼：先给方向，再谈技术） ============ -->
+<div id="view-welcome" class="view auth hidden">
+  <div class="auth-card welcome-card">
+    <div class="gate-eyebrow">QLIGHT · THE LIVING WORLD</div>
+    <img src="assets/coin-face-reverse.png" width="72" height="72" alt="">
+    <h1 data-i18n="welcome.title">欢迎来到 QLight 世界</h1>
+    <p class="muted" data-i18n="welcome.sub">走进方块里、亲手盖出东西，就是这里挖矿的方式</p>
+
+    <div class="welcome-acts">
+      <button id="btn-w-world" class="btn-primary" data-i18n="welcome.world">进入世界</button>
+      <button id="btn-w-how" class="btn-ghost" data-i18n="welcome.how">如何游玩</button>
+      <button id="btn-w-wallet" class="btn-ghost" data-i18n="welcome.wallet">创建或恢复钱包</button>
+    </div>
+
+    <div class="welcome-how hidden" id="welcome-how">
+      <ol class="about-steps">
+        <li><span class="step-no">1</span><div><b data-i18n="welcome.h1t"></b><div class="muted small" data-i18n="welcome.h1"></div></div></li>
+        <li><span class="step-no">2</span><div><b data-i18n="welcome.h2t"></b><div class="muted small" data-i18n="welcome.h2"></div></div></li>
+        <li><span class="step-no">3</span><div><b data-i18n="welcome.h3t"></b><div class="muted small" data-i18n="welcome.h3"></div></div></li>
+        <li><span class="step-no">4</span><div><b data-i18n="welcome.h4t"></b><div class="muted small" data-i18n="welcome.h4"></div></div></li>
+      </ol>
+    </div>
+
+    <div class="welcome-net" id="welcome-net">
+      <span class="chip" id="welcome-net-tag">–</span>
+      <span class="muted small" data-i18n="welcome.net.note"></span>
+    </div>
+
+    <!-- 技术参数收在这里：想查的人查得到，第一次进来的人不会被吓到 -->
+    <details class="welcome-adv">
+      <summary data-i18n="welcome.adv">高级设置与技术参数</summary>
+      <dl class="f3" id="welcome-adv-list"></dl>
+      <div class="muted small" data-i18n="welcome.adv.note"></div>
+    </details>
+  </div>
+</div>
+
 <!-- ============ 创建钱包 ============ -->
 <div id="view-create" class="view auth hidden">
   <div class="auth-card">
@@ -18,6 +55,7 @@
     <button id="btn-create" class="btn-primary" data-i18n="create.btn">创建钱包</button>
     <button id="btn-restore-dat" class="btn-ghost" data-i18n="backup.restore">从 .dat 备份文件恢复</button>
     <p class="muted small" data-i18n="create.note">密码用于加密本机密钥库（Argon2id + AES-256-GCM），丢失即无法找回。</p>
+    <p class="muted small" data-i18n="create.rule">密码规则：≥ 8 位，不能是连续字符、全同字符或常见弱口令</p>
     <div class="error" id="err-create"></div>
     <div class="ok" id="ok-create" hidden></div>
   </div>
@@ -51,6 +89,7 @@
       <button class="sb-item" data-page="about" data-i18n="nav.about">ⓘ 关于</button>
     </nav>
     <div class="sb-bottom">
+      <button id="btn-main-gate" class="btn-ghost small">⌂ 返回开场</button>
       <span class="badge" data-i18n="nav.badge">模拟链 regtest</span>
       <select id="lang-select" class="lang-select" aria-label="Language"></select>
       <button id="btn-backup" class="btn-ghost small" data-i18n="backup.export">💾 备份钱包</button>
@@ -154,6 +193,17 @@
 
     <!-- 🌍 世界页（确定性渲染 + 实体编辑器） -->
     <section class="page hidden" id="page-world">
+      <!-- 首次任务引导：前 4 步里只有 2、3 是账本事实，1、4 是导航事实（口径见 app.js renderGuide） -->
+      <div class="panel guide" id="panel-guide">
+        <div class="panel-title">
+          <span data-i18n="guide.title">第一次游玩</span>
+          <span class="tag" id="guide-count">0 / 4</span>
+          <button type="button" id="btn-guide-hide" class="btn-ghost tiny" data-i18n="guide.hide">不再显示</button>
+        </div>
+        <ol class="guide-list" id="guide-list"></ol>
+        <div class="muted small" data-i18n="guide.note"></div>
+      </div>
+
       <div class="world-wrap">
         <div class="panel world-map-col">
           <div class="panel-title">
@@ -278,6 +328,8 @@
             <div class="muted small" id="world-ore-note"></div>
             <div class="error" id="err-world"></div>
             <div class="ok" id="ok-world" hidden></div>
+            <div class="muted small" id="world-fix-note" data-i18n="world.fix.note" hidden></div>
+            <button type="button" id="btn-world-archive" class="btn-ghost inline" data-i18n="world.fix.btn" hidden></button>
             <div class="muted small" data-i18n="world.editor.note"></div>
           </div>
 
@@ -347,6 +399,34 @@
         <div class="muted small" data-i18n="about.safe3"></div>
       </div>
 
+      <!-- 联机三态：把「现在几个人在一起」说清楚，别让玩家以为全网同服 -->
+      <div class="panel">
+        <div class="panel-title" data-i18n="netstate.title">我们和谁在同一个世界</div>
+        <ol class="netstate-list" id="netstate-list"></ol>
+        <div class="muted small" data-i18n="netstate.note"></div>
+      </div>
+
+      <!-- 反馈：本地导出，默认不带任何密钥材料；本版没有上传通道 -->
+      <div class="panel" id="panel-feedback">
+        <div class="panel-title">
+          <span data-i18n="fb.title">反馈问题</span>
+          <span class="tag">QL-FEEDBACK-v1</span>
+        </div>
+        <div class="muted small" data-i18n="fb.intro"></div>
+        <textarea id="fb-text" rows="3" maxlength="2000" data-i18n-ph="fb.ph" placeholder="发生了什么"></textarea>
+        <label class="fb-opt"><input type="checkbox" id="fb-shot"><span data-i18n="fb.shot"></span></label>
+        <label class="fb-opt"><input type="checkbox" id="fb-addr"><span data-i18n="fb.addr"></span></label>
+        <button id="btn-fb" class="btn-primary inline" data-i18n="fb.btn">导出反馈包</button>
+        <div class="error" id="err-fb"></div>
+        <div class="ok" id="ok-fb" hidden></div>
+        <details class="fb-peek">
+          <summary data-i18n="fb.peek">看看这份反馈会带走什么</summary>
+          <div class="muted small" data-i18n="fb.peek.note"></div>
+          <dl class="f3" id="fb-diag"></dl>
+        </details>
+        <div class="muted small" data-i18n="fb.privacy"></div>
+      </div>
+
       <div class="panel">
         <div class="panel-title" data-i18n="about.audit">账本可审计</div>
         <p class="muted small" data-i18n="about.auditline"></p>
@@ -357,12 +437,28 @@
     <!-- 第一人称体素编辑器：地形本地算，方块签了名才存在 -->
     <div id="w3d" class="w3d" hidden>
       <canvas id="w3d-canvas"></canvas>
+      <canvas id="w3d-three-canvas" aria-hidden="true"></canvas>
+      <div class="w3d-grade" aria-hidden="true"></div>
+      <div class="w3d-veil" id="w3d-veil" aria-hidden="true"></div>
       <div class="w3d-cross" id="w3d-cross"></div>
       <div class="w3d-held" id="w3d-held"></div>
       <dl class="w3d-f3" id="w3d-f3"></dl>
       <div class="hotbar w3d-hotbar" id="w3d-hotbar"></div>
       <div class="w3d-hint" id="w3d-hint"></div>
       <div class="w3d-toast" id="w3d-toast" hidden></div>
+      <!-- 在场人数：共识外的展示信息（不进账本、不换收益），口径见 app.js applyPresence -->
+      <div class="w3d-pos" id="w3d-pos" hidden>◦</div>
+      <button type="button" id="w3d-shot" class="w3d-exit w3d-shot" data-i18n="world3d.shot">📷 截图</button>
+      <div class="w3d-share" id="w3d-share" hidden>
+        <img id="w3d-share-img" alt="">
+        <div class="w3d-share-meta" id="w3d-share-meta"></div>
+        <div class="w3d-share-ops">
+          <button type="button" id="btn-share-save" class="btn-primary tiny" data-i18n="share.save">保存截图 + 坐标</button>
+          <button type="button" id="btn-share-copy" class="btn-ghost tiny" data-i18n="share.copy">复制坐标</button>
+          <button type="button" id="btn-share-close" class="btn-ghost tiny" data-i18n="share.close">关闭</button>
+        </div>
+        <div class="muted small" id="share-out"></div>
+      </div>
       <button type="button" id="w3d-exit" class="w3d-exit" data-i18n="world3d.exit">离开世界</button>
     </div>
   </main>
@@ -370,6 +466,8 @@
 
 <script src="i18n.js"></script>
 <script src="sprites.js"></script>
+<script src="qlight-hd-sprites.js"></script>
+<script src="terrain-tex.js"></script>
 <script src="sfx.js"></script>
 <script src="world.js"></script>
 <script src="world3d.js"></script>

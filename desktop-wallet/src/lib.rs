@@ -10,8 +10,10 @@
 
 pub mod commands;
 pub mod crypto;
+pub mod feedback;
 pub mod keystore;
 pub mod net;
+pub mod prefs;
 pub mod simchain;
 pub mod tx;
 pub mod world;
@@ -43,8 +45,34 @@ pub fn run() {
             let ledger_path = data_dir.join("ledger.json");
             let blocks_path = data_dir.join("blocks.jsonl");
             let entities_path = data_dir.join("entities.jsonl");
+            let prefs_path = data_dir.join("prefs.json");
+            // 偏好跟着账本走，不跟 webview 存储走：同机多开时 localStorage 是共享的，
+            // 而"这个钱包玩过没有"属于某一本账，不属于某个渲染进程。
+            let (prefs_init, prefs_warn) = prefs::load(&prefs_path);
+            if let Some(w) = prefs_warn {
+                eprintln!("[QLight] {w}");
+            }
             let chain =
                 simchain::SimChain::new(ledger_path.clone(), blocks_path.clone());
+
+            // 链被归档重置 = 换了一个世界：同目录下的实体/光尘账本记的是旧链的块高与
+            // 手续费交易，留在新链上会让每一次写入都判定「账本第 1 条起校验失败」。
+            // 与链一样只归档不删除，tag 相同，便于成对找回。
+            if let Some(tag) = chain.take_reset_tag() {
+                for name in ["entities.jsonl", "dust.jsonl"] {
+                    let from = data_dir.join(name);
+                    if !from.exists() {
+                        continue;
+                    }
+                    let to = data_dir.join(format!("{name}.bak-world-{tag}"));
+                    if std::fs::rename(&from, &to).is_ok() {
+                        eprintln!(
+                            "[QLight] 链已重置：旧世界的 {name} 已归档为 {}",
+                            to.display()
+                        );
+                    }
+                }
+            }
 
             // 解锁核心槽：AppState 与联邦网络共用同一个 Arc（锁定/解锁一处写两侧同步）
             let core_slot: Arc<RwLock<Option<Arc<keystore::WalletCore>>>> =
@@ -73,6 +101,8 @@ pub fn run() {
                 keystore_path,
                 ledger_path,
                 blocks_path,
+                prefs_path,
+                prefs: RwLock::new(prefs_init),
                 entities: entities.clone(),
                 dust,
                 chain: chain.clone(),
@@ -98,6 +128,8 @@ pub fn run() {
             commands::net_status,
             commands::app_version,
             commands::world_snapshot,
+            commands::world_archive_ledger,
+            commands::world_dig,
             commands::world_place,
             commands::world_rename,
             commands::world_move,
@@ -114,6 +146,13 @@ pub fn run() {
             commands::pool_add,
             commands::pool_remove,
             commands::pool_swap,
+            commands::pos_publish,
+            commands::world_presence,
+            commands::get_prefs,
+            commands::set_pref,
+            commands::diag_report,
+            commands::feedback_write,
+            commands::export_share,
         ])
         .run(tauri::generate_context!())
         .expect("QLight Wallet 启动失败");

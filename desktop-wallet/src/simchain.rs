@@ -93,6 +93,19 @@ pub fn version_floor_at(height: u64) -> u8 {
         BLOCK_V_LEGACY
     }
 }
+/// 本机共识规则指纹：出块域版本 ‖ 实体记录语义 ‖ 光尘语义。
+///
+/// 联邦公告（`NetMsg::Announce`）带上它。三项里任何一项不同，两端就互相验不过
+/// 对方的块与记录——而这种分歧在链上是**静默**的：各出各的块、各自都认为自己
+/// 那条才是链，连接层看不出任何异常。所以只能趁"还连得上"的时候把它说出口。
+pub fn rules_tag() -> String {
+    format!(
+        "b{}|{}|{}",
+        BLOCK_V,
+        crate::world::RECORD_VERSION,
+        crate::world::dust::DUST_RECORD_VERSION
+    )
+}
 /// 两次挖矿发行之间的最小间隔（块）。2 秒一块 → 约 100 秒一回合。
 ///
 /// 挖矿是"在世界里落一格别人可复算的坐标"，不是跑算法；这个间隔让脚本
@@ -865,6 +878,8 @@ pub struct SimChain {
     dust_store: Arc<std::sync::RwLock<Option<Arc<crate::world::dust::DustLedger>>>>,
     /// 启动哈希链校验失败置 true，禁出新块与收交易
     pub corrupted: Arc<Mutex<bool>>,
+    /// 本次启动是否归档重置过链；tag 供上层把同一代的 world 账本一起归档
+    reset_tag: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -924,6 +939,7 @@ impl SimChain {
             world: Arc::new(std::sync::RwLock::new(None)),
             dust_store: Arc::new(std::sync::RwLock::new(None)),
             corrupted: Arc::new(Mutex::new(false)),
+            reset_tag: Mutex::new(None),
         };
 
         // 上次进程中断可能残留 .tmp 半成品（无害但清理干净）
@@ -937,11 +953,20 @@ impl SimChain {
             eprintln!(
                 "[QLight] 提醒：blocks.jsonl 哈希链校验未通过（可能为旧格式或文件被改动），已归档并重启演示链"
             );
-            chain.archive_and_reset();
+            let tag = chain.archive_and_reset();
             chain.ensure_genesis_line();
+            *chain.reset_tag.lock().unwrap() = Some(tag);
         }
         chain.sync_chain_meta();
         Arc::new(chain)
+    }
+
+    /// 本次启动归档重置过链时返回归档 tag（只取一次）。
+    ///
+    /// 上层拿它把同一代的 world 账本（entities/dust）一起归档：链一重置，
+    /// 旧世界的签名记录就指向了不再存在的块，留着只会把新世界锁死。
+    pub fn take_reset_tag(&self) -> Option<String> {
+        self.reset_tag.lock().ok().and_then(|mut t| t.take())
     }
 
     /// 从 blocks.jsonl 重建"由链本身决定"的运行态：
@@ -1011,8 +1036,9 @@ impl SimChain {
         }
     }
 
-    /// 校验失败的账本文件归档（ledger/blocks → *.bak-epoch），并从新创世继续
-    fn archive_and_reset(&self) {
+    /// 校验失败的账本文件归档（ledger/blocks → *.bak-epoch），并从新创世继续。
+    /// 返回归档 tag，调用方用它给 world 账本打同一枚戳。
+    fn archive_and_reset(&self) -> String {
         let tag = now_unix().to_string();
         let _ = std::fs::rename(
             &self.blocks_path,
@@ -1024,6 +1050,7 @@ impl SimChain {
         );
         *self.ledger.lock().unwrap() = Ledger::default();
         *self.corrupted.lock().unwrap() = false;
+        tag
     }
 
     /// 重放校验：逐行读块头，重算块哈希并与记录比对；无 blocks 文件视为通过
@@ -1984,7 +2011,7 @@ impl SimChain {
             }
             let tip = l.dust_tips.get(&r.pk_hash_hex).cloned().unwrap_or_default();
             dust::check_record(r, &tip, h.height)?;
-            dust::apply_record(&mut l.dust, r)?;
+            dust::apply_record(&mut l.dust, r, h.height)?;
             l.dust_tips
                 .entry(r.pk_hash_hex.clone())
                 .or_default()
@@ -2609,7 +2636,7 @@ impl SimChain {
                 continue;
             }
             let mut trial = state.clone();
-            if crate::world::dust::apply_record(&mut trial, &r).is_err() {
+            if crate::world::dust::apply_record(&mut trial, &r, height_next).is_err() {
                 continue;
             }
             state = trial;
@@ -2819,6 +2846,31 @@ mod tests {
         greedy.reward_total = 1_000_000_000_000;
         greedy.miner = "ql1qqqattacker".to_string();
         assert!(!SimChain::verify_header_slice(&[greedy, one.clone()]));
+    }
+
+    /// 链被归档重置时把 tag 交给上层（同一枚戳给 world 账本归档用），且只交一次
+    #[test]
+    fn a_reset_chain_hands_out_its_archive_tag_once() {
+        let (dir, chain) = temp_chain("reset-tag");
+        assert!(chain.take_reset_tag().is_none(), "新链没有重置过");
+        drop(chain);
+
+        // 把链文件改成对不上的内容：启动自检必然失败 → 归档重置
+        std::fs::write(dir.join("blocks.jsonl"), "{\"height\":0,\"hash\":\"00\"}\n").unwrap();
+        std::fs::write(
+            dir.join("ledger.json"),
+            serde_json::to_string(&Ledger::default()).unwrap(),
+        )
+        .unwrap();
+        let chain = SimChain::new(dir.join("ledger.json"), dir.join("blocks.jsonl"));
+        let tag = chain
+            .take_reset_tag()
+            .expect("校验失败必须给出归档 tag");
+        assert!(dir.join(format!("blocks.jsonl.bak-{tag}")).exists());
+        assert!(dir.join(format!("ledger.json.bak-{tag}")).exists());
+        assert!(chain.take_reset_tag().is_none(), "tag 只能取一次");
+        assert_eq!(chain.height(), 0, "重置后从新创世继续");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 新建链的 blocks.jsonl 第 0 行就是创世块（"创世是否启动"落盘可查）

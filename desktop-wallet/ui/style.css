@@ -111,6 +111,20 @@ body {
   background: linear-gradient(180deg, #FFF7DF, #FBEFD0);
   font-weight: 600;
 }
+/* 联邦版本分歧：邻居的共识规则与本机不同 = 块高过激活线后会各自出块、静默分叉，
+   这是唯一能看见它的地方，所以要用告警色而不是悄悄记在日志里 */
+#net-chip.warn {
+  color: #8E1B1B; border-color: rgba(200,60,60,.6);
+  background: linear-gradient(180deg, #FFE6E6, #FFD4D4);
+  font-weight: 600;
+}
+/* 版本不齐（规则指纹相同）：可能是分叉，也可能只是补丁差异，所以用虚线金边、
+   与「规则分歧」的实线红区分开——断言强度不一样，颜色也不该一样 */
+#net-chip.odd {
+  color: #6A4B12; border-color: rgba(227,181,74,.8); border-style: dashed;
+  background: linear-gradient(180deg, #FFFBEF, #FDF3DC);
+  font-weight: 600;
+}
 .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px;
   background: var(--green); box-shadow: 0 0 6px rgba(52,168,83,.7); animation: pulse 2s infinite; }
 @keyframes pulse { 50% { opacity: .4; } }
@@ -430,6 +444,22 @@ body {
 .w3d { position: fixed; inset: 0; z-index: 80; background: #0B0F16; }
 .w3d[hidden] { display: none; }
 #w3d-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+#w3d-three-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; background: #0B0F16; }
+#w3d-three-canvas[hidden] { display: none; }
+/* 进世界的门：封面本身也是这片地（黄昏），第一帧真画面出来后再淡掉 */
+.w3d-veil {
+  position: absolute; inset: 0; z-index: 2; pointer-events: none; opacity: 1;
+  background: radial-gradient(ellipse at 64% 46%, rgba(3, 9, 24, 0) 28%, rgba(3, 9, 24, .42) 100%),
+              url("assets/world-gate-v1.png") center center / cover no-repeat;
+  transition: opacity 1.1s ease;
+}
+.w3d-veil.gone { opacity: 0; }
+/* 电影感只加这一层：暗角收边 + 地平线以下压一点暖，画面就有"取景"而不是"截图" */
+.w3d-grade {
+  position: absolute; inset: 0; z-index: 1; pointer-events: none;
+  background: radial-gradient(ellipse at 50% 46%, transparent 46%, rgba(4, 8, 18, .38) 100%),
+              linear-gradient(0deg, rgba(28, 16, 8, .22), transparent 34%);
+}
 
 .w3d-cross { position: absolute; left: 50%; top: 50%; width: 20px; height: 20px; transform: translate(-50%,-50%); pointer-events: none; opacity: .75; }
 .w3d-cross::before, .w3d-cross::after { content: ""; position: absolute; background: #FFFFFF; box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
@@ -491,3 +521,196 @@ body {
 }
 .w3d-exit:hover { border-color: var(--gold); color: var(--gold-lt); }
 @media (max-width: 780px) { .w3d-f3 { font-size: 10px; } .w3d-hint { font-size: 10px; } }
+
+/* ---------- 欢迎页（第一轮外壳：先给方向，技术参数收进高级设置） ---------- */
+.welcome-card { width: 460px; }
+.welcome-acts { display: flex; flex-direction: column; gap: 8px; margin-top: 18px; }
+.welcome-acts .btn-primary { margin-top: 0; }
+.welcome-how { text-align: left; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.welcome-net { margin-top: 16px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.welcome-never { display: flex; align-items: center; gap: 7px; margin-top: 14px; font-size: 12.5px; color: var(--muted); }
+.welcome-never input { accent-color: var(--gold); }
+.welcome-adv { margin-top: 14px; text-align: left; font-size: 12.5px; }
+.welcome-adv summary { cursor: pointer; color: var(--muted); padding: 4px 0; user-select: none; }
+.welcome-adv[open] summary { color: var(--ink); }
+
+/* ---------- 首次任务引导 ---------- */
+.guide { border-color: rgba(227,181,74,.45); background: linear-gradient(180deg, #FFFDF6, var(--card) 60%); }
+.guide-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
+.guide-list li { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
+.gd-mark { width: 18px; flex: none; text-align: center; color: var(--muted); font-weight: 700; }
+li.done .gd-mark { color: var(--green); }
+li.done .gd-text { color: var(--muted); text-decoration: line-through; }
+.gd-kind { font-size: 10px; border-radius: 8px; padding: 1px 6px; border: 1px solid var(--line); color: var(--muted); background: #F3F5F8; }
+.gd-kind.ledger { background: #EEF7EF; border-color: rgba(52,168,83,.35); color: #1F6B36; }
+.gd-go { margin-left: auto; padding: 4px 10px; font-size: 11.5px; }
+#btn-guide-hide { margin-left: auto; padding: 3px 9px; }
+.btn-ghost.tiny, .btn-primary.tiny { width: auto; margin: 0; padding: 8px 14px; font-size: 12.5px; }
+
+/* ---------- 联机三态 ---------- */
+.netstate-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.netstate-list li { display: flex; gap: 10px; align-items: baseline; }
+.ns-mark { width: 16px; flex: none; text-align: center; }
+.netstate-list li.on { color: var(--ink); font-weight: 600; }
+.netstate-list li.off { color: var(--muted); }
+.netstate-list li.todo { color: var(--muted); font-style: italic; }
+
+/* ---------- 反馈 ---------- */
+#panel-feedback textarea {
+  width: 100%; margin-top: 10px; padding: 10px 12px; resize: vertical;
+  background: #FAFBFC; color: var(--ink); border: 1px solid var(--line); border-radius: 10px;
+  font-size: 13px; font-family: inherit; outline: none; user-select: text;
+}
+#panel-feedback textarea:focus { border-color: var(--gold); box-shadow: 0 0 0 3px rgba(227,181,74,.15); }
+.fb-opt { display: flex; align-items: center; gap: 7px; margin-top: 8px; font-size: 12.5px; color: #3A4456; }
+.fb-opt input { accent-color: var(--gold); }
+.fb-peek { margin-top: 12px; font-size: 12.5px; }
+.fb-peek summary { cursor: pointer; color: var(--muted); user-select: none; }
+
+/* ---------- 第一人称：在场人数 + 分享卡 ---------- */
+.w3d-pos {
+  position: absolute; right: 14px; top: 52px; padding: 6px 12px; border-radius: 999px;
+  font-size: 12px; color: #C7D0DE; background: rgba(10,14,20,.55); border: 1px solid rgba(255,255,255,.16);
+}
+.w3d-pos[hidden] { display: none; }
+.w3d-shot { right: 14px; top: 96px; }
+.w3d-share {
+  position: absolute; right: 14px; top: 140px; width: 300px; padding: 12px;
+  background: rgba(10,14,20,.86); border: 1px solid rgba(255,255,255,.18); border-radius: 14px;
+  color: #E6EAF2; font-size: 12px;
+}
+.w3d-share[hidden] { display: none; }
+.w3d-share img { width: 100%; border-radius: 8px; display: block; }
+.w3d-share-meta { margin-top: 8px; font-family: "SF Mono", Menlo, monospace; font-size: 11px; color: #93A0B4; word-break: break-all; }
+.w3d-share-ops { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.w3d-share .muted { color: #93A0B4; }
+
+/* ---------- 游戏开场与世界终端：只改展示层，钱包命令与表单结构保持原样 ---------- */
+:root {
+  --bg: #081325;
+  --card: rgba(11, 23, 43, .84);
+  --ink: #f4f2e9;
+  --muted: #a9b9cb;
+  --line: rgba(195, 218, 246, .17);
+  --gold: #eac477;
+  --gold-lt: #fff1bf;
+  --gold-dk: #c7994a;
+}
+body { background: #081325; }
+.view.auth {
+  position: relative;
+  justify-content: flex-start;
+  background: linear-gradient(90deg, rgba(3, 10, 25, .88) 0%, rgba(5, 13, 31, .54) 34%, rgba(6, 16, 35, .08) 68%),
+              linear-gradient(0deg, rgba(3, 10, 24, .58), transparent 42%),
+              url("assets/world-gate-v1.png") center center / cover no-repeat;
+}
+.view.auth::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse at 72% 42%, transparent 35%, rgba(3, 9, 24, .22) 100%);
+}
+.auth-card {
+  position: relative; z-index: 1;
+  margin-left: clamp(26px, 6vw, 92px);
+  width: min(440px, calc(100vw - 52px));
+  padding: 30px 32px;
+  color: #f4f2e9;
+  background: rgba(7, 19, 39, .77);
+  border: 1px solid rgba(232, 206, 151, .22);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .34), inset 0 1px 0 rgba(255, 255, 255, .08);
+  backdrop-filter: blur(14px);
+}
+.auth-card h1 { color: #fff3d7; }
+.auth-card .muted { color: #bcc9d7; }
+.auth-card input { background: rgba(4, 13, 29, .8); border-color: rgba(201, 218, 236, .22); color: #fff; }
+.auth-card input::placeholder { color: #94a6bb; }
+.auth-card .btn-ghost { background: rgba(7, 20, 43, .44); color: #dce9f4; border-color: rgba(215, 230, 246, .25); }
+.auth-card .btn-ghost:hover { border-color: #efce89; color: #fff2d8; background: rgba(24, 42, 64, .75); }
+.welcome-card {
+  width: min(455px, calc(100vw - 52px));
+  text-align: left;
+  margin-left: clamp(35px, 7vw, 108px);
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.gate-eyebrow { color: #e8c687; letter-spacing: .26em; font: 700 11px/1.4 "SF Mono", Menlo, monospace; }
+.welcome-card > img { width: 70px; height: 70px; margin: 22px 0 11px; filter: drop-shadow(0 0 22px rgba(240, 194, 100, .45)); }
+.welcome-card h1 { font-size: clamp(32px, 3.8vw, 48px); line-height: 1.14; letter-spacing: -.04em; margin: 4px 0 14px; text-shadow: 0 4px 25px rgba(0,0,0,.66); }
+.welcome-card > p { font-size: 14px; line-height: 1.7; max-width: 33em; text-shadow: 0 2px 10px rgba(0,0,0,.8); }
+.welcome-acts { margin-top: 38px; gap: 3px; max-width: 365px; }
+.welcome-acts button {
+  width: 100%; min-height: 49px; text-align: left; padding: 0 10px 0 20px;
+  font-size: 16px; letter-spacing: .06em; border-radius: 0;
+  background: transparent; border: 0; border-left: 2px solid transparent;
+  color: #eef3f8; box-shadow: none;
+  text-shadow: 0 2px 14px rgba(0,0,0,.8);
+}
+.welcome-acts .btn-primary {
+  color: #ffdf9b; background: linear-gradient(90deg, rgba(235, 185, 90, .2), transparent 88%);
+  border-left-color: #f1c36c; box-shadow: none;
+}
+.welcome-acts button:hover { color: #fff2d5; background: linear-gradient(90deg, rgba(235, 185, 90, .17), transparent 90%); filter: none; }
+.welcome-acts .btn-ghost::after { content: "›"; float: right; font-size: 24px; line-height: 22px; color: #d5bd89; }
+.welcome-net { margin-top: 32px; padding-top: 14px; border-top: 1px solid rgba(210,224,242,.22); max-width: 365px; }
+.welcome-adv { margin-top: 13px; }
+.welcome-adv summary { color: #97aabe; }
+.welcome-how { border-top-color: rgba(210,224,242,.19); }
+
+.view.shell {
+  background: linear-gradient(90deg, rgba(5, 15, 34, .94), rgba(5, 16, 35, .7)),
+              url("assets/world-gate-v1.png") center center / cover fixed no-repeat;
+}
+.sidebar {
+  width: 206px;
+  background: rgba(5, 15, 33, .84);
+  border-right: 1px solid rgba(224, 201, 145, .24);
+  box-shadow: 8px 0 34px rgba(0,0,0,.17);
+  backdrop-filter: blur(15px);
+}
+.sb-brand { padding: 6px 7px 24px; border-bottom: 1px solid rgba(220,228,242,.15); }
+.sb-brand b { color: #fff4d7; font-size: 19px; letter-spacing: .13em; }
+.sb-sub { color: #c3b58f; letter-spacing: .09em; }
+.sb-nav { gap: 8px; }
+.sb-item { color: #b7c6d9; font-size: 13px; letter-spacing: .07em; border: 1px solid transparent; }
+.sb-item:hover { color: #fff2d9; background: rgba(255,255,255,.08); }
+.sb-item.active { color: #fff0c7; border: 1px solid rgba(239, 201, 126, .4); background: linear-gradient(90deg, rgba(221, 170, 82, .27), rgba(218, 168, 79, .05)); box-shadow: inset 3px 0 #efc778; }
+.sb-bottom { border-top: 1px solid rgba(220,228,242,.15); padding-top: 15px; }
+.sb-bottom .btn-ghost { width: 100%; text-align: left; background: rgba(255,255,255,.035); color: #c3d1df; }
+.badge { background: rgba(221, 177, 94, .13); color: #f0d59d; }
+.lang-select { background: rgba(9, 24, 46, .9); color: #d4dfec; }
+.content { background: transparent; padding: 0 28px 45px; }
+.netbar { background: linear-gradient(180deg, rgba(5, 16, 36, .98) 70%, rgba(5, 16, 36, 0)); }
+.chip { background: rgba(10, 25, 46, .78); color: #c6d3e1; }
+.chip b, .addr-mini { color: #f3e6c6; }
+.panel, .asset-row { background: rgba(9, 24, 44, .84); border-color: rgba(197, 215, 237, .18); box-shadow: 0 13px 38px rgba(0, 0, 0, .17); backdrop-filter: blur(12px); }
+.panel-title { color: #e4c98e; font-weight: 700; text-transform: uppercase; letter-spacing: .12em; }
+.hero {
+  min-height: 226px;
+  background: linear-gradient(90deg, rgba(8, 20, 42, .96), rgba(8, 20, 42, .62) 58%, rgba(8, 20, 42, .18)),
+              url("assets/world-gate-v1.png") center 52% / cover no-repeat;
+  border-color: rgba(233, 194, 115, .42); box-shadow: 0 22px 50px rgba(0,0,0,.2);
+}
+.hero-label, .hero-frac { color: #e5c88c; }
+.hero-num { color: #fff3d3; text-shadow: 0 4px 20px rgba(0,0,0,.45); }
+.q-btn, .hs, .panel input[type=text], .panel input[type=number], .w-select, #panel-feedback textarea, .addr-full, .vrf-log {
+  background: rgba(5, 16, 34, .64); border-color: rgba(196, 214, 236, .2); color: #f1f4f7;
+}
+.q-btn:hover, .hs:hover { background: rgba(29, 48, 70, .84); color: #fff0cc; }
+.hs.active, .ent-row.active { background: rgba(221, 177, 94, .18); }
+.hs .hs-n, .f3v, .world-cursor, .addr-full, .proof, .vrf-log, .trader-result .ts-line { color: #dce5ef; }
+.tag, .gd-kind, .gd-kind.ledger { background: rgba(226, 184, 100, .13); color: #eed49d; }
+.mine-card, .trader-result, .guide { background: rgba(12, 28, 49, .86); color: #e6edf4; }
+.mine-card .gold, .trader-result .ts-line b { color: #f0d397; }
+.es-btn { background: rgba(219, 176, 89, .14); color: #f0d397; }
+.proof { background: rgba(3, 13, 29, .65); }
+.how-list li, .fb-opt { color: #cbd8e5; }
+.ent-row:hover, .trader-offer:hover:not(:disabled) { background: rgba(255,255,255,.06); }
+.trader-result { border-color: rgba(232,199,126,.28); }
+@media (max-width: 860px) {
+  .sidebar { width: 178px; padding: 18px 9px; }
+  .content { padding-left: 16px; padding-right: 16px; }
+  .hero { flex-wrap: wrap; }
+}

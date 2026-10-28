@@ -9,7 +9,8 @@
  *   2. 同一 (x, z, layer) 只能有一个活着的方块 → 所以本文件也只在被算成空的体素上高亮放置框
  *   3. 已释放归属的实体不显形、不占格（断租不删除：记录永久可查，但空间重新可造）
  *
- * 地形不能被挖：它不是数据，是 `render(种子, 规则, 历史)` 算出来的Nature。
+ * 地形可以挖，但**挖这件事本身要签名**：每铲掉一层落一条 `op=dig` 记录（v5 账本），
+ * 坐标、层号、材料都由链上重放判定。像素仍然在本地算：链只记"这一列被挖掉了几层"。
  */
 (function (global) {
   'use strict';
@@ -46,6 +47,15 @@
   var ERA_GOLD = [248, 216, 104];
   var BLOCK_SHADE = 0.94;       // 签出来的方块：与地形同色相但略微收边，看得出是"人造的"
 
+  // —— 挖地（实体账本 v5 = QL-ENTREC-v5）：全部与 src/world.rs 同一口径 ——
+  //    地表层 = 原始高度场 >> 3；挖掉一层，这一列露出的顶面就降一层；挖到 DUG_FLOOR 见底。
+  //    材料只按"离原始地表多深"分带：0–3 层是土、4–9 层是石、10 层往下是矿。
+  //    这三个数一旦与 Rust 侧不同，客户端显示的"下一铲会出什么"就会撒谎。
+  var DUG_FLOOR = 1, DUG_SOIL_DEPTH = 3, DUG_STONE_DEPTH = 9;
+  // 地形贴图槽位（图集 22..37，物品栏永远不占）。terrain-tex.js 负责画进去；
+  // 用户的地形贴图包可以整组替换这些槽位，本文件只认槽位号。
+  var TIL = (global.QLSprites && global.QLSprites.TERRAIN) || null;
+
   // 面的朝向（外法线）常量——quad() 靠它决定顶点序，见下方 quad 的注释
   var N_UP = [0, 1, 0], N_DOWN = [0, -1, 0], N_N = [0, 0, -1], N_S = [0, 0, 1], N_E = [1, 0, 0], N_W = [-1, 0, 0];
 
@@ -57,7 +67,7 @@
     'uniform vec4 u_tint;uniform vec3 u_fog;uniform vec2 u_fog_r;' +
     'void main(){float f=clamp((v_d-u_fog_r.x)/(u_fog_r.y-u_fog_r.x),0.0,1.0);f*=f;' +
     'float h=fract(sin(dot(floor(v_w*8.0),vec3(12.9898,78.233,37.719)))*43758.5453);' +
-    'vec3 base=v_c*(0.92+0.08*h);' +
+    'vec3 base=v_c*(0.85+0.16*h);' +
     'gl_FragColor=vec4(mix(base*u_tint.rgb,u_fog,f),1.0);}';
 
   // 贴图管线：像素图集 + alpha 裁剪（树叶/花/活物不需要混合排序，直接 discard）
@@ -122,10 +132,15 @@
 
   // 出块显形层的节奏：砖 2.4 秒落进矿格，符文雨 5.2 秒流完；同屏最多 8 条，写满就挤掉最老的
   var FX_MINT_MS = 2400, FX_RAIN_MS = 5200, FX_CAP = 8, FX_PX = 0.075;
+  // 在场邻居最多画这么多个人：铸块砖与数字雨共用同一条缓冲，人不能把动画挤出去
+  var POS_DRAW_MAX = 16;
 
   function World3D(canvas, hooks) {
     var gl = canvas.getContext('webgl', { antialias: false, alpha: false });
     if (!gl) { hooks.onUnsupported && hooks.onUnsupported(); return null; }
+    // 地形已经不是纯色块了：没有地形图集就等于没有世界。宁可当场报错，也不要
+    // 让人对着一个空天空以为链坏了。
+    if (!TIL) throw new Error('world3d: 地形图集未加载（terrain-tex.js 必须排在 world3d.js 之前）');
 
     var prog = gl.createProgram(), progT = gl.createProgram();
     function shader(prog, type, src) {
@@ -172,9 +187,9 @@
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
     }
 
-
     var st = {
       heights: null, blocks: null, entities: [], byCell: {}, address: '', entSig: '',
+      peers: [], wantShot: null,
       slot: 0, slots: 16, colors: [], maxLayer: MAX_LAYER,
       x: 128.5, z: 128.5, y: 30, yaw: 0.6, pitch: -0.45,
       keys: {}, dirty: true, regionKey: '', target: null, locked: false, drag: false,
@@ -182,15 +197,19 @@
       bob: 0, bobPhase: 0, stepMark: 0, parts: [], entAt: 0,
       // 资源层（QL-RES-v1）：长在地上的树/石/花，采伐记录才进光尘账本
       res: null, resMap: null, resSig: '',
-      bufT: gl.createBuffer(), nT: 0, bufE: gl.createBuffer(), nE: 0, bufH: gl.createBuffer(), nH: 0,      bufP: gl.createBuffer(), nP: 0, bufS: gl.createBuffer(), nS: 0, bufStar: gl.createBuffer(), nStar: 0,
+      // 挖地账本（v5）：cellKey → 已挖掉的层数。挖出来的坑是"少了一层"的同一片地形，
+      // 不是另画一份几何——所以 level()/solid()/support() 读它，坑壁由地形自己长出来。
+      dugMap: {}, dugSig: '',
+      bufG: gl.createBuffer(), nG: 0,
+      bufE: gl.createBuffer(), nE: 0, bufH: gl.createBuffer(), nH: 0,      bufP: gl.createBuffer(), nP: 0, bufS: gl.createBuffer(), nS: 0, bufStar: gl.createBuffer(), nStar: 0,
       // 资源层单独一条缓冲：采伐后只重铺这一层，不动 16 种签名的实体网格
       bufR: gl.createBuffer(), nR: 0,
       // 铸块砖 + QLOR 数字雨：只有这一层自己的缓冲。出块的动画不该重铺 64×64 地形。
       bufF: gl.createBuffer(), nF: 0, fx: [],
-      // 缓冲区按 12 面/格预算（平均只有约 2.4 面：树只占林地的 ~12%）。
-      // 真写满了 quad() 会直接停笔——最坏结果是区域最后几行（雾里那几格）缺面，
-      // 不会越界写坏内存，也不会影响任何一条链上判定。
-      arrT: new Float32Array(REGION * REGION * 12 * 6 * 6),
+      // 地形贴图缓冲：容量由这一帧的真实面数决定（见 countQuads）。固定"每格 16 面"
+      // 的预算在十层深的坑角会被用完，tquad 停笔的后果是坑壁缺一块——正是玩家说的"洞里"。
+      // 这里按需分配、只增不减，平地仍只有每格 1~5 面，深坑才付它该付的内存。
+      arrG: new Float32Array(REGION * REGION * 4 * 36),
       arrE: new Float32Array(2048 * 36 * 6),
       // 资源格按 64×64 区域全铺满留余量：树 432 浮点/格，写满即停笔（与 quad 同纪律）
       arrR: new Float32Array(REGION * REGION * 160),
@@ -204,12 +223,25 @@
     };
 
     // —— 只读的地形/体素查询（全部来自 QLWorld.render() 那一趟循环的产物）
-    function level(cx, cz) {
+    /** 原始地表层：高度场 >> 3。它只由创世种子决定，挖多少层都不会变——挖坑的深度基准。 */
+    function surf(cx, cz) {
       if (cx < 0 || cz < 0 || cx >= W || cz >= H) return -1;
       return st.heights[cz * W + cx] >> LEVEL_SHIFT;
     }
+    function removedAt(cx, cz) {
+      var r = st.dugMap[cellKey(cx, cz)];
+      return r || 0;
+    }
+    /** 这一列**现在**露出来的顶面层：原始地表被挖掉几层就降几层，硬底见 DUG_FLOOR */
+    function level(cx, cz) {
+      var s = surf(cx, cz);
+      if (s < 0) return -1;
+      var r = removedAt(cx, cz);
+      if (!r) return s;
+      var top = s - r;
+      return top < DUG_FLOOR ? (s < DUG_FLOOR ? s : DUG_FLOOR) : top;
+    }
     function blk(cx, cz) { return st.blocks[cz * W + cx]; }
-    function baseColor(b) { return (b & 16) ? ERA_GOLD : (PAL[b & 7] || PAL[5]); }
     function cellKey(cx, cz) { return cx * H + cz; }
     function inColumn(cx, cz) { return st.byCell[cellKey(cx, cz)] || []; }
     function blockAt(cx, cz, layer) {
@@ -217,11 +249,13 @@
       for (var i = 0; i < list.length; i++) if (list[i].layer === layer) return list[i];
       return null;
     }
-    /** 该格该层长的资源（树干/石头/花都算地表那一层）：被采走的不再命中 */
+    /** 该格该层长的资源（树干/石头/花都算地表那一层）：被采走的不再命中。
+     *  被挖过的地表上不再有地表资源——树根/花畦跟着那一层土一起没了。 */
     function resAt(cx, cy, cz) {
       if (!st.resMap) return null;
       var n = st.resMap[cellKey(cx, cz)];
       if (!n || n.taken) return null;
+      if (removedAt(cx, cz)) return null;
       return cy === level(cx, cz) ? n : null;
     }
     /** 该列最高实心顶面：地形顶面与所有活方块取最大——自己叠的塔，自己踩得住 */
@@ -239,6 +273,36 @@
       if (cy < 0 || cx < 0 || cz < 0 || cx >= W || cz >= H) return true;
       if (cy <= level(cx, cz)) return true;
       return !!blockAt(cx, cz, cy);
+    }
+
+    // —— 地形贴图选择：地表按生态，地下按"离原始地表多深"的同一个三带划分 ——
+    // 挖坑之后露出来的顶面/坑壁因此自动换成泥土、石、矿：你挖多深，世界就变多深，
+    // 而不是在草皮下面贴一张"土色的皮"。深度用原始地表（surf）算，不是用当前顶面。
+    function deepTile(cx, cz, depth) {
+      if (depth <= DUG_SOIL_DEPTH) return TIL.DIRT;
+      if (depth <= DUG_STONE_DEPTH) return TIL.STONE;
+      // 矿带：石头里按格子哈希撒矿脉（共识只认"这一带是矿"，具体哪种是外观）
+      var h = (Math.imul(cx + 17, 73856093) ^ Math.imul(cz + 31, 19349663) ^ Math.imul(depth + 7, 83492791)) >>> 0;
+      var r = h % 12;
+      return r < 2 ? TIL.ORE_GOLD : r < 4 ? TIL.ORE_IRON : r < 5 ? TIL.ORE_CRYSTAL : TIL.DEEP;
+    }
+    function topTile(cx, cz, kind, depth) {
+      if (kind === 0) return TIL.WATER;                       // 水柱：挖不动，永远是水面
+      if (depth === 0) {
+        return kind === 2 ? TIL.SNOW_TOP
+          : (kind === 1 || kind === 4) ? TIL.SAND
+            : TIL.GRASS_TOP;
+      }
+      return deepTile(cx, cz, depth);
+    }
+    function sideTile(cx, cz, kind, depth) {
+      if (kind === 0) return TIL.WATER;
+      if (depth === 0) {
+        if (kind === 2) return TIL.SNOW_SIDE;
+        if (kind === 1 || kind === 4) return TIL.SAND;
+        return TIL.GRASS_SIDE;
+      }
+      return deepTile(cx, cz, depth);
     }
 
     // —— 顶点写入（pos3 + color3 交错）；越界立即停笔，绝不越写缓冲区
@@ -272,6 +336,13 @@
       quad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], c, 0.65, N_W);      // 西 -x
     }
 
+    /** 一格某一面的四个角：k = 0 北 / 1 南 / 2 东 / 3 西，从 ya 到 yb。地形侧壁按"草皮 + 土壁"分两段画。 */
+    function sface(cx, cz, k, ya, yb) {
+      return k === 0 ? [cx, ya, cz, cx + 1, ya, cz, cx + 1, yb, cz, cx, yb, cz]
+        : k === 1 ? [cx + 1, ya, cz + 1, cx, ya, cz + 1, cx, yb, cz + 1, cx + 1, yb, cz + 1]
+          : k === 2 ? [cx + 1, ya, cz + 1, cx + 1, ya, cz, cx + 1, yb, cz, cx + 1, yb, cz + 1]
+            : [cx, ya, cz, cx, ya, cz + 1, cx, yb, cz + 1, cx, yb, cz];
+    }
     // —— 贴图顶点写入：pos3 + uv2 + shade1（stride 24，和颜色管线同宽）
     var COLS = 8, ROWS = 8, UV_E = 0.03;
     var tarr = null, tvp = 0;
@@ -314,46 +385,74 @@
       tquad([a, y0, d, c, y0, b, c, y0 + h, b, a, y0 + h, d], tile, 0.9, N_E);
     }
 
-    function upload(buf, count) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, vp), gl.DYNAMIC_DRAW);
-      return count / 6;
-    }
+    // 天然树的材质：与实体树共用图集里的树干/树叶两格（同一张画，不另起一套）
+    var TRUNK_TILE = 16, LEAF_TILE = 17;
 
-    function buildTerrain(x0, z0) {
-      st.mesh++;                       // 铺一次 64×64 记一次：出块动画若碰了这个数，回归闸当场就能看见
-      arr = st.arrT; vp = 0;
+    /** 这一片区域要写多少个面：顶面 1 + 每个露出侧壁的层 + 天然树的 3 个盒子。
+     *  先数后写，缓冲永远刚好装得下；深坑不会因为"预算用完"而缺半面墙。 */
+    function countQuads(x0, z0) {
+      var n = 0;
       for (var dz = 0; dz < REGION; dz++) {
         for (var dx = 0; dx < REGION; dx++) {
           var cx = x0 + dx, cz = z0 + dz;
           if (cx >= W || cz >= H) continue;
-          var lv = level(cx, cz), b = blk(cx, cz), c = baseColor(b);
-          var y0 = lv + 1;
-          quad([cx, y0, cz, cx + 1, y0, cz, cx + 1, y0, cz + 1, cx, y0, cz + 1], c, 1.0, N_UP);
-          // 四个方向的侧壁：邻格更低才补，且只从邻格顶面拉起到本格顶面——
-          // 一直画到 y=0 会让区域边界看起来像一排插在天空里的石柱
-          var nb = [[cx, cz - 1, 0.8, N_N], [cx, cz + 1, 0.8, N_S], [cx + 1, cz, 0.65, N_E], [cx - 1, cz, 0.65, N_W]];
+          var lv = level(cx, cz), b = blk(cx, cz);
+          n += 1;
           for (var k = 0; k < 4; k++) {
-            var nl = level(nb[k][0], nb[k][1]);
+            var nx = cx + (k === 2 ? 1 : k === 3 ? -1 : 0);
+            var nz = cz + (k === 0 ? -1 : k === 1 ? 1 : 0);
+            var nl = level(nx, nz);
+            if (nl < lv) n += lv - nl;
+          }
+          if ((b & 8) && !(b & 16) && lv === surf(cx, cz)) n += 3;
+        }
+      }
+      return n;
+    }
+
+    function buildTerrain(x0, z0) {
+      st.mesh++;                       // 铺一次 64×64 记一次：出块动画若碰了这个数，回归闸当场就能看见
+      var need = countQuads(x0, z0) * 36;
+      if (st.arrG.length < need) st.arrG = new Float32Array(need + REGION * 36);
+      tarr = st.arrG; tvp = 0;
+      for (var dz = 0; dz < REGION; dz++) {
+        for (var dx = 0; dx < REGION; dx++) {
+          var cx = x0 + dx, cz = z0 + dz;
+          if (cx >= W || cz >= H) continue;
+          var sv = surf(cx, cz), lv = level(cx, cz), b = blk(cx, cz);
+          var gold = (b & 16) !== 0, kind = b & 7;
+          var removed = sv - lv;                 // 这一列被挖掉几层 = 现在顶面的"地下深度"
+          var y0 = lv + 1;
+          // 顶面：草地/沙/雪/水面；挖过的顶面直接换成泥土/石/矿，一眼看出铲到了哪一带
+          tquad([cx, y0, cz, cx + 1, y0, cz, cx + 1, y0, cz + 1, cx, y0, cz + 1],
+            gold ? TIL.ERA_GOLD : topTile(cx, cz, kind, removed), 1.0, N_UP);
+          // 侧壁：邻格顶面更低才补，**逐层一个面**——草皮、泥土、石、矿各自贴自己的图，
+          // 悬崖与挖坑的坑壁因此自动长成一层一层的岩性剖面。只从邻格顶面拉起到本格顶面，
+          // 一直画到 y=0 会让区域边界看起来像一排插在天空里的石柱。
+          for (var k = 0; k < 4; k++) {
+            var nx = cx + (k === 2 ? 1 : k === 3 ? -1 : 0);
+            var nz = cz + (k === 0 ? -1 : k === 1 ? 1 : 0);
+            var nl = level(nx, nz);
             if (nl >= lv) continue;
-            var yb = nl + 1;
-            var q = k === 0 ? [cx, y0, cz, cx + 1, y0, cz, cx + 1, yb, cz, cx, yb, cz]
-              : k === 1 ? [cx + 1, y0, cz + 1, cx, y0, cz + 1, cx, yb, cz + 1, cx + 1, yb, cz + 1]
-              : k === 2 ? [cx + 1, y0, cz + 1, cx + 1, y0, cz, cx + 1, yb, cz, cx + 1, yb, cz + 1]
-              : [cx, y0, cz, cx, y0, cz + 1, cx, yb, cz + 1, cx, yb, cz];
-            quad(q, c, nb[k][2], nb[k][3]);
+            var sh = k < 2 ? 0.8 : 0.65;
+            var nrm = k === 0 ? N_N : k === 1 ? N_S : k === 2 ? N_E : N_W;
+            for (var L = nl + 1; L <= lv; L++) {
+              tquad(sface(cx, cz, k, L, L + 1),
+                gold ? TIL.ERA_GOLD : sideTile(cx, cz, kind, sv - L), sh, nrm);
+            }
           }
           // 天然树：与 2D 地图上同一个深色像点（同一趟分类，绝不两套判定）
           // 树干必须是落到地面的实心柱——只画一片 0.24 见方的顶面会让树冠悬在半空，
-          // 看上去就是"世界里到处是洞"。
-          if ((b & 8) && !(b & 16)) {
-            // 树干 0.32 宽、树冠 0.88 宽：再细就成了俯视时的一根黑针，比悬空还难看
-            cube(cx + 0.34, y0, cz + 0.34, cx + 0.66, y0 + 2.35, cz + 0.66, TREE_TRUNK);
-            cube(cx + 0.06, y0 + 2.2, cz + 0.06, cx + 0.94, y0 + 3.35, cz + 0.94, TREE_LEAF);
+          // 看上去就是"世界里到处是洞"。挖过的地表不再长树：树根跟着那一层土一起没了。
+          if ((b & 8) && !gold && !removed) {
+            tcube(cx + 0.34, y0, cz + 0.34, cx + 0.66, y0 + 2.35, cz + 0.66, TRUNK_TILE);
+            tcube(cx + 0.06, y0 + 2.2, cz + 0.06, cx + 0.94, y0 + 3.35, cz + 0.94, LEAF_TILE);
           }
         }
       }
-      st.nT = upload(st.bufT, vp);
+      st.nG = tvp / 6;
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufG);
+      gl.bufferData(gl.ARRAY_BUFFER, st.arrG.subarray(0, tvp), gl.DYNAMIC_DRAW);
     }
 
     /** 签过名的方块：按 layer 画像素贴图实体（叠塔因此成立），只画当前区域内的。
@@ -438,6 +537,7 @@
           if (cx >= W || cz >= H) continue;
           var n = st.resMap[cellKey(cx, cz)];
           if (!n || n.taken) continue;
+          if (removedAt(cx, cz)) continue;   // 被挖过的地表：资源跟着表层一起没了
           var y0 = level(cx, cz) + 1;
           switch (n.kind) {
             case 0: // 石头：半嵌在地里的岩块
@@ -530,10 +630,16 @@
           var insideMe = px === Math.floor(st.x) && pz === Math.floor(st.z) && py === Math.floor(st.y);
           var okPlace = !insideMe && px >= 0 && pz >= 0 && px < W && pz < H && py >= 0 && py < st.maxLayer &&
             !blockAt(px, pz, py);
+          // 能不能挖：只有这一列露出来的顶面能挖（与 world.rs 的判据逐字一致）。
+          // 侧壁上的旧层、水面、硬底都不行——点了也不该悄悄落进账本。
+          var top = level(cx, cz);
+          var diggable = !blockAt(cx, cz, cy) && cy === top && top >= DUG_FLOOR &&
+            (blk(cx, cz) & 7) !== 0;
           return {
             cx: cx, cz: cz, layer: cy,
             entity: blockAt(cx, cz, cy),
             place: okPlace ? { cx: px, cz: pz, layer: py } : null,
+            dig: diggable,
           };
         }
         px = cx; py = cy; pz = cz;
@@ -719,6 +825,22 @@
       }
     }
 
+    /** 邻居在哪：在场广播画出来的人形。
+     *  与铸块砖同一条例——只写 st.arrF，每帧重算，绝不为"有人在场"重铺 64×64 区域网格。
+     *  坐标来自对端自报，所以它只表示"他声称自己站在这儿"，不代表任何归属。 */
+    function drawPeer(p, rx, ry, rz, ux, uy, uz, nv) {
+      if (Math.hypot(p.x - st.x, p.z - st.z) > FOG_FAR) return;   // 雾外的标记不如不画
+      var feet = p.y, body = [150, 200, 255], head = [222, 236, 255];
+      cube(p.x - 0.3, feet, p.z - 0.3, p.x + 0.3, feet + 1.15, p.z + 0.3, body);
+      cube(p.x - 0.22, feet + 1.15, p.z - 0.22, p.x + 0.22, feet + 1.6, p.z + 0.22, head);
+      // 朝向针：cube 的角必须按 min/max 给，反过来写三角面序会翻、被背面剔除吃掉
+      var tx = p.x + Math.sin(p.yaw) * 0.55, tz = p.z + Math.cos(p.yaw) * 0.55;
+      cube(Math.min(p.x, tx) - 0.04, feet + 1.66, Math.min(p.z, tz) - 0.04,
+           Math.max(p.x, tx) + 0.04, feet + 1.82, Math.max(p.z, tz) + 0.04, ERA_GOLD);
+      fxText(p.x, feet + 2.15, p.z, rx, ry, rz, ux, uy, uz, nv,
+        String(p.addr || '').slice(-6).toUpperCase(), [190, 220, 255], 1);
+    }
+
     /** 每帧重算 FX 缓冲：过期条目当场剔除，画多少个三角形回给 draw */
     function stepFx(now, d) {
       var rx = d[2], ry = 0, rz = -d[0], rl = Math.hypot(rx, rz) || 1; rx /= rl; rz /= rl;
@@ -732,6 +854,10 @@
         if (f.age > f.life) { st.fx.splice(i, 1); continue; }
         if (f.type === 'mint') drawMint(f, f.age, rx, ry, rz, ux, uy, uz, nv);
         else drawRain(f, f.age, rx, ry, rz, ux, uy, uz, nv);
+      }
+      // 在场邻居：数量有上限，因为这条缓冲是共享的，人多了要给动画留地方
+      for (var pi = 0; pi < st.peers.length && pi < POS_DRAW_MAX; pi++) {
+        drawPeer(st.peers[pi], rx, ry, rz, ux, uy, uz, nv);
       }
       st.nF = vp / 6;
       if (!st.nF) return 0;   // 没东西可画就连这次上传也省掉：常态帧不许为动画买单
@@ -771,10 +897,9 @@
         gl.drawArrays(mode, 0, n);
       }
 
+      // 天空先画：太阳/月亮/星星不吃雾（否则它们会被自己的"远处"吃掉）。
+      // 地形随后覆盖它——深度测试会把挡在前面的地形留下来。
       colorUse();
-      drawBuf(st.bufT, st.nT, gl.TRIANGLES);
-
-      // 天空：太阳/月亮/星星不吃雾（否则它们会被自己的"远处"吃掉）
       gl.disable(gl.CULL_FACE);
       gl.uniform2f(U.fogr, 100000, 100001);
       gl.uniform4f(U.tint, 1, 1, 1, 1);
@@ -784,7 +909,7 @@
       drawBuf(st.bufStar, nStar, gl.POINTS);
       gl.enable(gl.CULL_FACE);
 
-      // 贴图实体（花/活物是十字面，不能剔除背面）
+      // 贴图管线：地形 → 签名的方块 → 资源（花/活物是十字面，不能剔除背面）
       gl.useProgram(progT);
       gl.uniformMatrix4fv(UT.vp, false, m);
       gl.uniform3f(UT.eye, e0[0], e0[1], e0[2]);
@@ -794,21 +919,19 @@
       gl.uniform1i(UT.tex, 0);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+      function drawTex(buf, n) {
+        if (!n) return;
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.enableVertexAttribArray(AT_P); gl.vertexAttribPointer(AT_P, 3, gl.FLOAT, false, 24, 0);
+        gl.enableVertexAttribArray(AT_UV); gl.vertexAttribPointer(AT_UV, 2, gl.FLOAT, false, 24, 12);
+        gl.enableVertexAttribArray(AT_S); gl.vertexAttribPointer(AT_S, 1, gl.FLOAT, false, 24, 20);
+        gl.drawArrays(gl.TRIANGLES, 0, n);
+      }
+      // 地形是闭合体素：背面剔除先开着（省一半片元）；花/活物/树冠贴片再关掉
+      drawTex(st.bufG, st.nG);
       gl.disable(gl.CULL_FACE);
-      if (st.nE) {
-        gl.bindBuffer(gl.ARRAY_BUFFER, st.bufE);
-        gl.enableVertexAttribArray(AT_P); gl.vertexAttribPointer(AT_P, 3, gl.FLOAT, false, 24, 0);
-        gl.enableVertexAttribArray(AT_UV); gl.vertexAttribPointer(AT_UV, 2, gl.FLOAT, false, 24, 12);
-        gl.enableVertexAttribArray(AT_S); gl.vertexAttribPointer(AT_S, 1, gl.FLOAT, false, 24, 20);
-        gl.drawArrays(gl.TRIANGLES, 0, st.nE);
-      }
-      if (st.nR) {
-        gl.bindBuffer(gl.ARRAY_BUFFER, st.bufR);
-        gl.enableVertexAttribArray(AT_P); gl.vertexAttribPointer(AT_P, 3, gl.FLOAT, false, 24, 0);
-        gl.enableVertexAttribArray(AT_UV); gl.vertexAttribPointer(AT_UV, 2, gl.FLOAT, false, 24, 12);
-        gl.enableVertexAttribArray(AT_S); gl.vertexAttribPointer(AT_S, 1, gl.FLOAT, false, 24, 20);
-        gl.drawArrays(gl.TRIANGLES, 0, st.nR);
-      }
+      drawTex(st.bufE, st.nE);
+      drawTex(st.bufR, st.nR);
       gl.enable(gl.CULL_FACE);
 
       // 粒子（放置/拆除反馈）
@@ -861,6 +984,11 @@
       st.target = pick();
       buildHighlight();
       draw();
+      // 帧内截图：缓冲只在 draw() 之后、本次回调返回之前是满的
+      if (st.wantShot) {
+        var shot = st.wantShot; st.wantShot = null;
+        try { shot(canvas.toDataURL('image/png')); } catch (e) { shot(null); }
+      }
       st.frames++;
       if (now - st.fpsMark > 1000) { st.fps = st.frames; st.frames = 0; st.fpsMark = now; }
       hooks.onFrame && hooks.onFrame(state());
@@ -870,10 +998,18 @@
       var t = st.target;
       var ds = dayState(performance.now());
       return {
-        x: cx, z: cz, layer: Math.floor(st.y - EYE + 0.01), surface: level(cx, cz),
+        x: cx, z: cz, layer: Math.floor(st.y - EYE + 0.01),
+        // surface = 原始地表（高度场）；top = 这一列现在露出来的顶面；dug = 挖掉了几层。
+        // HUD 三个都显示：只看 top 会分不清"地势本来就低"和"是我挖下去的"。
+        surface: surf(cx, cz), top: level(cx, cz), dug: surf(cx, cz) - level(cx, cz),
         block: blk(cx, cz), target: t, fps: st.fps, locked: st.locked,
         day: ds.day, dusk: ds.dusk, height: st.height, slots: st.slots,
         fx: st.fx.length, fxVerts: st.nF, mesh: st.mesh,
+        // 地形顶点数与缓冲容量：两者相等就说明这一帧被截断了（坑壁缺块 / 悬崖缺面）
+        verts: st.nG, vcap: (st.arrG.length / 6) | 0,
+        // 连续坐标与朝向：在场广播要的是"我这一刻站在哪"，取整的格子坐标不够用
+        px: st.x, py: st.y - EYE, pz: st.z, yaw: st.yaw, pitch: st.pitch,
+        peers: st.peers.length,
       };
     }
 
@@ -971,7 +1107,7 @@
         look = null;
       }
     }
-    /** 一次编辑动作：0 = 拆/采（释放归属或采走资源），2 = 造（签一条 claim 记录） */
+    /** 一次编辑动作：0 = 挖/拆/采，2 = 造（签一条 claim 记录） */
     function act(kind) {
       var t = st.target;
       if (!t) { hooks.onEmpty && hooks.onEmpty(kind); return; }
@@ -983,8 +1119,13 @@
       if (kind === 2) {
         if (!t.place) { hooks.onBlocked && hooks.onBlocked(t); return; }
         hooks.onPlace && hooks.onPlace(t.place.cx, t.place.cz, t.place.layer, st.slot);
-      } else {
+      } else if (t.entity) {
         hooks.onBreak && hooks.onBreak(t.cx, t.cz, t.layer, t.entity);
+      } else if (t.dig) {
+        // 地形：只挖露出来的那一层。挖掉的层号由这里报给命令层，链上还要再判一次。
+        hooks.onDig && hooks.onDig(t.cx, t.cz, t.layer);
+      } else {
+        hooks.onDigBlocked && hooks.onDigBlocked(t);
       }
     }
     function canLock() { return typeof canvas.requestPointerLock === 'function'; }
@@ -1022,6 +1163,42 @@
           if (g !== oldGround) st.y = g + EYE;
         }
       },
+      setPeers: function (list) {
+        var ps = list || [], out = [];
+        for (var i = 0; i < ps.length; i++) {
+          var p = ps[i];
+          // heading 上网时是「度 × POS_SCALE」，回到来就是度；这里再转弧度给朝向针
+          out.push({
+            x: Number(p.x) || 0, y: Number(p.y) || 0, z: Number(p.z) || 0,
+            yaw: (Number(p.heading) || 0) * Math.PI / 180, addr: p.addr || '',
+          });
+        }
+        st.peers = out;
+      },
+      /** 挖地账本（快照的 dug 数组：[{x, y, top, removed}]）。
+       *  只认 removed —— top 是派生值，谁算都一样（removed 才是链上的事实）。
+       *  签名只算"挖了哪几列、多深"，站着不动每 2 秒重收一份也不会重铺地形。 */
+      setDug: function (list) {
+        var src = list || [], map = {}, sig = 0;
+        for (var i = 0; i < src.length; i++) {
+          var d = src[i], rem = d.removed | 0;
+          if (rem <= 0) continue;
+          map[cellKey(d.x, d.y)] = rem;
+          sig = (Math.imul(sig, 31) + d.x * 3 + d.y * 5 + rem * 7) | 0;
+        }
+        var key = sig + ':' + src.length;
+        if (key === st.dugSig) return;
+        st.dugSig = key;
+        var wasStanding = st.heights &&
+          Math.abs(st.y - (support(st.x | 0, st.z | 0) + EYE)) < 0.06;
+        st.dugMap = map;
+        st.dirty = true;
+        // 脚下这一列刚好被挖了：站着的人跟着地面一起下去（悬空看风景不是"挖到了"）
+        if (wasStanding) st.y = support(st.x | 0, st.z | 0) + EYE;
+      },
+      // 截图必须**在同一帧内**抓：context 创建时没开 preserveDrawingBuffer，帧尾一过
+      // 缓冲就是空的——toDataURL 不报错，只给你一张全透明图。所以回调排进 tick。
+      snapshot: function (cb) { st.wantShot = cb; },
       setEntities: function (list, address) {
         var ents = list || [];
         // 快照每 2 秒就送一份全新数组（自己的写入和别人的写入都走这里）。只有几何
@@ -1076,6 +1253,12 @@
       setTime: function (height) { st.height = Math.max(0, height | 0); st.heightAt = performance.now(); },
       setMaxLayer: function (n) { if (n > 0) st.maxLayer = n; },
       burst: burst,
+      /** 挖掉一层的碎屑：颜色取这一带地层的贴图均色（土/石/矿），与坑壁同一个色系 */
+      digBurst: function (cx, cz, layer, kind) {
+        var tile = kind === 0 ? TIL.DIRT : kind === 1 ? TIL.STONE
+          : kind === 2 ? TIL.ORE_GOLD : TIL.DIRT;
+        burst(cx, layer, cz, tile);
+      },
       /** 出块显形：一块刻着块哈希/VRF/发行量的砖落进矿格。cell 缺省时落在脚下。 */
       mintBlock: function (info) {
         if (!info || !st.heights) return;
@@ -1104,6 +1287,10 @@
       jumpTo: function (cx, cz, layer) {
         st.x = cx + 0.5; st.z = cz + 0.5; st.y = (layer == null ? support(cx, cz) : layer + 1) + EYE;
         st.dirty = true;
+      },
+      setView: function (yaw, pitch) {
+        if (yaw != null) st.yaw = yaw;
+        if (pitch != null) st.pitch = pitch;
       },
       open: function () {
         global.addEventListener('keydown', onKeyDown);
@@ -1136,6 +1323,9 @@
   global.QLWorld3D = {
     create: World3D, LEVEL_SHIFT: LEVEL_SHIFT, MAX_LAYER: MAX_LAYER, REACH: REACH,
     REGION: REGION, PAL: PAL, TREE_TRUNK: TREE_TRUNK, TREE_LEAF: TREE_LEAF, ERA_GOLD: ERA_GOLD,
+    // 挖地与地形贴图的可测面：app.js 用 TERRAIN 给物品栏/材料上色，测试用深度常量对账
+    DUG_FLOOR: DUG_FLOOR, DUG_SOIL_DEPTH: DUG_SOIL_DEPTH, DUG_STONE_DEPTH: DUG_STONE_DEPTH,
+    TERRAIN: TIL,
     // 出块显形这一层的可测面：字模表与"这行字有没有缺笔"的判据（回归闸用它自己拼字符串）
     FONT35: FONT35, missingGlyphs: missingGlyphs,
     FX_MINT_MS: FX_MINT_MS, FX_RAIN_MS: FX_RAIN_MS, FX_CAP: FX_CAP,

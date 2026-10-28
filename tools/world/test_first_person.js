@@ -12,6 +12,7 @@
  *   E 准星落空必须有反馈（不许无声失败）    F 大地（高度场）钉死在创世哈希上，不随链长漂移
  *   G 写完的方块当场显形（几何变了才重铺，轮询不卡）    G2 app.js 的快照刷新必须推给 3D 场景
  *   G3 出块显形：铸块砖 + QLOR 数字雨只写自己的缓冲，绝不重铺 64×64，到期自动散场
+ *   H 挖地：只挖露出的顶面、层号随账本下降、水面/旧层点了必须有反馈
  *
  * 用法：node tools/world/test_first_person.js
  */
@@ -26,8 +27,18 @@ global.requestAnimationFrame = (cb) => { q.push(cb); return q.length; };
 global.cancelAnimationFrame = () => {};
 global.setTimeout = () => 0;
 const docL = {};
+/* 2D 画布替身：sprites.js / terrain-tex.js 只在启动时画图集，Node 里只要别抛错。
+ * 图集内容不参与任何断言——像素对不对由浏览器点测看，这里管的是接线与几何。 */
+const ctx2d = {
+  imageSmoothingEnabled: false, fillStyle: '#000',
+  fillRect() {}, drawImage() {}, putImageData() {},
+  createImageData: (w, h) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
+  getImageData: (x, y, w, h) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
+};
+const fakeCanvas = () => ({ width: 0, height: 0, getContext: () => ctx2d });
 global.document = {
   pointerLockElement: null,
+  createElement: (tag) => (tag === 'canvas' ? fakeCanvas() : { style: {} }),
   addEventListener: (n, f) => { (docL[n] = docL[n] || []).push(f); },
   removeEventListener: () => {},
   exitPointerLock: () => { global.document.pointerLockElement = null; fire('pointerlockchange'); },
@@ -61,6 +72,9 @@ const gl = new Proxy({}, { get(o, k) {
 }, set() { return true; } });
 
 global.window = global;
+require(path.join(UI, 'sprites.js'));
+require(path.join(UI, 'qlight-hd-sprites.js'));
+require(path.join(UI, 'terrain-tex.js'));
 require(path.join(UI, 'world.js'));
 require(path.join(UI, 'world3d.js'));
 const W = global.QLWorld, W3 = global.QLWorld3D;
@@ -78,7 +92,7 @@ const heights = out.heights, blocks = out.blocks;
 const ADDR = 'ql1test';
 let ledger = [], seq = 0;
 const live = () => ledger.filter((e) => !e.released);
-const stat = { blocked: 0, empty: 0, errors: [] };
+const stat = { blocked: 0, empty: 0, dig: [], digBlocked: 0, errors: [] };
 let slot = 0;
 const w3 = W3.create(canvas, {
   onPlace: (x, z, layer) => {
@@ -95,6 +109,10 @@ const w3 = W3.create(canvas, {
   },
   onBlocked: () => { stat.blocked++; },
   onEmpty: () => { stat.empty++; },
+  // 挖地：只记录"要挖哪一层"，账本由 src/world.rs 落；这里不自己改地形，
+  // 挖掉之后的世界由 setDug（命令层快照）再推进来——与 app.js 同一路径。
+  onDig: (x, z, layer) => { stat.dig.push({ x, z, layer }); },
+  onDigBlocked: () => { stat.digBlocked++; },
   onSlot: (i) => { slot = i; w3.setSlot(i); },
   onFrame: () => {}, onLock: () => {}, onClose: () => {},
 });
@@ -122,6 +140,14 @@ for (let z = 40; z < 220 && sx < 0; z++) {
   }
 }
 
+/* 视线钉死：
+ *   鼠标灵敏度是 0.0022 弧度/像素，pitch 限幅 ±1.5。分几次 look(120) 只转 0.26 弧度/次，
+ *   结果取决于上一步朝向——E 把视线拉到顶之后，H 的五次下压只到 -0.6，
+ *   准星落在隔壁那列而不是脚下，测试就会报"挖错格"。
+ *   一次给足 2000 像素 = 4.4 弧度，必然撞到限幅，与上一步朝向无关。 */
+const lookDown = () => { look(2000); frame(); };
+const lookUp = () => { look(-2000); frame(); };
+
 const results = [];
 const check = (name, ok, got) => results.push({ name, ok: !!ok, got });
 
@@ -136,7 +162,7 @@ check('A 浅俯角是铺开而不是叠高（>1 列）', Acells.size > 1, [...Ac
 /* B 低头 = 原地起柱 */
 ledger = []; w3.setEntities(ledger, ADDR);
 w3.jumpTo(sx - 3, sz - 3, null);
-for (let i = 0; i < 5; i++) { look(120); frame(); }        // pitch 触底 -1.5，正对脚下
+lookDown();
 const B = click5();
 const Bcell = new Set(B.filter(Boolean).map((p) => p[0] + '_' + p[1]));
 const Blayer = B.filter(Boolean).map((p) => p[2]);
@@ -151,7 +177,7 @@ frame();
 check('C 站到柱顶上（脚下 = 最高层 + 1）', w3.state().layer === top + 1, { feet: w3.state().layer, top });
 
 /* D 左键拆自己那块：三维与占格索引同时消失 */
-for (let i = 0; i < 5; i++) { look(120); frame(); }
+lookDown();
 const aim = w3.state().target;
 const n0 = live().length;
 press(0);
@@ -164,7 +190,7 @@ check('D 拆完的块不再被当成实心（可重新造）', !re || !re.entity
 
 /* E 准星落空必须有反馈 */
 w3.jumpTo(sx + 6, sz + 6, null);
-for (let i = 0; i < 16; i++) { look(-70); frame(); }       // 抬头看天
+lookUp();                                                  // 抬头看天
 frame();
 const e0 = stat.empty;
 press(2);
@@ -261,6 +287,67 @@ const mineBody = (appJs.match(/\$\("btn-mine-ore"\)\.addEventListener\("click",\
 check('G3 挖到矿必须在矿格上起一串符文', /noteMinedCell\(/.test(mineBody), mineBody.slice(0, 200));
 check('G3 符文只在矿签真的落账之后起（不许在签名前预告）',
   mineBody.indexOf('world_mine_once') >= 0 && mineBody.indexOf('world_mine_once') < mineBody.indexOf('noteMinedCell('), mineBody.slice(0, 240));
+
+/* ============ H 挖地（v5 账本）：只挖露出来的那一层，水面与旧层都挖不动 ============
+ *   账本侧由 src/world.rs 的 op=dig 判定；这里守的是渲染器/输入这一侧：
+ *   报给命令层的层号必须是这一列**现在**露出来的顶面，而不是准星碰到的任意一格。 */
+let dgx = -1, dgz = -1;
+for (let z = 40; z < 200 && dgx < 0; z++) {
+  for (let x = 20; x < 200; x++) {
+    if (Math.abs(x - sx) + Math.abs(z - sz) < 4) continue;
+    const b = blocks[z * W.W + x];
+    if ((b & 7) !== 0 && !(b & 24) && heights[z * W.W + x] >> 3 > 12) { dgx = x; dgz = z; break; }
+  }
+}
+const dsurf = heights[dgz * W.W + dgx] >> 3;
+w3.setDug([{ x: dgx, y: dgz, top: dsurf - 1, removed: 1 }]);
+w3.jumpTo(dgx, dgz, null);
+burn();
+const H1 = w3.state();
+check('H 挖掉一层：顶面比原始地表低一层', H1.top === H1.surface - 1 && H1.dug === 1, H1);
+check('H 挖掉一层：脚跟着落到新顶面上', H1.layer === H1.top + 1, { feet: H1.layer, top: H1.top });
+
+lookDown();
+const ht = w3.state().target;
+check('H 准星对着挖过的列顶面，且标记为可挖', ht && ht.layer === H1.top && ht.dig === true, ht && [ht.cx, ht.layer, ht.cz, ht.dig]);
+const d0 = stat.dig.length;
+press(0);
+check('H 左键挖掉一层 = 只发一次 dig（不是拆方块）', stat.dig.length - d0 === 1, stat.dig.slice(-2));
+check('H dig 报的是露出来的那一层', stat.dig[stat.dig.length - 1] &&
+  stat.dig[stat.dig.length - 1].layer === H1.top, stat.dig[stat.dig.length - 1]);
+
+// 再挖一层：同一套规则继续生效（顶面继续降，不是只认第一铲）
+w3.setDug([{ x: dgx, y: dgz, top: H1.top - 1, removed: 2 }]);
+burn();
+const H2 = w3.state();
+check('H 再挖一层：顶面继续下降', H2.top === H1.top - 1 && H2.dug === 2, H2);
+
+/* 坑壁是几何，不是贴图：深坑必须比平地多写出侧壁面。曾经按"每格 16 面"的固定预算，
+ * 十层深的坑角把预算用完后 tquad 就停笔，画面是缺了半面墙的坑——玩家眼里的"洞里"。 */
+w3.setDug([]);
+burn();
+const vFlat = w3.state().verts;
+w3.setDug([{ x: dgx, y: dgz, top: dsurf - 10, removed: 10 }]);
+burn();
+const Hd = w3.state();
+check('H 深坑的坑壁真的进了地形缓冲（比平地多出侧壁面）', Hd.verts > vFlat, { vFlat, verts: Hd.verts });
+check('H 地形缓冲没被写满（写满 = 坑壁缺块）', Hd.verts < Hd.vcap, { verts: Hd.verts, vcap: Hd.vcap });
+
+// 水面挖不动：水面不是"露出来的可挖层"，点了必须给反馈
+let wx = -1, wz = -1;
+for (let z = 40; z < 200 && wx < 0; z++) {
+  for (let x = 20; x < 200; x++) { if ((blocks[z * W.W + x] & 7) === 0) { wx = x; wz = z; break; } }
+}
+w3.setDug([]);
+w3.jumpTo(wx, wz, null);
+burn();
+lookDown();
+const wt = w3.state().target;
+check('H 水面不是可挖的顶面', wt && wt.dig === false, wt && [wt.cx, wt.layer, wt.cz, wt.dig]);
+const b0 = stat.digBlocked;
+press(0);
+check('H 对着水面左键必须给出反馈，不许悄悄进账本', stat.digBlocked - b0 === 1, stat.digBlocked - b0);
+check('H 收掉挖地账本：地面回到原始顶面', (() => { w3.jumpTo(dgx, dgz, null); burn(); const s = w3.state(); return s.dug === 0 && s.top === s.surface; })(), w3.state());
 
 let fail = 0;
 for (const r0 of results) {

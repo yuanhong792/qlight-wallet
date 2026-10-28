@@ -85,14 +85,72 @@ fn shake_check(ct: &[u8]) -> [u8; 8] {
     out
 }
 
+/// 口令下限（字符数，不是字节数：中文密码 8 字节只有不到 3 个字）
+pub const PASSWORD_MIN_CHARS: usize = 8;
+
+/// 常见弱口令表。这条规则不是防在线攻击——Argon2id 已经把离线穷举抬到 32 MiB×3 轮；
+/// 它防的是"玩家以为自己设了密码，其实第一秒就被字典命中"。
+/// ≥8 字符的按子串拒（`xpassword9` 仍是字典词），更短的只在整串相等时拒
+/// （否则 "admintest1" 这类合法口令会被误伤）。
+const WEAK_WORDS: &[&str] = &[
+    "password",
+    "passw0rd",
+    "p@ssword",
+    "qwertyui",
+    "qwertyuiop",
+    "iloveyou",
+    "letmein1",
+    "welcome1",
+    "admin123",
+    "abc12345",
+    "12345678",
+    "1234567890",
+    "00000000",
+    "aaaaaaaa",
+    "asdfghjkl",
+    "zxcvbnmm",
+];
+
+/// 弱口令判定：纯函数（不落盘、不派生密钥），所以前端预检和这里可以是同一套口径。
+///
+/// 四条规则，从小到大都能说清：长度、全同字符、连续字符、字典词。
+pub fn check_password(pw: &str) -> Result<(), String> {
+    let n = pw.chars().count();
+    if n < PASSWORD_MIN_CHARS {
+        return Err(format!("密码至少 {PASSWORD_MIN_CHARS} 位"));
+    }
+    let chars: Vec<char> = pw.chars().collect();
+    if chars.iter().all(|c| *c == chars[0]) {
+        return Err("密码不能是全同一个字符".into());
+    }
+    // 整串是升/降的连续码点（12345678 / hgfedcba）——长度规则挡不住，但它是最典型的懒密码
+    let step = |d: i64| {
+        chars
+            .windows(2)
+            .all(|w| (w[1] as i64 - w[0] as i64) == d)
+    };
+    if n >= 4 && (step(1) || step(-1)) {
+        return Err("密码不能是连续字符（如 12345678）".into());
+    }
+    let low = pw.to_lowercase();
+    for w in WEAK_WORDS {
+        if w.len() >= 8 {
+            if low.contains(w) {
+                return Err("密码里含有常见弱口令，换一个".into());
+            }
+        } else if low == *w {
+            return Err("这是常见弱口令，换一个".into());
+        }
+    }
+    Ok(())
+}
+
 /// 创建新钱包：生成主种子 → ML-DSA-65 → ql1 地址 → 加密落盘
 pub fn create_wallet(
     path: &PathBuf,
     password: &str,
 ) -> Result<(Keystore, WalletCore), String> {
-    if password.len() < 8 {
-        return Err("密码至少 8 位".into());
-    }
+    check_password(password)?;
 
     let seed = {
         let mut s = [0u8; 32];
@@ -311,6 +369,55 @@ mod tests {
 
         // 错密码必须解不开
         assert!(decrypt_core(&ks2, "wrong-password").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 弱口令必须拒在创建之前：一旦钱包用弱密码落了盘，密文就是可下载的穷举靶子
+    #[test]
+    fn lazy_passwords_are_refused() {
+        for weak in [
+            "12345678",
+            "87654321",
+            "abcdefgh",
+            "aaaaaaaa",
+            "password",
+            "PASSWORD1",
+            "my-password-2026",
+            "qwertyuiop",
+            "abc1234",
+        ] {
+            assert!(check_password(weak).is_err(), "弱口令被放过了：{weak}");
+        }
+    }
+
+    /// 中文按字符算不按字节算：6 个汉字是 18 字节，旧口径会当成"够长"
+    #[test]
+    fn length_counts_characters_not_bytes() {
+        assert!(check_password("量子货币").is_err(), "4 个汉字不该通过");
+        assert!(check_password("我的量子货币钱包口令").is_ok());
+    }
+
+    /// 正常口令不该被误伤——过严的判定只会逼玩家把密码写在便利贴上
+    #[test]
+    fn ordinary_passwords_pass() {
+        for ok in [
+            "test-pass-1234",
+            "Purple-Horse-42",
+            "admintest1",
+            "xkcd 99 bottle",
+        ] {
+            assert!(check_password(ok).is_ok(), "合法口令被误拒：{ok}");
+        }
+    }
+
+    /// 长度不够时创建必须失败，且不留下半个 keystore 文件
+    #[test]
+    fn create_wallet_refuses_before_touching_the_disk() {
+        let dir = std::env::temp_dir().join(format!("qlx-ks-weak-{}-x", std::process::id()));
+        let path = dir.join("keystore.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(create_wallet(&path, "12345678").is_err());
+        assert!(!path.exists(), "被拒的创建不许留下文件");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

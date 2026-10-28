@@ -235,7 +235,7 @@ fn walk(
     let mut state = DustState::default();
     let mut applied = 0usize;
     for i in order {
-        match apply_semantics(&mut state, &records[i], &words) {
+        match apply_semantics(&mut state, &records[i], &words, view.tip) {
             Ok(()) => applied += 1,
             Err(why) => {
                 results[i] = Err(why);
@@ -372,34 +372,47 @@ impl ChainTip {
     }
 }
 
-/// 语义层单条入口（块内应用用；整本重放内部走同一份 `apply_semantics`）。
-pub fn apply_record(state: &mut DustState, r: &DustRecord) -> Result<(), String> {
-    apply_semantics(state, r, &crate::world::resource_words())
+/// 语义层单条入口。`now` 是判定这条记录时**链头的块高**：块内应用即出块块高，
+/// 本机预览即当前链高。轮次与产出都按它算，绝不按记录自报的 `height` 算——
+/// 那是客户端字段：一把新钥匙可以把历史上每个轮次各刷 60 个配额，还能在"声明的
+/// 旧轮次"里重采别人本轮已经采走的格。时间只能往前走：采集只对本轮有效。
+pub fn apply_record(state: &mut DustState, r: &DustRecord, now: u64) -> Result<(), String> {
+    apply_semantics(state, r, &crate::world::resource_words(), now)
 }
 
 /// 语义层：这条记录对世界做了什么。失败只丢这一条，不断链。
-fn apply_semantics(state: &mut DustState, r: &DustRecord, words: &[u32]) -> Result<(), String> {
+fn apply_semantics(
+    state: &mut DustState,
+    r: &DustRecord,
+    words: &[u32],
+    now: u64,
+) -> Result<(), String> {
     match r.op.as_str() {
         op::HARVEST => {
             if r.x as usize >= super::WORLD_W as usize || r.y as usize >= super::WORLD_H as usize {
                 return Err("采集坐标越界".into());
             }
-            if r.epoch != resource::epoch_of(r.height) {
-                return Err("采集轮次与块高不符".into());
+            let round = resource::epoch_of(now);
+            if r.epoch != round {
+                return Err(format!(
+                    "采集轮次 {} 与本轮 {} 不符：轮次由进块的块高决定，历史轮次不许回拨",
+                    r.epoch, round
+                ));
             }
             let want = resource::node_at(r.x as u32, r.y as u32, words)
                 .ok_or_else(|| "这一格没有资源".to_string())?;
             if want != r.kind {
                 return Err("采集的资源种类与这一格不符".into());
             }
-            let reward = resource::reward_at(r.kind, r.height);
+            // 产出同样按"当下"算：自报一个本轮里白天的块高来躲夜间减半，也是回拨
+            let reward = resource::reward_at(r.kind, now);
             if reward == 0 || r.amount != reward {
                 return Err(format!(
                     "产出 {} 与规则算出的 {} 不符",
                     r.amount, reward
                 ));
             }
-            let key = (r.owner.clone(), r.epoch);
+            let key = (r.owner.clone(), round);
             let used = state.epoch_counts.get(&key).copied().unwrap_or(0);
             if used >= resource::HARVEST_QUOTA {
                 return Err(format!(
@@ -407,10 +420,10 @@ fn apply_semantics(state: &mut DustState, r: &DustRecord, words: &[u32]) -> Resu
                     resource::HARVEST_QUOTA
                 ));
             }
-            if state.harvested.contains(&(r.x, r.y, r.epoch)) {
+            if state.harvested.contains(&(r.x, r.y, round)) {
                 return Err("这一格本轮已经被采过".into());
             }
-            state.harvested.insert((r.x, r.y, r.epoch));
+            state.harvested.insert((r.x, r.y, round));
             *state.epoch_counts.entry(key).or_insert(0) += 1;
             *state.balances.entry(r.owner.clone()).or_insert(0) += r.amount;
             state.minted_total += r.amount;
@@ -453,6 +466,8 @@ pub struct MergeReport {
 pub struct DustLedger {
     path: PathBuf,
     lock: std::sync::Mutex<()>,
+    /// 最近一次整本读入跳过的坏行数（与 `EntityLedger` 同一口径、同一实现）
+    bad: super::BadLines,
 }
 
 impl DustLedger {
@@ -460,6 +475,7 @@ impl DustLedger {
         Self {
             path,
             lock: std::sync::Mutex::new(()),
+            bad: super::BadLines::default(),
         }
     }
 
@@ -468,19 +484,23 @@ impl DustLedger {
     }
 
     pub fn load(&self) -> Vec<DustRecord> {
-        let Ok(text) = std::fs::read_to_string(&self.path) else {
-            return Vec::new();
+        self.load_report().0
+    }
+
+    /// 整本读入 + 坏行说明。光尘的集合指纹要进块哈希，所以"少读了几行"绝不能只是
+    /// 静默少几行：那会让本机的 `dust_root` 永远对不上任何人，而账面看起来一切正常。
+    pub fn load_report(&self) -> (Vec<DustRecord>, super::LoadReport) {
+        let (recs, rep) = match std::fs::read_to_string(&self.path) {
+            Ok(text) => super::parse_lines::<DustRecord>(&text),
+            Err(_) => (Vec::new(), super::LoadReport::default()),
         };
-        text.lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                if l.is_empty() {
-                    None
-                } else {
-                    serde_json::from_str::<DustRecord>(l).ok()
-                }
-            })
-            .collect()
+        self.bad.note(&rep, "光尘账本", &self.path);
+        (recs, rep)
+    }
+
+    /// 最近一次整本读入跳过的坏行数（账本修好后回到 0）
+    pub fn bad_lines(&self) -> usize {
+        self.bad.count()
     }
 
     pub fn head_of(records: &[DustRecord], pk_hash_hex: &str) -> (u64, [u8; 32]) {
@@ -693,6 +713,78 @@ mod tests {
         assert!(st.harvested.contains(&(x, y, 0)));
     }
 
+    fn tmp_dust(tag: &str) -> DustLedger {
+        let mut p = std::env::temp_dir();
+        p.push(format!("qlight-dust-{}-{}.jsonl", tag, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        DustLedger::new(p)
+    }
+
+    /// 64×64 里的第二个资源点（同一轮里采两格要用不同坐标）
+    fn second_node(w: &[u32], skip: (u16, u16), height: u64) -> (u16, u16, u8) {
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let at = (x as u16, y as u16);
+                if at == skip {
+                    continue;
+                }
+                if let Some(k) = resource::node_at(x, y, w) {
+                    if resource::reward_at(k, height) > 0 {
+                        return (at.0, at.1, k);
+                    }
+                }
+            }
+        }
+        panic!("64×64 里找不到第二个资源点");
+    }
+
+    /// 坏行只丢它自己并计数：光尘的集合指纹要进块哈希，"静默少读几行"等于
+    /// 悄悄改掉本机承诺的到底是哪一本账。
+    #[test]
+    fn a_corrupt_dust_line_is_counted_not_swallowed() {
+        let c = core();
+        let w = words();
+        let led = tmp_dust("corrupt");
+        let (x1, y1, k1) = find_node(&w, 10);
+        let r1 = harvest(&c, 1, [0u8; 32], x1, y1, k1, 10);
+        let (x2, y2, k2) = second_node(&w, (x1, y1), 11);
+        let r2 = harvest(&c, 2, record_hash(&r1), x2, y2, k2, 11);
+        let text = format!(
+            "{}\n{{\"v\":\"QL-DUST-v1\",\"seq\":\n{}\n",
+            serde_json::to_string(&r1).unwrap(),
+            serde_json::to_string(&r2).unwrap()
+        );
+        std::fs::write(led.path(), text).unwrap();
+
+        let (recs, rep) = led.load_report();
+        assert_eq!(recs.len(), 2, "坏行之后的记录不许跟着消失");
+        assert_eq!(rep.bad_lines, 1);
+        assert_eq!(rep.first_line, 2);
+        assert_eq!(led.bad_lines(), 1, "快照与 UI 读的是这个数");
+
+        // 反向对照：坏行夹在中间，两条记录仍各自接得上自己的链
+        let (st, st_rep) = replay(&recs, &DustView { tip: 11 });
+        assert!(st_rep.ok, "一行坏了不该判断整条链：{}", st_rep.reason);
+        assert_eq!(
+            st.balance_of(&c.address),
+            resource::reward_at(k1, 10) + resource::reward_at(k2, 11)
+        );
+
+        // 修好后计数归零，告警不会赖在界面上
+        std::fs::write(
+            led.path(),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&r1).unwrap(),
+                serde_json::to_string(&r2).unwrap()
+            ),
+        )
+        .unwrap();
+        assert_eq!(led.load().len(), 2, "整本重读：两条都在");
+        assert_eq!(led.bad_lines(), 0);
+        let _ = std::fs::remove_file(led.path());
+    }
+
     #[test]
     fn same_node_twice_in_one_epoch_is_refused() {
         let a = core();
@@ -705,6 +797,81 @@ mod tests {
         assert_eq!(rep.accepted, 1, "同一格被采了两次");
         assert_eq!(st.balance_of(&a.address), resource::reward_at(k, 10));
         assert_eq!(st.balance_of(&b.address), 0);
+    }
+
+    /// 回拨轮次换配额：一把钥匙把**历史上每一轮**各写一条采集，一条都不许进账。
+    ///
+    /// 这一条钉的是"绝对公平"的地基：轮次一旦由客户端自报的块高决定，脚本就能在
+    /// 链头 6000 时把 0..6000 的十个轮次一次刷完（每轮 60 格），还能在"声明的旧轮次"
+    /// 里重采别人本轮已经采走的格。现在轮次只由判定它的那一块决定。
+    #[test]
+    fn backdated_epochs_buy_nothing() {
+        let c = core();
+        let w = words();
+        let tip = 5 * resource::EPOCH_BLOCKS + 10;
+        let (x, y, k) = find_node(&w, tip);
+        let mut forged = Vec::new();
+        let mut prev = [0u8; 32];
+        for e in 0..5u64 {
+            let h = e * resource::EPOCH_BLOCKS + 10;
+            let r = harvest(&c, e + 1, prev, x, y, k, h);
+            prev = record_hash(&r);
+            forged.push(r);
+        }
+        let (st, rep) = replay(&forged, &view(&w, tip));
+        assert_eq!(
+            st.balance_of(&c.address),
+            0,
+            "回拨的采集进了账：{}",
+            rep.reason
+        );
+
+        // 反向对照：同一个签名者按**当下**写，正常进账——上面那条不是把门焊死
+        let now = harvest(&c, 1, [0u8; 32], x, y, k, tip);
+        let (st2, rep2) = replay(&[now], &view(&w, tip));
+        assert!(rep2.ok, "当下的采集被误杀：{}", rep2.reason);
+        assert_eq!(st2.balance_of(&c.address), resource::reward_at(k, tip));
+    }
+
+    /// 旧轮次不解锁资源点：别人本轮采走的格，不能靠声明"上一轮"再采一遍。
+    #[test]
+    fn claiming_an_old_epoch_does_not_unharvest_a_cell() {
+        let a = core();
+        let b = crate::keystore::open_core_from_seed(&[9u8; 32], &[2u8, 3, 5, 7, 11, 13, 17, 19]).unwrap();
+        let w = words();
+        let tip = 4 * resource::EPOCH_BLOCKS + 300;
+        let (x, y, k) = find_node(&w, tip);
+        let ra = harvest(&a, 1, [0u8; 32], x, y, k, tip);
+        // b 挑上一轮同一点：形状自洽（轮次=那一轮的块高），但判定它的块在本次
+        let rb = harvest(&b, 1, [0u8; 32], x, y, k, tip - resource::EPOCH_BLOCKS);
+        let (st, _) = replay(&[ra, rb], &view(&w, tip));
+        assert_eq!(st.balance_of(&a.address), resource::reward_at(k, tip));
+        assert_eq!(st.balance_of(&b.address), 0, "回拨轮次绕过了「本轮已采」");
+    }
+
+    /// 产出也按当下算：本轮里挑一个白天的块高来躲夜间减半，同样是回拨。
+    #[test]
+    fn night_rate_follows_the_block_that_judges_it() {
+        let c = core();
+        let w = words();
+        let day = 10 * resource::EPOCH_BLOCKS + 100;
+        let night = 10 * resource::EPOCH_BLOCKS + 450;
+        assert!(resource::is_night(night) && !resource::is_night(day));
+        let (x, y, k) = find_node(&w, night);
+
+        let stale = harvest(&c, 1, [0u8; 32], x, y, k, day);
+        let (st, _) = replay(&[stale], &view(&w, night));
+        assert_eq!(st.balance_of(&c.address), 0, "自报白天块高就拿到白天价");
+
+        let fresh = harvest(&c, 1, [0u8; 32], x, y, k, night);
+        let (st2, rep2) = replay(&[fresh], &view(&w, night));
+        assert!(rep2.ok, "夜间当下的采集被误杀：{}", rep2.reason);
+        assert_eq!(st2.balance_of(&c.address), resource::reward_at(k, night));
+        assert_eq!(
+            resource::reward_at(k, night),
+            resource::base_reward(k) / 2,
+            "夜间就该是半价"
+        );
     }
 
     #[test]

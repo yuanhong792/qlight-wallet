@@ -49,6 +49,7 @@ fn line(h: &simchain::BlockHeader) -> String {
     let l = simchain::BlockLine {
         header: h.clone(),
         wires: vec![],
+        dusts: vec![],
     };
     format!("{}\n", serde_json::to_string(&l).unwrap())
 }
@@ -70,6 +71,8 @@ fn v1_block(prev_hex: &str, height: u64) -> simchain::BlockHeader {
         miner: "ql1v1miner".to_string(),
         entity_root_hex: String::new(),
         entity_count: 0,
+        dust_root_hex: String::new(),
+        dust_count: 0,
         txs: vec![],
     }
 }
@@ -146,6 +149,9 @@ fn committed_block(
         miner: miner.to_string(),
         entity_root_hex: entity_root_hex.to_string(),
         entity_count,
+        // v2/v3/v4 的域里没有光尘的位置：留空，让换域对照保持纯净
+        dust_root_hex: String::new(),
+        dust_count: 0,
         txs: vec![],
     }
 }
@@ -172,9 +178,16 @@ fn the_world_the_producer_sees_is_written_into_the_block() {
             .expect("免费记录应能落账");
     }
 
-    let (_, head, _) = chain.mine_block(&core).expect("第 2 块应出块");
+    let (_, head, _, _) = chain.mine_block(&core).expect("第 2 块应出块");
     let (count, digest) = world::set_digest(&entities.load());
-    assert_eq!(head.version, simchain::BLOCK_V, "现行出块必须是 v4");
+    // 激活高度（200）之前照旧出 v4——这正是留给两台机器的升级窗口；
+    // 过 200 才只出 v5，那一半由 simchain 的激活测试钉住。
+    assert!(head.height <= simchain::BLOCK_V_V5_ACTIVATION);
+    assert_eq!(
+        head.version,
+        simchain::BLOCK_V_MINER,
+        "v5 激活前出块仍是 v4：没升级的邻居也认这一版"
+    );
     assert_eq!(head.entity_count, count, "块头条数 = 出块人账本条数");
     assert_eq!(head.entity_root_hex, digest, "块头指纹 = 出块人账本指纹");
 
@@ -398,7 +411,7 @@ fn an_offline_ledger_swap_breaks_against_the_committed_root() {
             })
             .expect("落账");
     }
-    let (_, head, _) = chain.mine_block(&core).expect("出块");
+    let (_, head, _, _) = chain.mine_block(&core).expect("出块");
     assert_eq!(head.entity_count, 3);
 
     // 有人离线把账本截短成 1 条（每一行都仍然自洽，只是少了两条）
@@ -416,4 +429,49 @@ fn an_offline_ledger_swap_breaks_against_the_committed_root() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// v5（域 `QL-BLOCK-V6`）必须有自己的域：光尘承诺既不能借 v4 的域重放，
+/// 也不能"算不算都在哈希里无所谓"——换光尘必须换块，否则"哪些光尘记录被全网
+/// 接受过"依旧可离线改写，恒定乘积曲线就变回一句空话。
+#[test]
+fn dust_commitment_has_its_own_domain() {
+    let prev = "ql1prev";
+    let vrf = [9u8; 32];
+    let root = simchain::tx_root_of(&[]);
+    let er = [1u8; 32];
+    let dr = [2u8; 32];
+    let v5 =
+        simchain::block_hash_of_dust(prev, 201, 0, 0, &vrf, &root, &er, 3, "ql1v5miner", &dr, 7);
+    let v4 = simchain::block_hash_of_miner_bound(prev, 201, 0, 0, &vrf, &root, &er, 3, "ql1v5miner");
+    assert_ne!(
+        hex::encode(v4),
+        hex::encode(v5),
+        "v4 块能按 v5 域重算 = 同一份历史可以有两种解释"
+    );
+    let other_dust = simchain::block_hash_of_dust(
+        prev,
+        201,
+        0,
+        0,
+        &vrf,
+        &root,
+        &er,
+        3,
+        "ql1v5miner",
+        &[3u8; 32],
+        7,
+    );
+    assert_ne!(
+        hex::encode(v5),
+        hex::encode(other_dust),
+        "换一份光尘集合却得到同一个块 = 光尘承诺没进共识"
+    );
+    let other_count =
+        simchain::block_hash_of_dust(prev, 201, 0, 0, &vrf, &root, &er, 3, "ql1v5miner", &dr, 8);
+    assert_ne!(
+        hex::encode(v5),
+        hex::encode(other_count),
+        "光尘条数没被绑住：append-only 的凭据就少了一维"
+    );
 }

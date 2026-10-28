@@ -5,8 +5,10 @@
 //! - sendRawTx   → send_qlx（构造信封 → 签名 → submit → 结算）
 
 use crate::crypto;
+use crate::feedback;
 use crate::keystore::{self, Keystore, WalletCore};
 use crate::net;
+use crate::prefs;
 use crate::simchain::{self, bech32_decode_addr, BlockEvent, SimChain};
 use crate::tx;
 use crate::world;
@@ -21,6 +23,9 @@ pub struct AppState {
     pub keystore_path: PathBuf,
     pub ledger_path: PathBuf,
     pub blocks_path: PathBuf,
+    /// 外壳偏好（prefs.json：欢迎页是否还要弹、引导走到哪一步）
+    pub prefs_path: PathBuf,
+    pub prefs: RwLock<prefs::Prefs>,
     /// 世界实体账本（entities.jsonl，append-only 哈希链；DESIGN.md §9.11）
     pub entities: Arc<world::EntityLedger>,
     /// 光尘账本（dust.jsonl，独立前缀与独立哈希链；DESIGN.md §9.17）
@@ -376,6 +381,180 @@ pub async fn import_backup(state: AppCtx<'_>, app: AppHandle) -> Result<Option<S
     Ok(Some(src.display().to_string()))
 }
 
+// ---------------------------------------------------------------- 外壳偏好 / 反馈 / 分享（DESIGN.md §9.19）
+
+#[derive(serde::Serialize)]
+pub struct PrefsDto {
+    pub welcome_done: bool,
+    pub opened_world: bool,
+    pub opened_history: bool,
+    pub guide_done: bool,
+}
+
+impl From<&prefs::Prefs> for PrefsDto {
+    fn from(p: &prefs::Prefs) -> Self {
+        PrefsDto {
+            welcome_done: p.welcome_done,
+            opened_world: p.opened_world,
+            opened_history: p.opened_history,
+            guide_done: p.guide_done,
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_prefs(state: AppCtx) -> PrefsDto {
+    PrefsDto::from(&*state.prefs.read().unwrap())
+}
+
+/// 白名单写一位偏好。先落盘再改内存：写失败时内存保持原值，界面上就不会出现
+/// "我以为存下来了，重启又弹一遍"——那种错觉比一次报错难查得多。
+#[tauri::command]
+pub fn set_pref(state: AppCtx, key: String, value: bool) -> Result<PrefsDto, String> {
+    let mut p = state.prefs.read().unwrap().clone();
+    prefs::apply(&mut p, &key, value)?;
+    prefs::save(&state.prefs_path, &p)?;
+    let dto = PrefsDto::from(&p);
+    *state.prefs.write().unwrap() = p;
+    Ok(dto)
+}
+
+/// 聚合诊断数字（反馈包的机器部分）。全是内存里的计数，没有一个字段是文件内容。
+fn diag_of(state: &AppState) -> feedback::Diag {
+    let core = state.core.read().unwrap().clone();
+    let entity_lines = state.entities.load().len();
+    let (dust_recs, dust_rep) = state.dust.load_report();
+    let present = state.net.presence_report()["count"]
+        .as_u64()
+        .unwrap_or(0) as usize;
+    feedback::Diag {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        rules: simchain::rules_tag(),
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        height: state.chain.height(),
+        peers: state.net.peers_count(),
+        present,
+        entity_lines,
+        dust_lines: dust_recs.len(),
+        entity_bad_lines: state.entities.bad_lines(),
+        dust_bad_lines: dust_rep.bad_lines,
+        unlocked: core.is_some(),
+        // 只报"是不是同机多开的第 N 个实例"，不报路径：路径里带用户名
+        multi_instance: state
+            .data_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("node-"))
+            .unwrap_or(false),
+    }
+}
+
+/// 反馈包提交前给玩家看一眼会带走什么（透明是设计，不是客套）
+#[tauri::command]
+pub fn diag_report(state: AppCtx) -> feedback::Diag {
+    diag_of(&state)
+}
+
+/// 从 data: URL 里解出 PNG 字节。界面只能交截图，别的形状一律拒。
+fn decode_png_data_url(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let b64 = s
+        .strip_prefix("data:image/png;base64,")
+        .ok_or("截图必须是 PNG 的 data URL")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("截图数据解不开：{e}"))?;
+    if !bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Err("截图不是合法 PNG".into());
+    }
+    // 128 MB 上限：正常全屏截图几 MB，超这个数只会是把谁的日志当成图片交了上来
+    if bytes.len() > 128 * 1024 * 1024 {
+        return Err("截图过大".into());
+    }
+    Ok(bytes)
+}
+
+/// 玩家选的保存路径落成 PathBuf（dialog 插件在两种平台上返回两种形状）
+fn dest_path(fp: FilePath) -> Result<PathBuf, String> {
+    match fp {
+        FilePath::Path(p) => Ok(p),
+        FilePath::Url(u) => u.to_file_path().map_err(|_| "无法解析保存路径".to_string()),
+    }
+}
+
+/// 导出反馈包：只写玩家自己选的本地文件。**本版没有任何上传通道。**
+/// 带截图时同目录再写一个同名 `.png`（一次对话框，两个文件）。
+#[tauri::command]
+pub async fn feedback_write(
+    app: AppHandle,
+    state: AppCtx<'_>,
+    problem: String,
+    include_addr: bool,
+    screenshot: Option<String>,
+) -> Result<Option<String>, String> {
+    let png = match screenshot.as_deref() {
+        None => None,
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(decode_png_data_url(s)?),
+    };
+    let d = diag_of(&state);
+    let addr = state
+        .core
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.address.clone())
+        .unwrap_or_default();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let payload = feedback::build(&d, &problem, png.is_some(), include_addr, &addr, ts);
+
+    let stem = format!("qlight-feedback-{}", ts);
+    let fp = app
+        .dialog()
+        .file()
+        .set_file_name(format!("{stem}.json"))
+        .add_filter("QLight 反馈包", &["json"])
+        .blocking_save_file();
+    let Some(fp) = fp else { return Ok(None) };
+    let dest = dest_path(fp)?;
+    let out = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
+    std::fs::write(&dest, out).map_err(|e| format!("写入反馈包失败：{e}"))?;
+    if let Some(bytes) = png {
+        let shot = dest.with_extension("png");
+        std::fs::write(&shot, bytes).map_err(|e| format!("写入截图失败：{e}"))?;
+    }
+    Ok(Some(dest.display().to_string()))
+}
+
+/// 导出作品分享：PNG + 同名 `.txt`（坐标/标题等说明文字，短视频简介直接复制）
+#[tauri::command]
+pub async fn export_share(
+    app: AppHandle,
+    image_data_url: String,
+    caption: String,
+) -> Result<Option<String>, String> {
+    let bytes = decode_png_data_url(&image_data_url)?;
+    let fp = app
+        .dialog()
+        .file()
+        .set_file_name("qlight-world.png")
+        .add_filter("PNG 图片", &["png"])
+        .blocking_save_file();
+    let Some(fp) = fp else { return Ok(None) };
+    let dest = dest_path(fp)?;
+    std::fs::write(&dest, bytes).map_err(|e| format!("写入截图失败：{e}"))?;
+    if !caption.trim().is_empty() {
+        // 说明文字限长：分享卡不是日志容器，超了截断而不是丢弃整段
+        let text: String = caption.trim().chars().take(4000).collect();
+        let side = dest.with_extension("txt");
+        std::fs::write(&side, text).map_err(|e| format!("写入坐标说明失败：{e}"))?;
+    }
+    Ok(Some(dest.display().to_string()))
+}
+
 // ---------------------------------------------------------------- 内部工具
 
 /// "1.23" → 1_230_000_000（QLX 9 位小数）
@@ -443,10 +622,29 @@ fn emit_initial_state(app: &AppHandle, state: AppCtx, core: Arc<WalletCore>) {
 /// 联邦网络状态（UI 网络条 chip）
 #[tauri::command]
 pub fn net_status(state: AppCtx) -> serde_json::Value {
-    serde_json::json!({
-        "count": state.net.peers_count(),
-        "unlocked": state.core.read().unwrap().is_some(),
-    })
+    // 版本普查部分与 `net_versions` 事件同形：chip 只有一套读法
+    let mut v = state.net.version_report();
+    v["count"] = serde_json::json!(state.net.peers_count());
+    v["unlocked"] = serde_json::json!(state.core.read().unwrap().is_some());
+    v["present"] = serde_json::json!(state.net.presence_report()["count"]);
+    // 联机三态（本地 / 局域网 / 公网）：现在只可能长出前两档，公网那一档留给界面说实话
+    v["scope"] = state.net.scope_report();
+    v
+}
+
+/// 🚶 上报我在世界里的位置（DESIGN.md §9.19）。
+///
+/// 只在内存与 gossip 里流动：不写账本、不进块、不参与任何归属或发行判定，
+/// 所以它既刷不出币，也不能替任何人声称"那一格是我的"。
+#[tauri::command]
+pub fn pos_publish(state: AppCtx, x: f64, y: f64, z: f64, heading: f64) -> Result<(), String> {
+    state.net.publish_presence(x, y, z, heading)
+}
+
+/// 在场名单（前端画邻居、以及「同世界 N 人」的数据源）
+#[tauri::command]
+pub fn world_presence(state: AppCtx) -> serde_json::Value {
+    state.net.presence_report()
 }
 
 /// 版本号唯一来源是 Cargo.toml —— 写进 8 个语言的文案里必然过期
@@ -536,6 +734,36 @@ pub struct WorldSnapshot {
     pub mine_next_floor: u64,
     /// 创造权重：占了几格、守了多少个块。只计量，不评价好坏。
     pub craft: world::Craft,
+    /// —— 账本健康（DESIGN.md §9.18）——
+    /// 实体账本最近一次整本读入跳过的坏行数。坏行只伤它自己那一行，但必须让界面
+    /// 说得出"少了 N 行"：静默跳过等于让本机悄悄用另一本账参与共识。
+    pub entity_bad_lines: usize,
+    /// 光尘账本同上。这两本里任何一本的条数都会进块承诺，掉行不是无痕的。
+    pub dust_bad_lines: usize,
+    /// —— 挖地（§9.20）——
+    /// 已经被挖出坑的列：顶面层与已剥层数。渲染器只认这个，不自己猜。
+    pub dug: Vec<DugColumn>,
+    /// 本机地址手上的材料（土 / 石 / 矿），已扣掉建造消耗
+    pub materials: [u32; world::MAT_COUNT],
+    /// 物品栏 16 件的造价表（土 / 石 / 矿）
+    pub build_costs: Vec<[u32; world::MAT_COUNT]>,
+    /// 最后一层能挖到的层（岩床之上）：再往下就是第 0 层
+    pub dig_floor: u16,
+    /// 整本账都写在链头之上：它不是这本链的世界，而是链重置前那一代的
+    /// （每条记录的高度都超过链尖）。界面据此给出「归档旧世界账本」的出口，
+    /// 不把「一条坏行」和「换了条链」当成同一件事。
+    pub ledger_foreign: bool,
+}
+
+/// 一列挖出来的坑：渲染器把顶面压到 `top`，坑壁按深度分带
+#[derive(serde::Serialize)]
+pub struct DugColumn {
+    pub x: u16,
+    pub y: u16,
+    /// 当前露在外面的那一层（0 = 挖到岩床）
+    pub top: u16,
+    /// 已剥掉的层数
+    pub removed: u32,
 }
 
 /// 逐块读出 VRF 序列（世界的历史即种子；创世行的 VRF 是全零，异或进去不改变种子）
@@ -547,11 +775,27 @@ fn vrf_sequence(blocks_path: &std::path::Path) -> Vec<String> {
 pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
     let records = state.entities.load();
     let view = chain_view(&state);
-    let (state_map, report) = world::replay(&records, &view);
+    let w = world::replay_world(&records, &view);
+    let report = w.report.clone();
+    let state_map = w.entities;
     let core = state.core.read().unwrap().clone();
     let address = core.as_ref().map(|c| c.address.clone()).unwrap_or_default();
     let vrfs = vrf_sequence(&state.blocks_path);
     let height = state.chain.height();
+    // 旧世界账本：每条记录都写在链尖之上，或者版式 v3 的买单交易一笔都不在链上。
+    // 后一条是长期判据——链会一直长，长过旧记录的块高之后前一条自然失效。
+    let fee_known = records.iter().filter(|r| !r.fee_tx_hex.is_empty()).count();
+    let fee_present = records
+        .iter()
+        .filter(|r| !r.fee_tx_hex.is_empty() && view.fee(&r.fee_tx_hex).is_some())
+        .count();
+    let ledger_foreign = world::ledger_is_foreign(
+        report.ok,
+        &records.iter().map(|r| r.height).collect::<Vec<_>>(),
+        height,
+        fee_known,
+        fee_present,
+    );
 
     // 矿脉：与渲染器用同一份大地/地表，所以钱包算出的矿和网页上那片土地是同一片
     let words = world::terrain::seed_words(&simchain::genesis_hash_hex(), &vrfs);
@@ -567,7 +811,7 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
         records
             .iter()
             .filter(|r| {
-                r.v == "QL-ENTREC-v4"
+                (r.v == world::RECORD_VERSION || r.v == "QL-ENTREC-v4")
                     && r.pk_hash_hex == pk
                     && r.height / world::FREE_QUOTA_WINDOW == window
             })
@@ -581,6 +825,22 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
     let next_claim = state.chain.next_claim_height(&miner_addr);
     // 创造权重：世界状态 + 链头高度的纯函数。同一份账本，任何人算出同一个数。
     let craft = world::craft_of(&state_map, &address, height);
+    let dug: Vec<DugColumn> = w
+        .dug
+        .iter()
+        .map(|(&(x, y), &removed)| DugColumn {
+            x,
+            y,
+            top: world::column_top(&w.dug, x, y),
+            removed,
+        })
+        .collect();
+    let materials = w
+        .materials
+        .get(&address)
+        .copied()
+        .unwrap_or([0; world::MAT_COUNT]);
+    let build_costs = (0..world::SLOT_COUNT).map(world::build_cost).collect();
 
     WorldSnapshot {
         genesis_hash_hex: simchain::genesis_hash_hex(),
@@ -612,7 +872,61 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
         mine_claims_by_me,
         mine_next_floor,
         craft,
+        // 实体账本在上面已整本读入；光尘账本这里显式读一次，坏行数与它自己的重放同一口径
+        entity_bad_lines: state.entities.bad_lines(),
+        dust_bad_lines: state.dust.load_report().1.bad_lines,
+        dug,
+        materials,
+        build_costs,
+        dig_floor: world::DUG_FLOOR,
+        ledger_foreign,
     }
+}
+
+#[derive(serde::Serialize)]
+pub struct LedgerArchive {
+    pub tag: String,
+    /// 归档后的文件名（原文件只改名，不删除）
+    pub files: Vec<String>,
+}
+
+/// 把校验不过的世界账本归档（**只改名不删除**），让新世界从空账开始。
+///
+/// 只处理"换了条链"这一种情形：链被归档重置后，旧世界的记录引用的块已经不存在，
+/// 留着的唯一效果是每次写入都被判「账本第 1 条起校验失败」。能通过重放的账本一律
+/// 不动——那说明它属于这条链，归档等于抹掉活着的世界。
+#[tauri::command]
+pub fn world_archive_ledger(state: AppCtx) -> Result<LedgerArchive, String> {
+    let records = state.entities.load();
+    let ent_ok = world::replay_world(&records, &chain_view(&state)).report.ok;
+    let (_, dust_rep) = world::dust::replay(&state.dust.load(), &dust_view(&state));
+    if ent_ok && dust_rep.ok {
+        return Err("这两本账都能通过校验，不需要归档".into());
+    }
+    let tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let mut files = Vec::new();
+    for (name, bad) in [("entities.jsonl", !ent_ok), ("dust.jsonl", !dust_rep.ok)] {
+        if !bad {
+            continue;
+        }
+        let from = state.data_dir.join(name);
+        if !from.exists() {
+            continue;
+        }
+        let to = state.data_dir.join(format!("{name}.bak-world-{tag}"));
+        std::fs::rename(&from, &to)
+            .map_err(|e| format!("归档 {name} 失败：{e}"))?;
+        files.push(
+            to.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+    }
+    Ok(LedgerArchive { tag, files })
 }
 
 /// 已占用的格子（`released` 的不算：断租即让位，与 `world::live_at` 同一判据）
@@ -865,6 +1179,9 @@ pub struct DustHarvestResult {
 #[tauri::command]
 pub fn world_harvest(state: AppCtx, x: u16, y: u16) -> Result<DustHarvestResult, String> {
     let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    // 采集也先认世界：实体账本从某条起重放不过，这台机器用的就是另一本世界，
+    // 而光尘能经兑换池换回 QLX——产出侧不许带病开工，与 world_mine_once 同口径。
+    live_world(&state)?;
     let height = state.chain.height();
     // 资源/光尘一律用创世种子：判定结果必须能被任意时刻重放复现
     let words = world::resource_words();
@@ -953,7 +1270,7 @@ pub fn world_dust_send(state: AppCtx, to: String, amount: u64) -> Result<world::
     Ok(rec)
 }
 
-// ---------------------------------------------------------------- 旅人摊位（§9.18）
+// ---------------------------------------------------------------- 旅人摊位（§9.17）
 
 #[derive(serde::Serialize)]
 pub struct TraderOffer {
@@ -1086,15 +1403,19 @@ fn check_coords(x: u16, y: u16, layer: u16, kind: u8) -> Result<(), String> {
 
 /// 写操作前的统一前置：整本重放必须完好。一条语义非法的记录一旦落盘，
 /// 世界就从那条起再也重放不过去——所以宁可在这里就把话说明白。
-fn live_world(state: &AppState) -> Result<std::collections::BTreeMap<String, world::Entity>, String> {
-    let (map, report) = world::replay(&state.entities.load(), &chain_view(state));
-    if !report.ok {
+fn live_world_full(state: &AppState) -> Result<world::World, String> {
+    let w = world::replay_world(&state.entities.load(), &chain_view(state));
+    if !w.report.ok {
         return Err(format!(
             "实体账本第 {} 条起校验失败：{}。先排查账本再继续写入",
-            report.first_bad, report.reason
+            w.report.first_bad, w.report.reason
         ));
     }
-    Ok(map)
+    Ok(w)
+}
+
+fn live_world(state: &AppState) -> Result<std::collections::BTreeMap<String, world::Entity>, String> {
+    Ok(live_world_full(state)?.entities)
 }
 
 /// 那一格那一层是否已被活方块占用（`except_id` 允许"挪回原位"这类空操作）
@@ -1124,6 +1445,76 @@ fn check_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+#[derive(serde::Serialize)]
+pub struct DigResult {
+    pub record: world::EntityRecord,
+    pub x: u16,
+    pub y: u16,
+    /// 被剥掉的那一层
+    pub layer: u16,
+    /// 产出的材料（0 土 / 1 石 / 2 矿）
+    pub kind: u8,
+    /// 离地表的深度（0 = 地表那一层）
+    pub depth: u16,
+    /// 挖完以后这一列的新顶面
+    pub top: u16,
+    /// 挖完以后手上的材料
+    pub materials: [u32; world::MAT_COUNT],
+}
+
+/// ⛏ 挖一格：剥掉这一列露在最上面的那一层，材料当场进账（§9.20）。
+///
+/// 坐标和层数都不接受前端"随便指"——层数由这一列的历史算出来（地表层 − 已挖层数），
+/// 所以"我挖到了什么"不是客户端说了算，而是大地高度场说了算。想拿矿，就真往下挖。
+#[tauri::command]
+pub fn world_dig(state: AppCtx, x: u16, y: u16) -> Result<DigResult, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    if x >= world::WORLD_W || y >= world::WORLD_H {
+        return Err(format!("坐标 ({x},{y}) 超出世界边界 {}×{}", world::WORLD_W, world::WORLD_H));
+    }
+    let w = live_world_full(&state)?;
+    if world::is_water(x, y) {
+        return Err(format!("({x},{y}) 是水面，挖不动"));
+    }
+    let top = world::column_top(&w.dug, x, y);
+    if top < world::DUG_FLOOR {
+        return Err(format!("({x},{y}) 已经挖到岩床（第 {} 层）", world::DUG_FLOOR));
+    }
+    let depth = world::surface_layer(x, y) - top;
+    let kind = world::material_at_depth(depth);
+    let rec = commit_record(
+        &state,
+        &core,
+        &world::Draft {
+            op: world::op::DIG,
+            entity_id_hex: "",
+            parent_hex: "",
+            name: "",
+            x,
+            y,
+            layer: top,
+            kind,
+            height: state.chain.height(),
+            ts: now_unix(),
+        },
+    )?;
+    let after = world::replay_world(&state.entities.load(), &chain_view(&state));
+    Ok(DigResult {
+        record: rec,
+        x,
+        y,
+        layer: top,
+        kind,
+        depth,
+        top: world::column_top(&after.dug, x, y),
+        materials: after
+            .materials
+            .get(&core.address)
+            .copied()
+            .unwrap_or([0; world::MAT_COUNT]),
+    })
+}
+
 /// 创造一格世界：**免费、当场生效**（§9.14）。
 ///
 /// 不付钱、不等确认——创造不该被币控制。防刷是确定性的窗口配额：
@@ -1141,11 +1532,35 @@ pub fn world_place(
     let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
     let name = check_name(&name)?;
     check_coords(x, y, layer, kind)?;
-    let map = live_world(&state)?;
-    voxel_taken(&map, x, y, layer, "")?;
+    let w = live_world_full(&state)?;
+    voxel_taken(&w.entities, x, y, layer, "")?;
+    // 还埋在地下的层不能放东西：那是石头的地盘，先挖开才轮得到你造
+    let top = world::column_top(&w.dug, x, y);
+    if layer < top {
+        return Err(format!(
+            "({},{}) 第 {layer} 层还埋在地下（这一列顶面在第 {top} 层），先挖开再建",
+            x, y
+        ));
+    }
+    // 材料硬拦放在钱包侧：共识只把账算准（见 world.rs 的说明），签名之前这里必须挡住
+    let cost = world::build_cost(kind);
+    let have = w
+        .materials
+        .get(&core.address)
+        .copied()
+        .unwrap_or([0; world::MAT_COUNT]);
+    for (i, need) in cost.iter().enumerate() {
+        if have[i] < *need {
+            return Err(format!(
+                "材料不足：造「{name}」要 {need} 份{}，手上只有 {}。先去挖地",
+                world::mat_name(i as u8),
+                have[i]
+            ));
+        }
+    }
     let parent_hex = parent_hex.trim().to_string();
     if !parent_hex.is_empty() {
-        match map.get(&parent_hex) {
+        match w.entities.get(&parent_hex) {
             Some(p) if !p.released => {}
             Some(_) => return Err("父实体已无归属，不能再衍生".into()),
             None => return Err("父实体不存在".into()),
@@ -1275,7 +1690,7 @@ pub fn world_proof(state: AppCtx, entity_id_hex: String) -> Result<String, Strin
 }
 
 
-// ---------------------------------------------------------------- 兑换池（§9.19）
+// ---------------------------------------------------------------- 兑换池（§9.17）
 
 /// 池子的只读快照：储备、价格、我的份额与两条余额。
 ///

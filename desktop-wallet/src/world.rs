@@ -25,8 +25,8 @@
 /// 世界可用的最大高度层（layer ∈ 0..MAX_LAYER）。
 ///
 /// 地形本身是算出来的：`layer = 高度场 >> 3`（`ui/world.js` 与 `tools/world/*`
-/// 同一口径），所以地表只到 31 层。留到 64 层是给玩家往天上造的——
-/// **地形不能被挖，能被造的只有签过名的方块**。
+/// 同一口径），所以地表只到 28 层。留到 64 层是给玩家往天上造的；
+/// 往地下则是**挖**——每挖一层落一条 `dig` 记录（v5），挖到第 1 层为止。
 pub const MAX_LAYER: u16 = 64;
 
 use crate::crypto;
@@ -60,10 +60,31 @@ pub const NAME_MAX: usize = 64;
 pub const FREE_QUOTA_WINDOW: u64 = 1_024;
 pub const FREE_QUOTA_MAX: u32 = 4_096;
 
+/// 每列真正挖不动的那一层：第 0 层是岩床，第 1 层是最后一层可挖的地。
+/// 地表层最高 28、最低 4，所以一列能挖 3..27 层（全图均值约 13 层）。
+pub const DUG_FLOOR: u16 = 1;
+
+/// 材料编号（`dig` 记录的 `kind`）：0 泥土、1 石头、2 矿。
+/// 与 `claim` 的 `kind`（物品栏槽位）共用同一个字段，但语义按 `op` 分开——
+/// 重放时先看操作、再看字段，绝不会把一件家具当成一筐土。
+pub const MAT_SOIL: u8 = 0;
+pub const MAT_STONE: u8 = 1;
+pub const MAT_ORE: u8 = 2;
+pub const MAT_COUNT: usize = 3;
+
+/// 深度带（离地表的层数）：0..=3 是泥土，4..=9 是石头，10 层以下才出矿。
+/// 矿必须靠真往下挖换来——否则"深度"就只是画面上的说法。
+pub const DUG_SOIL_DEPTH: u16 = 3;
+pub const DUG_STONE_DEPTH: u16 = 9;
+
 const REC_PREFIX_V3: &[u8] = b"QL-ENTREC-v3";
 const REC_PREFIX_V4: &[u8] = b"QL-ENTREC-v4";
+const REC_PREFIX_V5: &[u8] = b"QL-ENTREC-v5";
 const REC_HASH_PREFIX: &[u8] = b"QL-ENTREC-H1";
-const RECORD_VERSION: &str = "QL-ENTREC-v4";
+pub(crate) const RECORD_VERSION: &str = "QL-ENTREC-v5";
+/// v4 = 免费的上一代语义（无挖地、无材料）。老账本必须原样重放——
+/// 升版本换前缀是为了让新的字段语义（kind 在 dig 里指材料）不污染旧记录。
+const RECORD_VERSION_V4: &str = "QL-ENTREC-v4";
 const RECORD_VERSION_V3: &str = "QL-ENTREC-v3";
 const ID_PREFIX: &[u8] = b"QL-ENT-V1";
 const CHUNK_PREFIX: &[u8] = b"QL-CHUNK-V1";
@@ -91,19 +112,26 @@ pub fn entity_fee(op: &str) -> Option<u64> {
     }
 }
 
-/// 操作类型（对应 §9.11 的四件事：铸、改名、挪动、释放归属）
+/// 操作类型（对应 §9.11 的四件事：铸、改名、挪动、释放归属）+ v5 的第五件：挖
 pub mod op {
     pub const CLAIM: &str = "claim";
     pub const RENAME: &str = "rename";
     pub const MOVE: &str = "move";
     pub const RELEASE: &str = "release";
+    /// v5：从某一列剥掉露出地面的那一层，产出一份材料（§9.20）
+    pub const DIG: &str = "dig";
 }
 
 /// 一条实体记录（entities.jsonl 每行一条，字段全部参与哈希链，无冗余可篡改位）
 ///
 /// 版本沿革：v1（无 layer，从未签名过任何一条）→ v2（加 layer）→
 /// v3（加 `fee_tx_hex`：每条写入必须由一笔已确认的链上付款买单）→
-/// **v4（建造免费：`fee_tx_hex` 必须为空，`height` 不得超过链头，按窗口配额防刷）**。
+/// **v4（建造免费：`fee_tx_hex` 必须为空，`height` 不得超过链头，按窗口配额防刷）** →
+/// **v5（地形可挖：新增 `op = "dig"`，材料进重放状态，建造按材料扣费）**。
+///
+/// v5 的 `dig` 记录里字段各管什么：`x, y` = 列，`layer` = 被剥掉的那一层，
+/// `kind` = 产出的材料（0 土 / 1 石 / 2 矿），`name`、`entity_id_hex`、
+/// `parent_hex` 一律为空——挖不是造东西，账本里不留一个假实体。
 ///
 /// v3 用钱解决了"刷盘免费"；v4 把这笔钱拿掉，是因为**创造不该被币控制**。
 /// 防刷改为确定性的速率上限：同一归属者、同一 1024 块窗口最多 4096 条。
@@ -157,8 +185,10 @@ pub struct EntityRecord {
 fn rec_prefix(v: &str) -> &'static [u8] {
     if v == RECORD_VERSION_V3 {
         REC_PREFIX_V3
-    } else {
+    } else if v == RECORD_VERSION_V4 {
         REC_PREFIX_V4
+    } else {
+        REC_PREFIX_V5
     }
 }
 
@@ -252,6 +282,72 @@ pub fn derive_entity_id(prev_hash: &[u8; 32], pk_hash: &[u8; 32], r: &EntityReco
     let mut out = [0u8; 32];
     out.copy_from_slice(&d);
     out
+}
+
+// ---------------------------------------------------------------- 挖掘（v5）
+
+/// 大地种子：只取创世哈希，**不折任何块 VRF**。
+///
+/// 挖掘判定必须用它：地表湿度（`chain_words`）每出一个块就重画一次，
+/// 拿它判定"这一列地表在第几层"，昨天挖的那一格今天就会变成非法——
+/// 一笔历史被后来的块改判，等于整个重放不可复现。
+fn ground_words() -> &'static Vec<u32> {
+    static WORDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    WORDS.get_or_init(|| terrain::seed_words(&crate::simchain::genesis_hash_hex(), &[]))
+}
+
+/// 该列的大地高度（0..247，历史无关）
+pub fn ground_height(x: u16, y: u16) -> u32 {
+    terrain::height_at(x as u32, y as u32, ground_words())
+}
+
+/// 该列原始地表所在的层：地表方块就占这一层，顶面在 `layer + 1`
+pub fn surface_layer(x: u16, y: u16) -> u16 {
+    (ground_height(x, y) >> 3) as u16
+}
+
+/// 水面不是方块：这一列挖不动（也挖不出东西）
+pub fn is_water(x: u16, y: u16) -> bool {
+    ground_height(x, y) < terrain::SEA_LEVEL
+}
+
+/// 深度带 → 材料。`depth` = 离地表的层数（0 = 地表那一层被剥掉）
+pub fn material_at_depth(depth: u16) -> u8 {
+    if depth <= DUG_SOIL_DEPTH {
+        MAT_SOIL
+    } else if depth <= DUG_STONE_DEPTH {
+        MAT_STONE
+    } else {
+        MAT_ORE
+    }
+}
+
+pub fn mat_name(i: u8) -> &'static str {
+    match i {
+        MAT_SOIL => "泥土",
+        MAT_STONE => "石头",
+        MAT_ORE => "矿",
+        _ => "材料",
+    }
+}
+
+/// 造一件东西要的材料（v5 起建造真花钱，钱就是挖出来的土石矿）。
+///
+/// 一张 16 行的表，按物品栏槽位索引。结构件吃石料、活物与花木吃泥土、
+/// 灯塔要点矿石——**不是定价策略，是让"往下挖"有去处**。木料要等砍树
+/// 那条记录做出来再补，这一版先把土石矿的闭环跑通。
+pub fn build_cost(kind: u8) -> [u32; MAT_COUNT] {
+    let mut c = [0u32; MAT_COUNT];
+    match kind {
+        0 => c[MAT_STONE as usize] = 1,                  // 石头
+        3 | 4 => c[MAT_STONE as usize] = 1,              // 木屋 / 木桥：结构料
+        5 => {
+            c[MAT_STONE as usize] = 1;                   // 灯塔：石料 + 矿
+            c[MAT_ORE as usize] = 1;
+        }
+        _ => c[MAT_SOIL as usize] = 1,                   // 树 / 花 / 篝火 / 篱笆 / 生灵
+    }
+    c
 }
 
 /// 世界里的一个实体（由记录重放出来的当前状态，不是独立存储）
@@ -437,6 +533,64 @@ pub fn replay(records: &[EntityRecord], view: &ChainView) -> (BTreeMap<String, E
     (w.state, w.report)
 }
 
+/// 重放出来的整个可见世界：实体 + 结算单 + 挖掉的土 + 每个人手里的材料。
+///
+/// 挖地让世界多了两个维度（地下的形状、材料的存量），但两者都是**记录集合的
+/// 纯函数**——同一条账本，任何机器算出同一片地、同一本材料账。
+pub struct World {
+    pub entities: BTreeMap<String, Entity>,
+    pub report: Report,
+    /// (x, y) → 这一列已经剥掉的层数；顶面层 = `surface_layer - 已挖层数`
+    pub dug: BTreeMap<(u16, u16), u32>,
+    /// 地址 → 土 / 石 / 矿
+    pub materials: BTreeMap<String, [u32; MAT_COUNT]>,
+}
+
+/// 整本账一条都通不过，而且它对这条链的**锚点一个都找不到** = 这本账属于另一条链
+/// （链被归档重置前的旧世界）。锚点有两种：块高（记录写在链尖之上）、手续费凭据
+/// （v3 记录买单的那笔交易在链上）。链一直在长，块高锚迟早失效——链长过旧记录的
+/// 高度之后，凭据锚还认得出这本账：新链再长也变不出那些交易。
+/// 只用来决定界面要不要给「归档旧世界账本」这个出口；它不是共识判据，真实写入
+/// 仍由 `replay_world` 逐条判定。
+pub fn ledger_is_foreign(
+    report_ok: bool,
+    heights: &[u64],
+    tip: u64,
+    fee_anchors_known: usize,
+    fee_anchors_present: usize,
+) -> bool {
+    let n = heights.len();
+    if report_ok || n == 0 {
+        return false;
+    }
+    let all_above_tip = heights.iter().all(|&h| h > tip);
+    // 每条记录都带 v3 手续费凭据、且没有一笔在当前链上：整本账的履历都不属于这条链
+    let every_fee_absent = fee_anchors_known == n && fee_anchors_present == 0;
+    all_above_tip || every_fee_absent
+}
+
+pub fn replay_world(records: &[EntityRecord], view: &ChainView) -> World {
+    let w = walk_full(records, view);
+    let mut materials: BTreeMap<String, [u32; MAT_COUNT]> = BTreeMap::new();
+    for ((addr, mat), n) in w.mats {
+        if (mat as usize) < MAT_COUNT {
+            materials.entry(addr).or_insert([0; MAT_COUNT])[mat as usize] = n;
+        }
+    }
+    World {
+        entities: w.state,
+        report: w.report,
+        dug: w.dug,
+        materials,
+    }
+}
+
+/// 该列当前露在外面的那一层（地表以下已被挖空的层不算）
+pub fn column_top(dug: &BTreeMap<(u16, u16), u32>, x: u16, y: u16) -> u16 {
+    let removed = dug.get(&(x, y)).copied().unwrap_or(0);
+    surface_layer(x, y).saturating_sub(removed.min(u16::MAX as u32) as u16)
+}
+
 /// 与 `replay` 同一份判定（绝不写两套），额外回吐"每一条是否被接受"的下标标记——
 /// M0 合并邻居中继的记录时必须知道到底是哪几条进了世界，而不是只看一个总闸。
 fn walk(records: &[EntityRecord], view: &ChainView) -> (BTreeMap<String, Entity>, Report, Vec<bool>) {
@@ -452,10 +606,14 @@ struct Walked {
     report: Report,
     flags: Vec<bool>,
     used_fees: BTreeSet<String>,
-    /// (公钥摘要, 窗口号 h/FREE_QUOTA_WINDOW) → 该窗口已接受的 v4 记录数
+    /// (公钥摘要, 窗口号 h/FREE_QUOTA_WINDOW) → 该窗口已接受的免费记录数
     writes: BTreeMap<(String, u64), u32>,
-    /// 每个归属者最后一条 v4 记录的声明块高
+    /// 每个归属者最后一条免费记录的声明块高
     last_v4: BTreeMap<String, u64>,
+    /// (x, y) → 已剥掉的层数
+    dug: BTreeMap<(u16, u16), u32>,
+    /// (地址, 材料) → 存量
+    mats: BTreeMap<(String, u8), u32>,
 }
 
 fn walk_full(records: &[EntityRecord], view: &ChainView) -> Walked {
@@ -464,6 +622,8 @@ fn walk_full(records: &[EntityRecord], view: &ChainView) -> Walked {
     let mut used_fees: BTreeSet<String> = BTreeSet::new();
     let mut writes: BTreeMap<(String, u64), u32> = BTreeMap::new();
     let mut last_v4: BTreeMap<String, u64> = BTreeMap::new();
+    let mut dug: BTreeMap<(u16, u16), u32> = BTreeMap::new();
+    let mut mats: BTreeMap<(String, u8), u32> = BTreeMap::new();
     let mut accepted = 0usize;
     let mut skipped = 0usize;
     let mut flags = vec![false; records.len()];
@@ -478,6 +638,8 @@ fn walk_full(records: &[EntityRecord], view: &ChainView) -> Walked {
             &mut state,
             &mut used_fees,
             &mut writes,
+            &mut dug,
+            &mut mats,
             ch.accepted,
             &ch.prev,
             ch.last_v4_height,
@@ -487,7 +649,7 @@ fn walk_full(records: &[EntityRecord], view: &ChainView) -> Walked {
             Ok(()) => {
                 ch.prev = record_hash(r);
                 ch.accepted += 1;
-                if r.v == RECORD_VERSION {
+                if is_free_version(&r.v) {
                     *writes
                         .entry((r.pk_hash_hex.clone(), r.height / FREE_QUOTA_WINDOW))
                         .or_insert(0) += 1;
@@ -527,24 +689,41 @@ fn walk_full(records: &[EntityRecord], view: &ChainView) -> Walked {
         used_fees,
         writes,
         last_v4,
+        dug,
+        mats,
     }
+}
+
+/// v4 与 v5 都走"免费 + 窗口配额"这条路；v3 走当年的手续费那条
+fn is_free_version(v: &str) -> bool {
+    v == RECORD_VERSION || v == RECORD_VERSION_V4
 }
 
 fn apply_record(
     state: &mut BTreeMap<String, Entity>,
     used_fees: &mut BTreeSet<String>,
     writes: &mut BTreeMap<(String, u64), u32>,
+    dug: &mut BTreeMap<(u16, u16), u32>,
+    mats: &mut BTreeMap<(String, u8), u32>,
     want_seq: u64,
     prev: &[u8; 32],
     last_v4_height: u64,
     r: &EntityRecord,
     view: &ChainView,
 ) -> Result<(), String> {
-    let legacy = match r.v.as_str() {
-        RECORD_VERSION => false,
-        RECORD_VERSION_V3 => true,
+    /// 三代语义：v3 靠链上付款、v4 免费但有配额、v5 在 v4 之上加挖地与材料
+    enum Ver {
+        Fee,
+        Free,
+        World,
+    }
+    let ver = match r.v.as_str() {
+        RECORD_VERSION => Ver::World,
+        RECORD_VERSION_V4 => Ver::Free,
+        RECORD_VERSION_V3 => Ver::Fee,
         other => return Err(format!("未知记录版本 {other}")),
     };
+    let legacy = matches!(ver, Ver::Fee);
     if r.seq != want_seq + 1 {
         return Err(format!(
             "该归属者的序号断裂：期望 {}，实得 {}",
@@ -555,7 +734,16 @@ fn apply_record(
     if hex::encode(prev) != r.prev_hash_hex {
         return Err(format!("哈希链断裂：seq {} 的 prev_hash 与其上一条不符", r.seq));
     }
-    if r.name.is_empty() || r.name.len() > NAME_MAX {
+    if r.op == op::DIG {
+        // 挖不是造东西：不带名字、不带实体 id、不挂父实体。留出任何一个空位，
+        // 账本里就会多一条"看起来像实体"的幽灵记录。
+        if !matches!(ver, Ver::World) {
+            return Err(format!("seq {} 是 {} 记录，那一代还没有「挖」", r.seq, r.v));
+        }
+        if !r.name.is_empty() || !r.entity_id_hex.is_empty() || !r.parent_hex.is_empty() {
+            return Err(format!("seq {} 的挖地记录不许带名字／实体 id／父实体", r.seq));
+        }
+    } else if r.name.is_empty() || r.name.len() > NAME_MAX {
         return Err(format!("seq {} 名称长度为 {}，须为 1..={}", r.seq, r.name.len(), NAME_MAX));
     }
     if r.x >= WORLD_W || r.y >= WORLD_H || r.layer >= MAX_LAYER || r.kind >= SLOT_COUNT {
@@ -564,7 +752,7 @@ fn apply_record(
             r.seq, r.x, r.y, r.layer, r.kind
         ));
     }
-    if !matches!(r.op.as_str(), op::CLAIM | op::RENAME | op::MOVE | op::RELEASE) {
+    if !matches!(r.op.as_str(), op::CLAIM | op::RENAME | op::MOVE | op::RELEASE | op::DIG) {
         return Err(format!("seq {} 未知操作 {}", r.seq, r.op));
     }
     // —— 密码学四件套：公钥可解 → 摘要自洽 → 签名有效 → 归属可由公钥复算 ——
@@ -662,6 +850,33 @@ fn apply_record(
     }
 
     match r.op.as_str() {
+        op::DIG => {
+            if is_water(r.x, r.y) {
+                return Err(format!("seq {} 想挖 ({},{})：那是水面，挖不动", r.seq, r.x, r.y));
+            }
+            let surf = surface_layer(r.x, r.y);
+            let removed = dug.get(&(r.x, r.y)).copied().unwrap_or(0);
+            let top = surf.saturating_sub(removed.min(u16::MAX as u32) as u16);
+            // 岩床：挖到这里就到底了，再往下按空操作处理（不撕链——只是没东西可挖）
+            if top < DUG_FLOOR {
+                return Ok(());
+            }
+            // 只许挖露在最上面的那一层。被人抢先挖掉的同一层＝空操作：
+            // 记录签得没错、链也没断，只是那格土已经不在了。竞赛不该撕掉一条链。
+            if r.layer != top {
+                return Ok(());
+            }
+            let depth = surf - top;
+            let want = material_at_depth(depth);
+            if r.kind != want {
+                return Err(format!(
+                    "seq {} 挖 ({},{}) 第 {} 层（离地表 {depth} 层）应得{}，记账写的是 {}",
+                    r.seq, r.x, r.y, r.layer, mat_name(want), r.kind
+                ));
+            }
+            *dug.entry((r.x, r.y)).or_insert(0) += 1;
+            *mats.entry((r.owner.clone(), want)).or_insert(0) += 1;
+        }
         op::CLAIM => {
             let mut pk_hash32 = [0u8; 32];
             pk_hash32.copy_from_slice(&pk_hash);
@@ -680,6 +895,21 @@ fn apply_record(
                     "seq {} 想造的格子 ({},{}) 第 {} 层已经有「{}」",
                     r.seq, r.x, r.y, r.layer, busy.name
                 ));
+            }
+            // v5：建造扣材料。土石矿都从地里挖出来，"一层地换一件东西"。
+            //
+            // 扣到 0 为止、**不因材料不足判非法**：材料余额取决于别人在不在同一列
+            // 抢挖，把它当共识硬闸，两个人抢一格就会给其中一人的链判死刑——
+            // 那比"有人无限造东西"更伤世界。硬拦放在钱包侧（`world_place`），
+            // 诚实钱包在签名之前就把话说明白；共识只负责把账算准。
+            if matches!(ver, Ver::World) {
+                let cost = build_cost(r.kind);
+                for (i, need) in cost.iter().enumerate() {
+                    if *need > 0 {
+                        let e = mats.entry((r.owner.clone(), i as u8)).or_insert(0);
+                        *e = e.saturating_sub(*need);
+                    }
+                }
             }
             state.insert(
                 r.entity_id_hex.clone(),
@@ -867,9 +1097,7 @@ pub struct EntityLedger {
     path: PathBuf,
     lock: std::sync::Mutex<()>,
     /// 最近一次整本读入跳过的坏行数（0 = 账本逐行都能解析）
-    bad_lines: std::sync::atomic::AtomicUsize,
-    /// 已经就该数值告过警的坏行数——轮询每次都整本重放，不控制就会刷屏
-    warned_at: std::sync::atomic::AtomicUsize,
+    bad: BadLines,
 }
 
 /// 整本读入的附带说明：解析不了的行**逐行跳过**并计数，绝不从那里截断。
@@ -894,13 +1122,66 @@ impl LoadReport {
     }
 }
 
+/// 逐行读一本 jsonl：坏行只跳过它自己并计数，**绝不**从那里截断尾部。
+/// 实体账本与光尘账本共用这一份实现，两本不允许各写一套读法。
+pub(crate) fn parse_lines<T: serde::de::DeserializeOwned>(text: &str) -> (Vec<T>, LoadReport) {
+    let mut rep = LoadReport::default();
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<T>(line) {
+            Ok(r) => out.push(r),
+            Err(e) => {
+                rep.bad_lines += 1;
+                if rep.first_line == 0 {
+                    rep.first_line = i + 1;
+                    rep.reason = e.to_string();
+                }
+            }
+        }
+    }
+    (out, rep)
+}
+
+/// 坏行计数的常驻监视位：账本的 `bad_lines()` 从这里读，UI 的告警条也从这里读。
+#[derive(Default)]
+pub(crate) struct BadLines {
+    seen: std::sync::atomic::AtomicUsize,
+    /// 已经就该数值告过警——轮询每次都整本重放，不控制就会刷屏
+    warned: std::sync::atomic::AtomicUsize,
+}
+
+impl BadLines {
+    pub fn count(&self) -> usize {
+        self.seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn note(&self, rep: &LoadReport, what: &str, path: &Path) {
+        use std::sync::atomic::Ordering;
+        self.seen.store(rep.bad_lines, Ordering::Relaxed);
+        let was = self.warned.swap(rep.bad_lines, Ordering::Relaxed);
+        if rep.bad_lines == 0 || was == rep.bad_lines {
+            return;
+        }
+        eprintln!(
+            "[QLight] {what}有 {} 行解析失败（首处第 {} 行：{}），已逐行跳过、继续读后面的记录：{}",
+            rep.bad_lines,
+            rep.first_line,
+            rep.reason,
+            path.display()
+        );
+    }
+}
+
 impl EntityLedger {
     pub fn new(path: PathBuf) -> Self {
         let led = Self {
             path,
             lock: std::sync::Mutex::new(()),
-            bad_lines: std::sync::atomic::AtomicUsize::new(0),
-            warned_at: std::sync::atomic::AtomicUsize::new(0),
+            bad: BadLines::default(),
         };
         led.archive_if_legacy();
         led
@@ -919,7 +1200,7 @@ impl EntityLedger {
             .filter(|l| !l.is_empty())
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter_map(|v| v.get("v").and_then(|x| x.as_str()).map(str::to_string))
-            .any(|v| v != RECORD_VERSION && v != RECORD_VERSION_V3);
+            .any(|v| v != RECORD_VERSION && v != RECORD_VERSION_V4 && v != RECORD_VERSION_V3);
         if !legacy {
             return;
         }
@@ -945,55 +1226,21 @@ impl EntityLedger {
         self.load_report().0
     }
 
-    /// 整本读入 + 读到了什么不该读到的东西。上层要显式调用这一版才能拿到坏行数；
-    /// `load()` 已经把同一个数存进 `bad_lines()`，快照与告警都从那里取。
-    pub fn load_report(&self) -> (Vec<EntityRecord>, LoadReport) {
-        let mut rep = LoadReport::default();
-        let Ok(text) = std::fs::read_to_string(&self.path) else {
-            self.note_bad(rep.clone());
-            return (Vec::new(), rep);
-        };
-        let mut out = Vec::new();
-        for (i, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<EntityRecord>(line) {
-                Ok(r) => out.push(r),
-                Err(e) => {
-                    rep.bad_lines += 1;
-                    if rep.first_line == 0 {
-                        rep.first_line = i + 1;
-                        rep.reason = e.to_string();
-                    }
-                }
-            }
-        }
-        self.note_bad(rep.clone());
-        (out, rep)
-    }
-
     /// 最近一次整本读入跳过的坏行数。计数是"最后一次读的结果"，不是累计：
     /// 账本修好了它就回到 0，UI 上的告警也跟着消失。
     pub fn bad_lines(&self) -> usize {
-        self.bad_lines.load(std::sync::atomic::Ordering::Relaxed)
+        self.bad.count()
     }
 
-    fn note_bad(&self, rep: LoadReport) {
-        use std::sync::atomic::Ordering;
-        self.bad_lines.store(rep.bad_lines, Ordering::Relaxed);
-        let was = self.warned_at.swap(rep.bad_lines, Ordering::Relaxed);
-        if rep.bad_lines == 0 || was == rep.bad_lines {
-            return;
-        }
-        eprintln!(
-            "[QLight] 实体账本有 {} 行解析失败（首处第 {} 行：{}），已逐行跳过、继续读后面的记录：{}",
-            rep.bad_lines,
-            rep.first_line,
-            rep.reason,
-            self.path.display()
-        );
+    /// 整本读入 + 读到了什么不该读到的东西。上层要显式调用这一版才能拿到坏行数；
+    /// `load()` 已经把同一个数存进 `bad_lines()`，快照与告警都从那里取。
+    pub fn load_report(&self) -> (Vec<EntityRecord>, LoadReport) {
+        let (recs, rep) = match std::fs::read_to_string(&self.path) {
+            Ok(text) => parse_lines::<EntityRecord>(&text),
+            Err(_) => (Vec::new(), LoadReport::default()),
+        };
+        self.bad.note(&rep, "实体账本", &self.path);
+        (recs, rep)
     }
 
     /// 追加一条记录（自取写锁）
@@ -1042,6 +1289,8 @@ impl EntityLedger {
             &mut w.state,
             &mut w.used_fees,
             &mut w.writes,
+            &mut w.dug,
+            &mut w.mats,
             seq,
             &prev,
             last_v4,
@@ -1548,6 +1797,55 @@ mod tests {
         let _ = std::fs::remove_file(ledger.path());
     }
 
+    /// 中间一行坏了只丢它自己那一行，**不许**把后面的历史一起静默吞掉。
+    ///
+    /// 旧口径遇到坏行就 `break`：联邦世界里各归属者的记录交错在同一本文件里，
+    /// 一次断电截断会把后面所有人的全部历史判成"从没发生过"，而账本看起来只是
+    /// 短了一点——没有任何地方说它短了。现在坏行计数并原样上报。
+    #[test]
+    fn a_corrupt_line_in_the_middle_does_not_truncate_the_tail() {
+        let c = core();
+        let ledger = tmp_ledger("corrupt-middle");
+        let view = view_at(3);
+        for i in 0..3u16 {
+            commit(
+                &ledger,
+                &view,
+                &c,
+                &Draft {
+                    op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "塔",
+                    x: 100 + i, y: 100, layer: 0, kind: 0, height: i as u64 + 1, ts: i as u64,
+                },
+            );
+        }
+        let good: Vec<String> = std::fs::read_to_string(ledger.path())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(good.len(), 3);
+        // 第 2 行换成半截 JSON（断电截断的形状），第 3 行原样留在它后面
+        std::fs::write(
+            ledger.path(),
+            format!("{}\n{{\"v\":\"QL-ENTREC-v4\",\"seq\":\n{}\n", good[0], good[2]),
+        )
+        .unwrap();
+
+        let (recs, rep) = ledger.load_report();
+        assert_eq!(rep.bad_lines, 1, "只坏了一行");
+        assert_eq!(rep.first_line, 2, "首处坏行的行号必须是真行号");
+        assert!(!rep.is_clean());
+        assert_eq!(ledger.bad_lines(), 1, "上层（快照/UI）读的是这个数");
+        assert_eq!(recs.len(), 2, "坏行之后的历史不许跟着消失");
+        assert_eq!(recs[1].seq, 3, "尾条仍是第 3 条，不是被截断后的第 1 条");
+
+        // 反向对照：账本修好后计数回到 0，告警不会赖在界面上
+        std::fs::write(ledger.path(), format!("{}\n", good.join("\n"))).unwrap();
+        assert_eq!(ledger.load().len(), 3);
+        assert_eq!(ledger.bad_lines(), 0);
+        let _ = std::fs::remove_file(ledger.path());
+    }
+
     #[test]
     fn a_rewritten_line_breaks_the_hash_chain() {
         let c = core();
@@ -1712,6 +2010,8 @@ mod tests {
             &mut BTreeMap::new(),
             &mut BTreeSet::new(),
             &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
             0,
             &[0u8; 32],
             0,
@@ -1738,6 +2038,8 @@ mod tests {
         let err = apply_record(
             &mut BTreeMap::new(),
             &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             0,
             &[0u8; 32],
@@ -1766,7 +2068,19 @@ mod tests {
                 x: 1, y: 1, layer: 0, kind: 0, height: 30, ts: 1,
             },
         );
-        apply_record(&mut state, &mut used, &mut writes, 0, &[0u8; 32], 0, &r1, &view).unwrap();
+        apply_record(
+            &mut state,
+            &mut used,
+            &mut writes,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            0,
+            &[0u8; 32],
+            0,
+            &r1,
+            &view,
+        )
+        .unwrap();
         let r2 = sign_record(
             &c,
             2,
@@ -1780,6 +2094,8 @@ mod tests {
             &mut state,
             &mut used,
             &mut writes,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
             1,
             &record_hash(&r1),
             30,
@@ -1811,6 +2127,8 @@ mod tests {
             &mut BTreeMap::new(),
             &mut BTreeSet::new(),
             &mut writes,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
             0,
             &[0u8; 32],
             0,
@@ -1825,6 +2143,8 @@ mod tests {
             &mut BTreeMap::new(),
             &mut BTreeSet::new(),
             &mut writes,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
             0,
             &[0u8; 32],
             0,
@@ -1832,6 +2152,156 @@ mod tests {
             &view,
         )
         .unwrap();
+    }
+
+    // ------------------------------------------------ v5：挖地
+
+    fn dig(ledger: &EntityLedger, view: &ChainView, c: &crate::keystore::WalletCore, x: u16, y: u16, layer: u16, kind: u8) -> EntityRecord {
+        commit(
+            ledger,
+            view,
+            c,
+            &Draft {
+                op: op::DIG, entity_id_hex: "", parent_hex: "", name: "",
+                x, y, layer, kind, height: 50, ts: 1,
+            },
+        )
+    }
+
+    /// 一列从地表往下剥：每层产什么由**离地表的深度**定，挖到第 1 层为止。
+    /// 这条测试把整列挖穿，确认三带的分界与层数严格对得上。
+    #[test]
+    fn digging_a_column_pays_soil_then_stone_then_ore() {
+        let c = core();
+        let ledger = tmp_ledger("dig-column");
+        let view = view_at(50);
+        let (x, y) = (0u16, 0u16);
+        assert!(!is_water(x, y));
+        let surf = surface_layer(x, y);
+        assert!(surf >= 12, "测试点不够深：第 {surf} 层");
+
+        for i in 0..surf {
+            let layer = surf - i;
+            dig(&ledger, &view, &c, x, y, layer, material_at_depth(i));
+        }
+        let w = replay_world(&ledger.load(), &view);
+        assert!(w.report.ok, "{}", w.report.reason);
+        assert_eq!(column_top(&w.dug, x, y), 0, "整列挖到岩床");
+        let m = w.materials.get(&c.address).copied().unwrap();
+        assert_eq!(m[MAT_SOIL as usize], (DUG_SOIL_DEPTH + 1) as u32, "地表 0–3 层出泥土");
+        assert_eq!(
+            m[MAT_STONE as usize],
+            (DUG_STONE_DEPTH - DUG_SOIL_DEPTH) as u32,
+            "4–9 层出石头"
+        );
+        assert_eq!(
+            m[MAT_ORE as usize],
+            (surf - 1 - DUG_STONE_DEPTH) as u32,
+            "10 层以下才出矿"
+        );
+
+        // 岩床之上再挖：空操作，不撕链（链上已经有整列的历史，多一条也无妨）
+        dig(&ledger, &view, &c, x, y, 1, MAT_ORE);
+        let w2 = replay_world(&ledger.load(), &view);
+        assert!(w2.report.ok, "{}", w2.report.reason);
+        assert_eq!(column_top(&w2.dug, x, y), 0);
+        assert_eq!(w2.materials.get(&c.address).unwrap()[MAT_ORE as usize], (surf - 10) as u32);
+        let _ = std::fs::remove_file(ledger.path());
+    }
+
+    /// 只能剥露在最上面的那一层：跳着挖是空操作，材料与顶面都不动。
+    /// （竞赛里别人抢先挖掉同一层，这一条也不该把你的链判死。）
+    #[test]
+    fn digging_below_the_exposed_layer_is_a_no_op_not_a_forgery() {
+        let c = core();
+        let ledger = tmp_ledger("dig-skip");
+        let view = view_at(50);
+        let (x, y) = (3u16, 3u16);
+        let surf = surface_layer(x, y);
+        let r = dig(&ledger, &view, &c, x, y, surf - 1, MAT_SOIL);
+        let w = replay_world(&ledger.load(), &view);
+        assert!(w.report.ok, "{}", w.report.reason);
+        assert_eq!(column_top(&w.dug, x, y), surf, "顶面不该动");
+        assert_eq!(
+            w.materials.get(&c.address).copied().unwrap_or([0; MAT_COUNT])[MAT_SOIL as usize],
+            0
+        );
+        assert_eq!(r.layer, surf - 1);
+        let _ = std::fs::remove_file(ledger.path());
+    }
+
+    /// 材料与深度不符 = 伪造：重放当场拒绝。想拿矿就真挖到第 10 层以下。
+    #[test]
+    fn claiming_ore_from_the_surface_is_rejected() {
+        let c = core();
+        let ledger = tmp_ledger("dig-lie");
+        let view = view_at(50);
+        let (x, y) = (5u16, 5u16);
+        let surf = surface_layer(x, y);
+        force_write(
+            &ledger,
+            &c,
+            &Draft {
+                op: op::DIG, entity_id_hex: "", parent_hex: "", name: "",
+                x, y, layer: surf, kind: MAT_ORE, height: 50, ts: 1,
+            },
+        );
+        let (_, rep) = replay(&ledger.load(), &view);
+        assert!(!rep.ok);
+        assert!(rep.reason.contains("应得泥土"), "{}", rep.reason);
+        let _ = std::fs::remove_file(ledger.path());
+    }
+
+    /// 水面挖不动——水不是方块，挖不出土，也不该有一条"水底记录"
+    #[test]
+    fn water_columns_cannot_be_dug() {
+        let c = core();
+        let ledger = tmp_ledger("dig-water");
+        let view = view_at(50);
+        // (40,60) 大地高度 76 < 海面 86
+        assert!(is_water(40, 60));
+        let err = ledger
+            .commit_as(&signer_pk_hash(&c), &view, |seq, prev| {
+                sign_record(&c, seq, &prev, &Draft {
+                    op: op::DIG, entity_id_hex: "", parent_hex: "", name: "",
+                    x: 40, y: 60, layer: surface_layer(40, 60), kind: MAT_SOIL,
+                    height: 50, ts: 1,
+                })
+            })
+            .unwrap_err();
+        assert!(err.contains("水面"), "{err}");
+        assert!(ledger.load().is_empty(), "验不过的挖地记录一条都不许落盘");
+        let _ = std::fs::remove_file(ledger.path());
+    }
+
+    /// 挖出来的材料是建造的预算：造一件就少一份，账本里同一条也可以复算。
+    #[test]
+    fn building_spends_the_material_you_dug() {
+        let c = core();
+        let ledger = tmp_ledger("dig-spend");
+        let view = view_at(50);
+        let (x, y) = (0u16, 0u16);
+        let surf = surface_layer(x, y);
+
+        dig(&ledger, &view, &c, x, y, surf, MAT_SOIL);
+        let w = replay_world(&ledger.load(), &view);
+        assert_eq!(w.materials[&c.address][MAT_SOIL as usize], 1);
+
+        // 花丛（kind 2）造价：1 份泥土
+        commit(
+            &ledger,
+            &view,
+            &c,
+            &Draft {
+                op: op::CLAIM, entity_id_hex: "", parent_hex: "", name: "一朵花",
+                x, y, layer: surf + 1, kind: 2, height: 50, ts: 2,
+            },
+        );
+        let w = replay_world(&ledger.load(), &view);
+        assert!(w.report.ok, "{}", w.report.reason);
+        assert_eq!(w.materials[&c.address][MAT_SOIL as usize], 0, "造完就花光");
+        assert_eq!(build_cost(5), [0, 1, 1], "灯塔 = 1 石 + 1 矿");
+        let _ = std::fs::remove_file(ledger.path());
     }
 
     // ------------------------------------------------ v3：老账本按当年规则重放
@@ -2064,5 +2534,25 @@ mod tests {
         assert_eq!(a.cells, CRAFT_CELL_CAP + 8);
         assert_eq!(a.graded, CRAFT_CELL_CAP, "只给最老的 64 格计分");
         assert!((a.score as usize) < MINE_FLOORS.len());
+    }
+
+    /// 「整本落在链尖之上」或「整本的手续费凭据都不在链上」才叫旧世界的账：
+    /// 混着能过的记录说明是别的问题，不许归档。链长过旧记录高度之后，
+    /// 凭据锚必须继续认得出它——否则等链追上，出口就消失了。
+    #[test]
+    fn only_a_wholly_foreign_ledger_gets_the_archive_exit() {
+        assert!(ledger_is_foreign(false, &[778, 797], 80, 2, 0));
+        assert!(!ledger_is_foreign(true, &[778, 797], 80, 2, 0), "能过就不是孤儿账");
+        assert!(!ledger_is_foreign(false, &[], 80, 0, 0), "空账没有可归档的东西");
+        assert!(!ledger_is_foreign(false, &[70, 90], 80, 2, 1), "混合账是真空错，不猜");
+        assert!(!ledger_is_foreign(false, &[80], 80, 2, 1), "正好落在链尖上不算之上");
+        assert!(
+            ledger_is_foreign(false, &[70, 80], 80, 2, 0),
+            "链已经长过旧记录高度，只要凭据一笔都不在链上，仍认得出是旧账"
+        );
+        assert!(
+            !ledger_is_foreign(false, &[70, 90], 80, 0, 0),
+            "没有凭据可对（v4 免费记录）就只剩块高口径，mixed 不猜"
+        );
     }
 }
