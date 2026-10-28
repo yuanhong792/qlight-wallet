@@ -39,6 +39,12 @@ pub const FEE: u64 = 1_000_000;
 pub const DECIMALS: u64 = 9;
 /// 单块最多打包笔数
 pub const TXS_PER_BLOCK: usize = 64;
+/// 单块最多收录的光尘记录条数。
+///
+/// 光尘是"频繁发生的小事"（采一格、转一次），块不能因为它变胖；64 条在
+/// 2 秒一块的节奏下远超手工玩法产出速度，同时又给分叉激活那一下的存量
+/// 迁移留出平滑的消化速度（旧记录优先，见 `collect_dust` 的排序）。
+pub const DUST_PER_BLOCK: usize = 64;
 /// 交易池上限
 pub const MEMPOOL_CAP: usize = 256;
 /// 账本格式版本（B 档：v2 增加 miner/nonce 字段，旧档自动归档）
@@ -64,18 +70,25 @@ pub const BLOCK_V_CRAFT: u8 = 3;
 /// （域 `QL-BLOCK-V5`）。没有这一步，无矿签的块可以改 `miner` 偷手续费；
 /// v0 块更可以改 `miner` 偷整笔奖励。v3 及以前的块仍按旧域原样重放。
 pub const BLOCK_V_MINER: u8 = 4;
-pub const BLOCK_V: u8 = 4;
-/// 旧版本（v0/v1/v2/v3）只允许在这个高度及以前出现；超过后必须 v4。
+/// v5 = 光尘与池子进块（域 `QL-BLOCK-V6`）。
 ///
-/// 这是"版本激活高度"：没有它，攻击者可以在任意高度造 v0 块，绕过矿签与冷却
-/// 无条件领 `reward_at(h)`。1000 覆盖现有演示链（当前最高 < 900），同时给旧
-/// 免费发行画上硬边界；超过 1000 的旧 v0 链会在启动校验时归档重置。
-pub const BLOCK_V_V4_ACTIVATION: u64 = 1_000;
+/// 这是**第一阶段硬分叉**：块头多绑一份 `dust_root`（块内光尘记录的集合指纹），
+/// 块行多带 `dusts` 原件；光尘余额从此由共识结算，而不再只是各机器手里的
+/// 一本 gossip 账。有了它，池子才能在链上成立——光尘的稀缺性（配额、一格一次）
+/// 第一次变成全网一致的状态，陌生人之间才谈得上兑换。
+pub const BLOCK_V_POOL: u8 = 5;
+pub const BLOCK_V: u8 = BLOCK_V_POOL;
+/// v5 激活高度：此高度之后**只认 v5**。现有演示链在 141 左右，
+/// 200 给两台机器留出升级窗口，之后光尘开始逐块进块。
+///
+/// 没有激活高度，攻击者可以在任意高度造 v0 块，绕过矿签与冷却无条件领
+/// `reward_at(h)`；旧链（v0）在启动校验时会被归档重置。
+pub const BLOCK_V_V5_ACTIVATION: u64 = 200;
 
-/// 某个块高允许的最低版本：激活高度之后只认 v4，之前允许历史版本逐级升级。
+/// 某个块高允许的最低版本：激活高度之后只认 v5，之前允许历史版本逐级升级。
 pub fn version_floor_at(height: u64) -> u8 {
-    if height > BLOCK_V_V4_ACTIVATION {
-        BLOCK_V
+    if height > BLOCK_V_V5_ACTIVATION {
+        BLOCK_V_POOL
     } else {
         BLOCK_V_LEGACY
     }
@@ -148,6 +161,8 @@ pub fn genesis_header() -> BlockHeader {
         // 创世块不承诺世界：那时还没有任何实体（v0 语义，字段恒空）
         entity_root_hex: String::new(),
         entity_count: 0,
+        dust_root_hex: String::new(),
+        dust_count: 0,
         txs: vec![TxAttestation {
             digest_hex: hex::encode(genesis_manifesto_digest()),
             from: String::new(),
@@ -208,6 +223,20 @@ pub struct Ledger {
     /// 用于单调性闸门：append-only 的世界里，倒退 = 有人想把世界清空。
     #[serde(default)]
     pub entity_count_committed: u64,
+    /// v5 起：**共识结算后的光尘状态**（余额 / 本轮已采格 / 每人配额用量）。
+    /// 分叉之前它恒为空——那时光尘只活在各机器手里的 gossip 账本里。
+    #[serde(default)]
+    pub dust: crate::world::dust::DustState,
+    /// v5 起：已进块的光尘记录哈希（同一批记录不许被两块各结算一次）。
+    #[serde(default)]
+    pub dust_seen: std::collections::BTreeSet<String>,
+    /// v5 起：每个归属者光尘链的游标（seq / prev / 最后块高）。
+    #[serde(default)]
+    pub dust_tips: BTreeMap<String, crate::world::dust::ChainTip>,
+    /// v5 起：兑换池状态（池子 id → 两边储备 + LP 份额）。池子没有地址、没有私钥，
+    /// 谁能取走什么只由恒定乘积曲线决定。
+    #[serde(default)]
+    pub pools: BTreeMap<String, crate::world::pool::Pool>,
     /// 全部历史 VRF（世界地表种子 = 创世哈希 ⊕ 这些值）。
     /// 不进 ledger.json：它可以从 blocks.jsonl 逐行重建，存两份只会漂移。
     #[serde(skip)]
@@ -232,6 +261,10 @@ impl Default for Ledger {
             last_claim_height: 0,
             last_block_version: BLOCK_V_LEGACY,
             entity_count_committed: 0,
+            dust: crate::world::dust::DustState::default(),
+            dust_seen: std::collections::BTreeSet::new(),
+            dust_tips: BTreeMap::new(),
+            pools: BTreeMap::new(),
             vrfs: vec![],
             claims_by: BTreeMap::new(),
         }
@@ -263,6 +296,13 @@ pub struct BlockHeader {
     /// 这条单调性本身就是"把世界清空"攻击的检测器。
     #[serde(default)]
     pub entity_count: u64,
+    /// v5 起：块内光尘记录的集合指纹（`QL-DUSTROOT-V1`，与顺序无关），空块为 64 个 0。
+    /// 它进了块哈希，所以块里的光尘记录从此不可重写、不可抵赖。
+    #[serde(default)]
+    pub dust_root_hex: String,
+    /// v5 起：块内光尘记录条数（展示与对账用，根里已经覆盖）
+    #[serde(default)]
+    pub dust_count: u64,
     pub txs: Vec<TxAttestation>,
 }
 
@@ -301,6 +341,9 @@ pub struct BlockLine {
     pub header: BlockHeader,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wires: Vec<BlockWire>,
+    /// v5 起：本块收录的光尘记录原件（逐条可独立验签验链，块不要求任何人信任）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dusts: Vec<crate::world::dust::DustRecord>,
 }
 
 impl BlockWire {
@@ -541,6 +584,62 @@ pub fn block_hash_of_miner_bound(
     h
 }
 
+/// v5 的块哈希：在 v4 的预镜像上再绑 `dust_root`（块内光尘记录的集合指纹）
+/// 与条数，域 `QL-BLOCK-V6`。
+///
+/// 为什么光尘要进块哈希：光尘是池子另一侧的资产，只有"哪些光尘记录被全网
+/// 接受过"变成不可改写的事实，恒定乘积曲线才不会变成一句空话。
+pub fn block_hash_of_dust(
+    prev_hash_hex: &str,
+    height: u64,
+    ts_unix: u64,
+    minted_after: u64,
+    vrf: &[u8],
+    root: &[u8; 32],
+    entity_root: &[u8; 32],
+    entity_count: u64,
+    miner: &str,
+    dust_root: &[u8; 32],
+    dust_count: u64,
+) -> [u8; 32] {
+    let mut block_in: Vec<u8> = Vec::with_capacity(197 + miner.len());
+    block_in.push(BLOCK_V_POOL);
+    block_in.extend_from_slice(prev_hash_hex.as_bytes());
+    block_in.extend_from_slice(&height.to_be_bytes());
+    block_in.extend_from_slice(&ts_unix.to_be_bytes());
+    block_in.extend_from_slice(&minted_after.to_be_bytes());
+    block_in.extend_from_slice(vrf);
+    block_in.extend_from_slice(root);
+    block_in.extend_from_slice(entity_root);
+    block_in.extend_from_slice(&entity_count.to_be_bytes());
+    block_in.extend_from_slice(miner.as_bytes());
+    block_in.extend_from_slice(dust_root);
+    block_in.extend_from_slice(&dust_count.to_be_bytes());
+    let out = crypto::shake256(b"QL-BLOCK-V6", &block_in, 32);
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&out);
+    h
+}
+
+/// 块内光尘记录的集合指纹：与顺序无关（升序哈希后取 SHAKE-256）。
+/// 空集合返回全零，和 `tx_root_of` 的空块口径一致。
+pub fn dust_root_of(records: &[crate::world::dust::DustRecord]) -> [u8; 32] {
+    if records.is_empty() {
+        return [0u8; 32];
+    }
+    let mut hashes: Vec<[u8; 32]> = records.iter().map(crate::world::dust::record_hash).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let mut buf = Vec::with_capacity(hashes.len() * 32);
+    for h in &hashes {
+        buf.extend_from_slice(h);
+    }
+    let out = crypto::shake256(b"QL-DUSTROOT-V1", &buf, 32);
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&out);
+    h
+}
+
 /// 三个校验点（本地重放 / 联邦块 / 追账快照）共用的分域入口。
 ///
 /// v2 起 `entity_root_hex` 必须是 64 个 hex：一个"声称自己是 v2 却没有世界承诺"的
@@ -569,6 +668,27 @@ pub fn block_hash_of_header(
     }
     let mut er = [0u8; 32];
     er.copy_from_slice(&raw);
+    if bh.version >= BLOCK_V_POOL {
+        let dr_raw = hex::decode(&bh.dust_root_hex).ok()?;
+        if dr_raw.len() != 32 {
+            return None;
+        }
+        let mut dr = [0u8; 32];
+        dr.copy_from_slice(&dr_raw);
+        return Some(block_hash_of_dust(
+            &bh.prev_hash_hex,
+            bh.height,
+            bh.ts_unix,
+            bh.minted_after,
+            vrf,
+            root,
+            &er,
+            bh.entity_count,
+            &bh.miner,
+            &dr,
+            bh.dust_count,
+        ));
+    }
     Some(match bh.version {
         BLOCK_V_WORLD => block_hash_of_world(
             &bh.prev_hash_hex,
@@ -627,6 +747,14 @@ pub fn claim_cell_of(e: &TxEnvelope) -> Option<(u16, u16, u16)> {
         u16::from_be_bytes([a.to[6], a.to[7]]),
         u16::from_be_bytes([a.to[8], a.to[9]]),
     ))
+}
+
+/// 池子交易在凭据/历史里的收款方标签。
+///
+/// 池子没有地址：这串东西故意**不是**合法 bech32，所以 `claim_cell_of_attestation`
+/// 不会把它误读成矿签，UI 也能一眼分辨"这不是转给谁的"。
+pub fn pool_label() -> String {
+    format!("qlpool:{}", crate::world::pool::POOL_ID)
 }
 
 /// 块头凭据里的矿签坐标（快照校验只拿得到凭据，拿不到原件）
@@ -732,6 +860,9 @@ pub struct SimChain {
     /// 整本实体账本（v2 出块要向它承诺）。用 Arc&lt;RwLock&gt; 是因为 `SimChain` 会被
     /// clone 给网络线程与命令层，挂载必须对所有副本同时可见。
     world: Arc<std::sync::RwLock<Option<Arc<crate::world::EntityLedger>>>>,
+    /// 本机光尘记录账本（v5 出块时从里面挑还没进块的记录）。
+    /// 与 `world` 同一套挂载方式：链、网络、命令层共用同一个 Arc。
+    dust_store: Arc<std::sync::RwLock<Option<Arc<crate::world::dust::DustLedger>>>>,
     /// 启动哈希链校验失败置 true，禁出新块与收交易
     pub corrupted: Arc<Mutex<bool>>,
 }
@@ -791,6 +922,7 @@ impl SimChain {
             ledger_path,
             blocks_path,
             world: Arc::new(std::sync::RwLock::new(None)),
+            dust_store: Arc::new(std::sync::RwLock::new(None)),
             corrupted: Arc::new(Mutex::new(false)),
         };
 
@@ -941,6 +1073,27 @@ impl SimChain {
         l.records.iter().rev().take(200).cloned().collect()
     }
 
+    /// 池子储备（未激活 / 从未做市时是空池，不是"不存在"）
+    pub fn pool_pub(&self) -> crate::world::pool::Pool {
+        self.ledger
+            .lock()
+            .unwrap()
+            .pools
+            .get(crate::world::pool::POOL_ID)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 共识结算后的光尘余额：v5 之前恒为 0（那时光尘只活在 gossip 账本里）
+    pub fn dust_balance_pub(&self, addr: &str) -> u64 {
+        self.ledger.lock().unwrap().dust.balance_of(addr)
+    }
+
+    /// v5 是否已经生效（激活高度之后出过块）。界面据此区分"已确认/待确认"光尘。
+    pub fn dust_fork_active(&self) -> bool {
+        self.ledger.lock().unwrap().last_block_version >= BLOCK_V_POOL
+    }
+
     /// 内存池中某地址的待确认交易（活动页「确认中」条目；出块后自动消失）
     pub fn pending_of(&self, addr_bech32: &str) -> Vec<PendingView> {
         let want = addr_hex_of(addr_bech32);
@@ -993,16 +1146,24 @@ impl SimChain {
         if *self.corrupted.lock().unwrap() {
             return Err("账本完整性校验未通过，已停止收单（详见日志）".into());
         }
-        if envelope.actions.is_empty() {
+        let pool_op = envelope.pool.clone();
+        if pool_op.is_some() {
+            if !envelope.actions.is_empty() {
+                return Err("池子操作不能夹带转账".into());
+            }
+        } else if envelope.actions.is_empty() {
             return Err("交易不包含任何转账".into());
         }
         // 零金额只允许一种形态：矿签（单动作、目标是 QLOR 世界坐标）。
         // 它不付手续费——挖矿必须能从"余额为 0 的新钱包"开始，否则发行就被锁死。
         let claim = claim_cell_of(&envelope);
-        if claim.is_none() && envelope.actions.iter().any(|a| a.amount == 0) {
+        if claim.is_none()
+            && pool_op.is_none()
+            && envelope.actions.iter().any(|a| a.amount == 0)
+        {
             return Err("转账金额必须大于 0".into());
         }
-        let tx_fee = if claim.is_some() { 0 } else { FEE };
+        let tx_fee = if claim.is_some() || pool_op.is_some() { 0 } else { FEE };
 
         // —— 真 ML-DSA-65 验签：对 SHAKE-256 digest ——
         let digest = tx_digest(&envelope);
@@ -1034,6 +1195,19 @@ impl SimChain {
             }
             if envelope.expiry <= ledger.height {
                 return Err("交易已过期（expiry 块高）".into());
+            }
+            // 池子：先确认下一块真的是 v5，再在副本上试算一遍（磁盘上的账本不许动）
+            if let Some(op) = &pool_op {
+                if version_floor_at(ledger.height + 1) < BLOCK_V_POOL {
+                    return Err(format!(
+                        "兑换池要等硬分叉 v5（块高 {} 之后）才开放，当前 #{}",
+                        BLOCK_V_V5_ACTIVATION + 1,
+                        ledger.height
+                    ));
+                }
+                let mut trial = ledger.clone();
+                Self::apply_pool_op(&mut trial, &from, op)
+                    .map_err(|e| format!("池子操作不成立：{e}"))?;
             }
 
             // 可支配余额 = 余额 − 池中本地址未入块总支出
@@ -1167,13 +1341,19 @@ impl SimChain {
     pub fn mine_block(
         &self,
         core: &crate::keystore::WalletCore,
-    ) -> Option<(BlockEvent, BlockHeader, Vec<BlockWire>)> {
+    ) -> Option<(BlockEvent, BlockHeader, Vec<BlockWire>, Vec<crate::world::dust::DustRecord>)> {
         if *self.corrupted.lock().unwrap() {
             return None;
         }
         let mut ledger = self.ledger.lock().unwrap();
         let height_next = ledger.height + 1;
         let prev_hash_before = ledger.prev_hash_hex.clone();
+        // 分叉窗口：激活高度之前照旧出 v4（还没升级的机器也认），之后只出 v5
+        let version = if height_next > BLOCK_V_V5_ACTIVATION {
+            BLOCK_V_POOL
+        } else {
+            BLOCK_V_MINER
+        };
 
         // —— VRF 存活心跳（轻节点证明；输入绑定钱包种子/高度/前块哈希）——
         let mut vrf_in: Vec<u8> = Vec::with_capacity(80);
@@ -1195,7 +1375,7 @@ impl SimChain {
         if last_claim_before != ledger.last_claim_height {
             ledger.last_claim_height = last_claim_before;
         }
-        let window = claim_window(BLOCK_V, height_next, last_claim_before, prior_mine);
+        let window = claim_window(version, height_next, last_claim_before, prior_mine);
         let can_claim = window.is_some();
         let mut claim_tx: Option<PendingTx> = None;
         let mut taken: Vec<PendingTx> = Vec::with_capacity(TXS_PER_BLOCK);
@@ -1240,7 +1420,7 @@ impl SimChain {
                 pk_hex: p.pk_hex.clone(),
                 salt_hex: p.salt_hex.clone(),
             };
-            match Self::apply_wire(&mut ledger, &wire, height_next, ts, &miner, BLOCK_V) {
+            match Self::apply_wire(&mut ledger, &wire, height_next, ts, &miner, version) {
                 Ok((att, digest, fee)) => {
                     included.push(att);
                     digests.push(digest);
@@ -1259,7 +1439,7 @@ impl SimChain {
                 pk_hex: p.pk_hex.clone(),
                 salt_hex: p.salt_hex.clone(),
             };
-            match Self::apply_wire(&mut ledger, &wire, height_next, ts, &miner, BLOCK_V) {
+            match Self::apply_wire(&mut ledger, &wire, height_next, ts, &miner, version) {
                 Ok((att, digest, fee)) => {
                     included.push(att);
                     digests.push(digest);
@@ -1302,21 +1482,46 @@ impl SimChain {
                 entity_root.copy_from_slice(&b);
             }
         }
-        let block_hash = block_hash_of_miner_bound(
-            &prev_hash_before,
-            height_next,
-            ts,
-            ledger.total_minted,
-            &vrf,
-            &root,
-            &entity_root,
-            entity_count,
-            &miner,
-        );
+        // —— 光尘进块（v5）：从本机 gossip 账本里挑还没被任何块结算过的记录 ——
+        // 激活之前一块不带（v4 块头没有这个字段），激活之后逐块带货。
+        let dusts = if version >= BLOCK_V_POOL {
+            self.collect_dust(&mut ledger, height_next, DUST_PER_BLOCK)
+        } else {
+            Vec::new()
+        };
+        let dust_root = dust_root_of(&dusts);
+        let dust_count = dusts.len() as u64;
+        let block_hash = if version >= BLOCK_V_POOL {
+            block_hash_of_dust(
+                &prev_hash_before,
+                height_next,
+                ts,
+                ledger.total_minted,
+                &vrf,
+                &root,
+                &entity_root,
+                entity_count,
+                &miner,
+                &dust_root,
+                dust_count,
+            )
+        } else {
+            block_hash_of_miner_bound(
+                &prev_hash_before,
+                height_next,
+                ts,
+                ledger.total_minted,
+                &vrf,
+                &root,
+                &entity_root,
+                entity_count,
+                &miner,
+            )
+        };
 
         ledger.height = height_next;
         ledger.prev_hash_hex = hex::encode(&block_hash);
-        ledger.last_block_version = BLOCK_V;
+        ledger.last_block_version = version;
         ledger.entity_count_committed = entity_count;
 
         // —— 原子持久化 + 追加可审计块头 ——
@@ -1324,7 +1529,7 @@ impl SimChain {
             atomic_write(&self.ledger_path, &bytes);
         }
         let header = BlockHeader {
-            version: BLOCK_V,
+            version,
             height: height_next,
             ts_unix: ts,
             prev_hash_hex: prev_hash_before,
@@ -1335,10 +1540,16 @@ impl SimChain {
             miner: miner.clone(),
             entity_root_hex,
             entity_count,
+            dust_root_hex: if version >= BLOCK_V_POOL {
+                hex::encode(dust_root)
+            } else {
+                String::new()
+            },
+            dust_count,
             txs: included,
         };
         drop(ledger);
-        append_block_line(&self.blocks_path, &header, &wires);
+        append_block_line(&self.blocks_path, &header, &wires, &dusts);
 
         let balance = self.balance_of(&miner);
         Some((
@@ -1355,7 +1566,60 @@ impl SimChain {
             },
             header.clone(),
             wires,
+            dusts,
         ))
+    }
+
+    /// 池子操作的状态转移：所有校验都在动钱之前完成（失败不留半截账）。
+    ///
+    /// QLX 走 `balances`，光尘走 `dust.balances`，储备走 `pools`——三条数据
+    /// 在同一个账本里，所以"给出资产"和"记下储备"要么一起成立，要么都不成立。
+    fn apply_pool_op(
+        l: &mut Ledger,
+        from: &str,
+        op: &crate::tx::PoolOp,
+    ) -> Result<(), String> {
+        use crate::tx::PoolOp;
+        use crate::world::pool::{Dir, POOL_ID};
+        let mut pool = l.pools.get(POOL_ID).cloned().unwrap_or_default();
+        let qlx_bal = l.balances.get(from).copied().unwrap_or(0);
+        let dust_bal = l.dust.balance_of(from);
+        match op {
+            PoolOp::AddLiquidity { qlx, dust } => {
+                if qlx_bal < *qlx {
+                    return Err(format!("QLX 不够做市：有 {qlx_bal}，要 {qlx}"));
+                }
+                if dust_bal < *dust {
+                    return Err(format!("光尘不够做市：有 {dust_bal}，要 {dust}"));
+                }
+                pool.add(from, *qlx, *dust)?;
+                *l.balances.get_mut(from).expect("余额已确认存在") -= *qlx;
+                *l.dust.balances.get_mut(from).expect("余额已确认存在") -= *dust;
+            }
+            PoolOp::RemoveLiquidity { lp } => {
+                let (q, d) = pool.remove(from, *lp)?;
+                *l.balances.entry(from.to_string()).or_insert(0) += q;
+                *l.dust.balances.entry(from.to_string()).or_insert(0) += d;
+            }
+            PoolOp::SwapQlxForDust { qlx_in, min_out } => {
+                if qlx_bal < *qlx_in {
+                    return Err(format!("QLX 不够：有 {qlx_bal}，要换 {qlx_in}"));
+                }
+                let out = pool.swap(Dir::QlxIn, *qlx_in, *min_out)?;
+                *l.balances.get_mut(from).expect("余额已确认存在") -= *qlx_in;
+                *l.dust.balances.entry(from.to_string()).or_insert(0) += out;
+            }
+            PoolOp::SwapDustForQlx { dust_in, min_out } => {
+                if dust_bal < *dust_in {
+                    return Err(format!("光尘不够：有 {dust_bal}，要换 {dust_in}"));
+                }
+                let out = pool.swap(Dir::DustIn, *dust_in, *min_out)?;
+                *l.dust.balances.get_mut(from).expect("余额已确认存在") -= *dust_in;
+                *l.balances.entry(from.to_string()).or_insert(0) += out;
+            }
+        }
+        l.pools.insert(POOL_ID.to_string(), pool);
+        Ok(())
     }
 
     /// 单笔交易的状态转移（本地出块 / 远端块 / 快照重建三处共用，绝不写三套）。
@@ -1372,14 +1636,24 @@ impl SimChain {
     ) -> Result<(TxAttestation, [u8; 32], u64), String> {
         let (digest, from) = w.verify()?;
         let e = &w.envelope;
-        if e.actions.is_empty() {
+        let pool_op = e.pool.clone();
+        if pool_op.is_some() && !e.actions.is_empty() {
+            return Err("池子操作不能夹带转账".into());
+        }
+        if pool_op.is_some() && version < BLOCK_V_POOL {
+            return Err("池子操作只允许出现在 v5 块里".into());
+        }
+        if pool_op.is_none() && e.actions.is_empty() {
             return Err("交易不包含任何转账".into());
         }
         let claim = claim_cell_of(e);
         if claim.is_some() && version == BLOCK_V_LEGACY {
             return Err("历史版本块不允许矿签".into());
         }
-        if claim.is_none() && e.actions.iter().any(|a| a.amount == 0) {
+        if claim.is_none()
+            && pool_op.is_none()
+            && e.actions.iter().any(|a| a.amount == 0)
+        {
             return Err("零金额交易只允许矿签".into());
         }
         if e.expiry <= height {
@@ -1389,8 +1663,39 @@ impl SimChain {
         if e.nonce != nonce_now {
             return Err(format!("nonce 断档（期望 {nonce_now}，实得 {}）", e.nonce));
         }
-        let fee = if claim.is_some() { 0 } else { FEE };
-        let need: u64 = e.actions.iter().map(|a| a.amount).sum::<u64>() + fee;
+        let fee = if claim.is_some() || pool_op.is_some() { 0 } else { FEE };
+        let need: u64 = if pool_op.is_some() {
+            0
+        } else {
+            e.actions.iter().map(|a| a.amount).sum::<u64>() + fee
+        };
+        // 池子交易：两边余额都由这一处结算，链上没有第二个人能动池子。
+        if let Some(op) = &pool_op {
+            Self::apply_pool_op(l, &from, op)?;
+            l.nonces.insert(from.clone(), e.nonce + 1);
+            let label = pool_label();
+            l.records.push(TxRecord {
+                hash_hex: hex::encode(digest),
+                height,
+                ts_unix: ts,
+                from: from.clone(),
+                to: label.clone(),
+                amount: 0,
+                fee: 0,
+            });
+            return Ok((
+                TxAttestation {
+                    digest_hex: hex::encode(digest),
+                    from,
+                    to: label,
+                    amount: 0,
+                    fee: 0,
+                    nonce: e.nonce,
+                },
+                digest,
+                0,
+            ));
+        }
         if let Some((x, y, layer)) = claim {
             if from != miner {
                 return Err("矿签必须由出块者本人提交（奖励不能被代领）".into());
@@ -1642,6 +1947,53 @@ impl SimChain {
         true
     }
 
+    /// 块内光尘记录：形状（集合指纹/条数）+ 逐条验签验链 + 语义结算。
+    ///
+    /// 任何一条不过就整块作废——记录已经被块哈希绑住，矿工没有"夹带一条坏账"
+    /// 的余地；这也正是光尘余额能被陌生人当作兑换凭据的原因。
+    fn apply_dust_block(
+        l: &mut Ledger,
+        h: &BlockHeader,
+        dusts: &[crate::world::dust::DustRecord],
+    ) -> Result<(), String> {
+        use crate::world::dust;
+        if h.version < BLOCK_V_POOL {
+            if !dusts.is_empty() {
+                return Err("旧版本块不应携带光尘记录".into());
+            }
+            return Ok(());
+        }
+        if h.dust_root_hex.len() != 64 {
+            return Err("v5 块缺光尘集合指纹".into());
+        }
+        if h.dust_count != dusts.len() as u64 {
+            return Err(format!(
+                "光尘条数不符：头 {} ≠ 原件 {}",
+                h.dust_count,
+                dusts.len()
+            ));
+        }
+        if hex::encode(dust_root_of(dusts)) != h.dust_root_hex {
+            return Err("光尘集合指纹与原件不一致".into());
+        }
+        for r in dusts {
+            let hash = dust::record_hash(r);
+            let key = hex::encode(hash);
+            if l.dust_seen.contains(&key) {
+                return Err(format!("光尘记录 {} 已被前块结算（一笔不能记两次）", &key[..12]));
+            }
+            let tip = l.dust_tips.get(&r.pk_hash_hex).cloned().unwrap_or_default();
+            dust::check_record(r, &tip, h.height)?;
+            dust::apply_record(&mut l.dust, r)?;
+            l.dust_tips
+                .entry(r.pk_hash_hex.clone())
+                .or_default()
+                .advance(hash, r.height);
+            l.dust_seen.insert(key);
+        }
+        Ok(())
+    }
+
     /// 追账唯一的状态重建：**从交易原件**逐笔验签、复算凭据、推进余额，
     /// 再把复算出的凭据与块头逐字对照。
     ///
@@ -1653,8 +2005,8 @@ impl SimChain {
         let h = &bl.header;
         // 创世块不改变状态：它只把链钉在宣言上（无铸造、无转账、不入交易历史）
         if h.height == 0 {
-            if !bl.wires.is_empty() {
-                return Err("创世块不应携带交易原件 → 快照拒收".into());
+            if !bl.wires.is_empty() || !bl.dusts.is_empty() {
+                return Err("创世块不应携带交易/光尘原件 → 快照拒收".into());
             }
             l.height = 0;
             l.prev_hash_hex = h.block_hash_hex.clone();
@@ -1711,6 +2063,8 @@ impl SimChain {
         if rebuilt != h.txs {
             return Err(format!("块 #{} 重放凭据与块头不一致 → 快照拒收", h.height));
         }
+        Self::apply_dust_block(l, h, &bl.dusts)
+            .map_err(|e| format!("块 #{} 光尘记录复验失败 → 快照拒收：{e}", h.height))?;
         if l.records.len() > 500 {
             let cut = l.records.len() - 500;
             l.records.drain(0..cut);
@@ -1751,11 +2105,16 @@ impl SimChain {
         if *self.corrupted.lock().unwrap() {
             return Err("账本完整性校验未通过，拒绝入网交易".into());
         }
-        if wire.envelope.actions.is_empty() {
+        let pool_op = wire.envelope.pool.clone();
+        if pool_op.is_some() && !wire.envelope.actions.is_empty() {
+            return Err("池子操作不能夹带转账".into());
+        }
+        if pool_op.is_none() && wire.envelope.actions.is_empty() {
             return Err("交易不包含任何转账".into());
         }
         let claim = claim_cell_of(&wire.envelope);
         if claim.is_none()
+            && pool_op.is_none()
             && wire
                 .envelope
                 .actions
@@ -1764,7 +2123,7 @@ impl SimChain {
         {
             return Err("转账金额必须大于 0".into());
         }
-        let tx_fee = if claim.is_some() { 0 } else { FEE };
+        let tx_fee = if claim.is_some() || pool_op.is_some() { 0 } else { FEE };
 
         let (digest, from) = wire.verify()?;
         let from_hex = hex::encode(&wire.envelope.from_addr);
@@ -1781,6 +2140,14 @@ impl SimChain {
             }
             if wire.envelope.expiry <= ledger.height {
                 return Err("交易已过期（expiry 块高）".into());
+            }
+            if let Some(op) = &pool_op {
+                if version_floor_at(ledger.height + 1) < BLOCK_V_POOL {
+                    return Err("兑换池还没开放（等 v5 分叉）".into());
+                }
+                let mut trial = ledger.clone();
+                Self::apply_pool_op(&mut trial, &from, op)
+                    .map_err(|e| format!("池子操作不成立：{e}"))?;
             }
             let projected_spend: u64 = mp
                 .iter()
@@ -1832,6 +2199,7 @@ impl SimChain {
         &self,
         header: &BlockHeader,
         wires: Vec<BlockWire>,
+        dusts: Vec<crate::world::dust::DustRecord>,
     ) -> Result<BlockEvent, String> {
         if *self.corrupted.lock().unwrap() {
             return Err("账本完整性校验未通过，拒绝外部块".into());
@@ -1910,6 +2278,9 @@ impl SimChain {
         if included != header.txs {
             return Err("重放凭据与块头不一致 → 整块拒绝".into());
         }
+        // —— v5：光尘记录同样逐条验签验链，任何一条不过整块拒绝 ——
+        Self::apply_dust_block(&mut staged, header, &dusts)
+            .map_err(|e| format!("块内光尘记录复验失败 → 整块拒绝：{e}"))?;
 
         // —— 排放（版本化口径与本地出块一致）——
         let claim_count = included
@@ -1997,7 +2368,7 @@ impl SimChain {
             atomic_write(&self.ledger_path, &bytes);
         }
         drop(ledger);
-        append_block_line(&self.blocks_path, header, &wires);
+        append_block_line(&self.blocks_path, header, &wires, &dusts);
 
         // 已入账的 from 地址，其池内挂着的后续交易 nonce 已可能过期——先撤下等重发
         let mut froms: Vec<String> = header.txs.iter().map(|t| t.from.clone()).collect();
@@ -2062,6 +2433,10 @@ impl SimChain {
             last_claim_height: 0,
             last_block_version: BLOCK_V_LEGACY,
             entity_count_committed: 0,
+            dust: crate::world::dust::DustState::default(),
+            dust_seen: std::collections::BTreeSet::new(),
+            dust_tips: BTreeMap::new(),
+            pools: BTreeMap::new(),
             vrfs: vec![],
             claims_by: BTreeMap::new(),
         };
@@ -2189,6 +2564,64 @@ impl SimChain {
         *self.world.write().unwrap() = Some(ledger);
     }
 
+    /// 挂载本机光尘账本：v5 起出块要从这里取还没进块的记录。
+    pub fn attach_dust(&self, store: Arc<crate::world::dust::DustLedger>) {
+        *self.dust_store.write().unwrap() = Some(store);
+    }
+
+    /// 挑一批还没被任何块结算过的光尘记录，接到账本上并返回（v5 出块用）。
+    ///
+    /// 顺序 `(声明块高, 归属, seq)`：同一条归属链的 seq 必须从小到大，
+    /// 否则 `check_record` 会当场拒绝。语义不过（余额不足、配额用完）的记录
+    /// 只跳过、不进块——一块不能因为一条坏记录而整块作废，但错误也绝不吞进共识。
+    fn collect_dust(
+        &self,
+        ledger: &mut Ledger,
+        height_next: u64,
+        limit: usize,
+    ) -> Vec<crate::world::dust::DustRecord> {
+        use crate::world::dust::record_hash;
+        let Some(store) = self.dust_store.read().unwrap().clone() else {
+            return Vec::new();
+        };
+        let mut pending: Vec<crate::world::dust::DustRecord> = store
+            .load()
+            .into_iter()
+            .filter(|r| !ledger.dust_seen.contains(&hex::encode(record_hash(r))))
+            .collect();
+        pending.sort_by(|a, b| {
+            a.height
+                .cmp(&b.height)
+                .then_with(|| a.owner.cmp(&b.owner))
+                .then_with(|| a.seq.cmp(&b.seq))
+        });
+
+        let mut tips = ledger.dust_tips.clone();
+        let mut state = ledger.dust.clone();
+        let mut out: Vec<crate::world::dust::DustRecord> = Vec::new();
+        for r in pending {
+            if out.len() >= limit {
+                break;
+            }
+            let h = record_hash(&r);
+            let tip = tips.get(&r.pk_hash_hex).cloned().unwrap_or_default();
+            if crate::world::dust::check_record(&r, &tip, height_next).is_err() {
+                continue;
+            }
+            let mut trial = state.clone();
+            if crate::world::dust::apply_record(&mut trial, &r).is_err() {
+                continue;
+            }
+            state = trial;
+            tips.entry(r.pk_hash_hex.clone()).or_default().advance(h, r.height);
+            ledger.dust_seen.insert(hex::encode(h));
+            out.push(r);
+        }
+        ledger.dust = state;
+        ledger.dust_tips = tips;
+        out
+    }
+
     /// 本机此刻的世界承诺：`(去重条数, 集合指纹)`。没挂世界就是诚实的空集合，
     /// 而不是"不承诺"——v2 块永远带一个可被别人复算的指纹。
     pub fn world_head(&self) -> (u64, String) {
@@ -2224,11 +2657,17 @@ fn addr_hex_of(bech32_addr: &str) -> String {
 }
 
 /// 块行落盘：块头 + 交易原件（`wires` 为空时与旧行逐字相同，故本机重放照旧可读）
-fn append_block_line(path: &PathBuf, h: &BlockHeader, wires: &[BlockWire]) {
+fn append_block_line(
+    path: &PathBuf,
+    h: &BlockHeader,
+    wires: &[BlockWire],
+    dusts: &[crate::world::dust::DustRecord],
+) {
     use std::io::Write;
     let line = BlockLine {
         header: h.clone(),
         wires: wires.to_vec(),
+        dusts: dusts.to_vec(),
     };
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -2362,6 +2801,8 @@ mod tests {
             miner: "ql1qqqminer".to_string(),
             entity_root_hex: String::new(),
             entity_count: 0,
+            dust_root_hex: String::new(),
+            dust_count: 0,
             txs: vec![],
         };
         one.block_hash_hex = hex::encode(block_hash_of(
@@ -2482,7 +2923,7 @@ mod tests {
                     chain.submit_claim(miner, x, y, layer).expect("节奏到了，矿签应入池");
                 }
             }
-            let (_, head, _) = chain.mine_block(miner).expect("应出块");
+            let (_, head, _, _) = chain.mine_block(miner).expect("应出块");
             if head.minted_after > minted_before {
                 strikes.push((head.height, head.minted_after - minted_before));
                 minted_before = head.minted_after;
@@ -2588,6 +3029,8 @@ mod tests {
             miner: miner.to_string(),
             entity_root_hex: hex::encode(er),
             entity_count: 0,
+            dust_root_hex: String::new(),
+            dust_count: 0,
             txs: vec![],
         }
     }
@@ -2617,6 +3060,8 @@ mod tests {
             miner: "ql1v0miner".to_string(),
             entity_root_hex: String::new(),
             entity_count: 0,
+            dust_root_hex: String::new(),
+            dust_count: 0,
             txs: vec![],
         };
         let mut v0 = v0;
@@ -2632,8 +3077,8 @@ mod tests {
             "v4 链后面接 v0 = 绕过矿签免费发行，必须拒绝"
         );
 
-        assert_eq!(version_floor_at(BLOCK_V_V4_ACTIVATION), BLOCK_V_LEGACY);
-        assert_eq!(version_floor_at(BLOCK_V_V4_ACTIVATION + 1), BLOCK_V);
+        assert_eq!(version_floor_at(BLOCK_V_V5_ACTIVATION), BLOCK_V_LEGACY);
+        assert_eq!(version_floor_at(BLOCK_V_V5_ACTIVATION + 1), BLOCK_V);
     }
 
     /// v0→v4 升级：水位跟到最后一条 v0，第一笔 v4 只结算升级后的新块。
@@ -2653,6 +3098,8 @@ mod tests {
             miner: "ql1v0miner".to_string(),
             entity_root_hex: String::new(),
             entity_count: 0,
+            dust_root_hex: String::new(),
+            dust_count: 0,
             txs: vec![],
         };
         let mut v0 = v0;
@@ -2931,6 +3378,8 @@ mod tests {
             miner: victim.address.clone(),
             entity_root_hex: String::new(),
             entity_count: 0,
+            dust_root_hex: String::new(),
+            dust_count: 0,
             txs: vec![],
         };
         b1.block_hash_hex = hex::encode(block_hash_of(
@@ -2962,6 +3411,8 @@ mod tests {
             miner: attacker.address.clone(),
             entity_root_hex: String::new(),
             entity_count: 0,
+            dust_root_hex: String::new(),
+            dust_count: 0,
             txs: vec![TxAttestation {
                 digest_hex: hex::encode(digest),
                 from: victim.address.clone(),
@@ -2988,11 +3439,13 @@ mod tests {
             serde_json::to_string(&BlockLine {
                 header: b1,
                 wires: vec![],
+                dusts: vec![],
             })
             .unwrap(),
             serde_json::to_string(&BlockLine {
                 header: b2,
                 wires: vec![wire],
+                dusts: vec![],
             })
             .unwrap(),
         ]
@@ -3008,6 +3461,309 @@ mod tests {
         assert_eq!(dst.balance_of(&victim.address), 0);
 
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // ------------------------------------------------ v5：池子与光尘的共识结算
+
+    /// 池子操作在同一本账里同时动 QLX、光尘与储备：任何一步不成立，三条都不动。
+    #[test]
+    fn pool_ops_move_both_ledgers_and_cannot_overdraw() {
+        use crate::tx::PoolOp;
+        use crate::world::pool::POOL_ID;
+
+        let chain = temp_chain("pool-op").1;
+        let owner = test_core(5).address;
+        let mut l = chain.ledger.lock().unwrap().clone();
+        let qlx0 = 1_000_000_000_000_000u64;
+        let dust0 = 1_000_000u64;
+        l.balances.insert(owner.clone(), qlx0);
+        l.dust.balances.insert(owner.clone(), dust0);
+
+        // 首次做市：两边同时扣、储备同时记上，LP 份额里留一份永久锁死
+        SimChain::apply_pool_op(
+            &mut l,
+            &owner,
+            &PoolOp::AddLiquidity {
+                qlx: qlx0,
+                dust: dust0,
+            },
+        )
+        .unwrap();
+        let p = l.pools.get(POOL_ID).cloned().unwrap();
+        assert_eq!((p.qlx, p.dust), (qlx0, dust0));
+        assert_eq!(l.balances[&owner], 0);
+        assert_eq!(l.dust.balance_of(&owner), 0);
+        assert!(
+            p.lp_total > p.shares_of(&owner),
+            "首次做市必须锁死一份份额"
+        );
+
+        // 余额不够的做市整笔拒绝：储备 / QLX 余额 / 光尘余额一个字都不许动
+        l.balances.insert(owner.clone(), 1); // QLX 够 1、光尘为 0 → 卡在光尘那一步
+        let before = (l.pools.clone(), l.balances.clone(), l.dust.clone());
+        let err = SimChain::apply_pool_op(
+            &mut l,
+            &owner,
+            &PoolOp::AddLiquidity { qlx: 1, dust: 1 },
+        )
+        .unwrap_err();
+        assert!(err.contains("光尘不够做市"), "实得：{err}");
+        assert_eq!(l.pools, before.0);
+        assert_eq!(l.balances, before.1);
+        assert_eq!(l.dust, before.2);
+
+        // QLX 换光尘：付出扣掉、收入加上、k 只增不减（手续费留在池里）
+        l.balances.insert(owner.clone(), qlx0 / 2);
+        let k0 = l.pools[POOL_ID].k();
+        let dust_before = l.dust.balance_of(&owner);
+        let qlx_in = 1_000_000_000_000u64;
+        SimChain::apply_pool_op(
+            &mut l,
+            &owner,
+            &PoolOp::SwapQlxForDust {
+                qlx_in,
+                min_out: 0,
+            },
+        )
+        .unwrap();
+        let got = l.dust.balance_of(&owner) - dust_before;
+        assert!(got > 0);
+        assert_eq!(l.balances[&owner], qlx0 / 2 - qlx_in);
+        assert!(l.pools[POOL_ID].k() >= k0);
+
+        // 滑点保护：算出来多少要多少 +1 就必须拒绝，且状态原样
+        let before = (l.pools.clone(), l.balances.clone(), l.dust.clone());
+        assert!(SimChain::apply_pool_op(
+            &mut l,
+            &owner,
+            &PoolOp::SwapQlxForDust {
+                qlx_in,
+                min_out: got + 1,
+            },
+        )
+        .is_err());
+        assert_eq!(l.pools, before.0);
+        assert_eq!(l.balances, before.1);
+        assert_eq!(l.dust, before.2);
+
+        // 反方向：光尘换 QLX，两边余额一起变动
+        let dust_in = got / 2;
+        let qlx_before = l.balances[&owner];
+        SimChain::apply_pool_op(
+            &mut l,
+            &owner,
+            &PoolOp::SwapDustForQlx {
+                dust_in,
+                min_out: 0,
+            },
+        )
+        .unwrap_or_else(|e| panic!("光尘换 QLX 应成功：{e}"));
+        let back = l.balances[&owner] - qlx_before;
+        assert!(back > 0);
+        assert_eq!(l.dust.balance_of(&owner), got - dust_in);
+
+        // 撤资：份额变回两边资产，锁死的那份永远拿不回来
+        let shares = l.pools[POOL_ID].shares_of(&owner);
+        SimChain::apply_pool_op(&mut l, &owner, &PoolOp::RemoveLiquidity { lp: shares }).unwrap();
+        assert!(l.balances[&owner] > qlx_before);
+        assert!(l.dust.balance_of(&owner) > 0);
+        assert_eq!(l.pools[POOL_ID].shares_of(&owner), 0);
+        assert!(
+            l.pools[POOL_ID].ready(),
+            "锁死的份额让池子不会被自己掏空"
+        );
+    }
+
+    /// 分叉前的链拒收池子交易（升级窗口内不许旧规则下动新资产）
+    #[test]
+    fn pool_tx_is_refused_before_v5() {
+        use crate::tx::PoolOp;
+
+        let chain = temp_chain("pool-gate").1;
+        let core = test_core(6);
+        let env = TxEnvelope::new(bech32_decode_addr(&core.address).unwrap(), 0, 50).with_pool(
+            PoolOp::AddLiquidity { qlx: 1, dust: 1 },
+        );
+        let sig = crypto::sign(&core.signing_key, &tx_digest(&env));
+        let err = chain.submit(&core, env, sig).unwrap_err();
+        assert!(err.contains("v5"), "应提示等硬分叉 v5，实得：{err}");
+    }
+
+    /// v5 块：光尘记录进块 → 集合指纹进块哈希 → 快照逐块重放出同一本光尘账
+    #[test]
+    fn v5_block_binds_dust_and_replays_from_snapshot() {
+        use crate::world::dust::{self, DustDraft, DustView};
+
+        let (dir, chain) = temp_chain("v5-dust");
+        let miner = test_core(7);
+        while chain.height() < BLOCK_V_V5_ACTIVATION {
+            chain.mine_block(&miner).expect("空块也应出块");
+        }
+        assert_eq!(chain.height(), BLOCK_V_V5_ACTIVATION);
+
+        // 在当前链头采一格资源，落一条真签（真实客户端走 world_dust_harvest）
+        let words = crate::world::resource_words();
+        let hrec = chain.height();
+        let (x, y, k) = (0..64u32)
+            .flat_map(|y| (0..64u32).map(move |x| (x, y)))
+            .filter_map(|(x, y)| {
+                crate::world::resource::node_at(x, y, &words).map(|k| (x, y, k))
+            })
+            .find(|&(_, _, k)| crate::world::resource::reward_at(k, hrec) > 0)
+            .expect("64×64 里没有资源点");
+        let reward = crate::world::resource::reward_at(k, hrec);
+
+        let store = Arc::new(dust::DustLedger::new(dir.join("dust.jsonl")));
+        chain.attach_dust(store.clone());
+        let pk_hash = hex::encode(crypto::shake256(b"QL-PK-REG-V1", &miner.pk_bytes, 32));
+        store
+            .commit_as(&pk_hash, &DustView { tip: hrec }, |seq, prev| {
+                dust::sign_record(
+                    &miner,
+                    seq,
+                    &prev,
+                    &DustDraft {
+                        op: dust::op::HARVEST,
+                        epoch: crate::world::resource::epoch_of(hrec),
+                        x: x as u16,
+                        y: y as u16,
+                        kind: k,
+                        amount: reward,
+                        to: "",
+                        height: hrec,
+                        ts: now_unix(),
+                    },
+                )
+            })
+            .expect("真签应落盘");
+
+        // 下一块自动带上这条记录，并把它的集合指纹写进块哈希
+        let (_, head, _, carried) = chain.mine_block(&miner).expect("第 201 块应出块");
+        assert_eq!(head.version, BLOCK_V_POOL);
+        assert_eq!((head.dust_count, carried.len()), (1, 1));
+        assert_eq!(head.dust_root_hex, hex::encode(dust_root_of(&carried)));
+        assert_eq!(
+            chain.ledger.lock().unwrap().dust.balance_of(&miner.address),
+            reward
+        );
+
+        // 同一份 blocks.jsonl 在空机器上重放：光尘余额与出块机一致
+        let lines = std::fs::read_to_string(dir.join("blocks.jsonl")).unwrap();
+        let (dir2, dst) = temp_chain("v5-replay");
+        assert_eq!(
+            dst.install_snapshot(&lines).unwrap(),
+            BLOCK_V_V5_ACTIVATION + 1
+        );
+        assert_eq!(
+            dst.ledger.lock().unwrap().dust.balance_of(&miner.address),
+            reward,
+            "重放必须得到同一本光尘账"
+        );
+
+        // 篡改一条已进块的光尘记录：原件与块头指纹对不上，整条快照拒收
+        let mut bl: BlockLine = serde_json::from_str(lines.lines().last().unwrap()).unwrap();
+        bl.dusts[0].amount += 1;
+        let mut rows: Vec<String> = lines.lines().map(str::to_string).collect();
+        *rows.last_mut().unwrap() = serde_json::to_string(&bl).unwrap();
+        let err = dst.install_snapshot(&rows.join("\n")).unwrap_err();
+        assert!(err.contains("指纹"), "应因指纹不符拒收，实得：{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// v5 上的池子交易：真出块 → 账本动账 → 快照重放出同一份储备
+    #[test]
+    fn pool_tx_applies_in_v5_blocks_and_replays() {
+        use crate::tx::PoolOp;
+        use crate::world::dust::{self, DustDraft, DustView};
+        use crate::world::pool::POOL_ID;
+
+        let (dir, chain) = temp_chain("v5-pool");
+        let miner = test_core(8);
+        // 正常挖到激活高度：QLX 全部来自矿签发行（没有预铸，池子也不能凭空有钱）
+        strike_fast(&chain, &miner, BLOCK_V_V5_ACTIVATION);
+        let qlx_in = 1_000_000_000u64;
+        let qlx_start = chain.balance_of(&miner.address);
+        assert!(qlx_start > qlx_in, "矿签发行应足够做市，实得 {qlx_start}");
+
+        // 光尘先真采一笔，让它随 201 块进共识
+        let words = crate::world::resource_words();
+        let hrec = chain.height();
+        let (x, y, k) = (0..64u32)
+            .flat_map(|y| (0..64u32).map(move |x| (x, y)))
+            .filter_map(|(x, y)| {
+                crate::world::resource::node_at(x, y, &words).map(|k| (x, y, k))
+            })
+            .find(|&(_, _, k)| crate::world::resource::reward_at(k, hrec) > 0)
+            .expect("64×64 里没有资源点");
+        let dust_in = crate::world::resource::reward_at(k, hrec);
+        let store = Arc::new(dust::DustLedger::new(dir.join("dust.jsonl")));
+        chain.attach_dust(store.clone());
+        let pk_hash = hex::encode(crypto::shake256(b"QL-PK-REG-V1", &miner.pk_bytes, 32));
+        store
+            .commit_as(&pk_hash, &DustView { tip: hrec }, |seq, prev| {
+                dust::sign_record(
+                    &miner,
+                    seq,
+                    &prev,
+                    &DustDraft {
+                        op: dust::op::HARVEST,
+                        epoch: crate::world::resource::epoch_of(hrec),
+                        x: x as u16,
+                        y: y as u16,
+                        kind: k,
+                        amount: dust_in,
+                        to: "",
+                        height: hrec,
+                        ts: now_unix(),
+                    },
+                )
+            })
+            .expect("真签应落盘");
+        chain.mine_block(&miner).expect("第 201 块应出块");
+        assert_eq!(chain.ledger.lock().unwrap().dust.balance_of(&miner.address), dust_in);
+
+        // 做市交易进池 → 下一块结算落账
+        let nonce = chain.pending_nonce(&miner.address);
+        let env = TxEnvelope::new(
+            bech32_decode_addr(&miner.address).unwrap(),
+            nonce,
+            400,
+        )
+        .with_pool(PoolOp::AddLiquidity {
+            qlx: qlx_in,
+            dust: dust_in,
+        });
+        let sig = crypto::sign(&miner.signing_key, &tx_digest(&env));
+        chain.submit(&miner, env, sig).expect("池子交易应入池");
+        let (_, head, _, _) = chain.mine_block(&miner).expect("第 202 块应出块");
+        assert!(head
+            .txs
+            .iter()
+            .any(|t| t.to == pool_label() && t.amount == 0));
+
+        {
+            let l = chain.ledger.lock().unwrap();
+            let p = l.pools.get(POOL_ID).cloned().expect("池子应存在");
+            assert_eq!((p.qlx, p.dust), (qlx_in, dust_in));
+            assert_eq!(p.qlx + l.balances[&miner.address], qlx_start);
+            assert_eq!(l.dust.balance_of(&miner.address), 0);
+        }
+
+        // 同一份块文件在空机器上重放：储备、余额、光尘全部一致
+        let lines = std::fs::read_to_string(dir.join("blocks.jsonl")).unwrap();
+        let (dir2, dst) = temp_chain("v5-pool-replay");
+        assert_eq!(dst.install_snapshot(&lines).unwrap(), BLOCK_V_V5_ACTIVATION + 2);
+        {
+            let l = dst.ledger.lock().unwrap();
+            assert_eq!(l.pools.get(POOL_ID), chain.ledger.lock().unwrap().pools.get(POOL_ID));
+            assert_eq!(l.balances.get(&miner.address), Some(&(qlx_start - qlx_in)));
+            assert_eq!(l.dust.balance_of(&miner.address), 0);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
 
@@ -3026,7 +3782,7 @@ pub fn spawn_mining_thread(
                 break;
             }
             if now_unix() >= next_block_unix {
-                if let Some((event, _, _)) = chain.mine_block(&core) {
+                if let Some((event, ..)) = chain.mine_block(&core) {
                     let _ = app.emit("chain_block", &event);
                 }
                 next_block_unix += BLOCK_INTERVAL_SECS;

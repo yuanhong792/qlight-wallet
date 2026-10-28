@@ -180,7 +180,11 @@
       keys: {}, dirty: true, regionKey: '', target: null, locked: false, drag: false,
       height: 0, heightAt: performance.now(), day: null, lastYaw: 1e9, lastAnim: 0, mesh: 0,
       bob: 0, bobPhase: 0, stepMark: 0, parts: [], entAt: 0,
+      // 资源层（QL-RES-v1）：长在地上的树/石/花，采伐记录才进光尘账本
+      res: null, resMap: null, resSig: '',
       bufT: gl.createBuffer(), nT: 0, bufE: gl.createBuffer(), nE: 0, bufH: gl.createBuffer(), nH: 0,      bufP: gl.createBuffer(), nP: 0, bufS: gl.createBuffer(), nS: 0, bufStar: gl.createBuffer(), nStar: 0,
+      // 资源层单独一条缓冲：采伐后只重铺这一层，不动 16 种签名的实体网格
+      bufR: gl.createBuffer(), nR: 0,
       // 铸块砖 + QLOR 数字雨：只有这一层自己的缓冲。出块的动画不该重铺 64×64 地形。
       bufF: gl.createBuffer(), nF: 0, fx: [],
       // 缓冲区按 12 面/格预算（平均只有约 2.4 面：树只占林地的 ~12%）。
@@ -188,6 +192,8 @@
       // 不会越界写坏内存，也不会影响任何一条链上判定。
       arrT: new Float32Array(REGION * REGION * 12 * 6 * 6),
       arrE: new Float32Array(2048 * 36 * 6),
+      // 资源格按 64×64 区域全铺满留余量：树 432 浮点/格，写满即停笔（与 quad 同纪律）
+      arrR: new Float32Array(REGION * REGION * 160),
       arrH: new Float32Array(6 * 24 * 6),
       arrP: new Float32Array(512 * 6),
       arrS: new Float32Array(2 * 6 * 6),
@@ -210,6 +216,13 @@
       var list = inColumn(cx, cz);
       for (var i = 0; i < list.length; i++) if (list[i].layer === layer) return list[i];
       return null;
+    }
+    /** 该格该层长的资源（树干/石头/花都算地表那一层）：被采走的不再命中 */
+    function resAt(cx, cy, cz) {
+      if (!st.resMap) return null;
+      var n = st.resMap[cellKey(cx, cz)];
+      if (!n || n.taken) return null;
+      return cy === level(cx, cz) ? n : null;
     }
     /** 该列最高实心顶面：地形顶面与所有活方块取最大——自己叠的塔，自己踩得住 */
     function support(cx, cz) {
@@ -411,6 +424,40 @@
       gl.bufferData(gl.ARRAY_BUFFER, tarr.subarray(0, tvp), gl.DYNAMIC_DRAW);
     }
 
+    /** 资源层（QL-RES-v1）：长在地表、采一次就消失的树/石/花。
+     *
+     *  可采树的抽样与装饰林互斥（见 resource.rs 的不变量测试），所以这里可以
+     *  直接落完整几何，不会和 buildTerrain 的天然树叠在一起。
+     */
+    function buildResources(x0, z0) {
+      if (!st.resMap) { st.nR = 0; return; }
+      tarr = st.arrR; tvp = 0;
+      for (var dz = 0; dz < REGION; dz++) {
+        for (var dx = 0; dx < REGION; dx++) {
+          var cx = x0 + dx, cz = z0 + dz;
+          if (cx >= W || cz >= H) continue;
+          var n = st.resMap[cellKey(cx, cz)];
+          if (!n || n.taken) continue;
+          var y0 = level(cx, cz) + 1;
+          switch (n.kind) {
+            case 0: // 石头：半嵌在地里的岩块
+              tcube(cx + 0.12, y0 - 0.45, cz + 0.12, cx + 0.88, y0 + 0.3, cz + 0.88, 0);
+              break;
+            case 1: // 橡树：树干 + 树冠
+              tcube(cx + 0.37, y0, cz + 0.37, cx + 0.63, y0 + 1.15, cz + 0.63, 16);
+              tcube(cx + 0.08, y0 + 0.95, cz + 0.08, cx + 0.92, y0 + 1.62, cz + 0.92, 17);
+              break;
+            default: // 花丛
+              cross(cx, y0, cz, 0.92, 0.85, 2);
+              break;
+          }
+        }
+      }
+      st.nR = tvp / 6;
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufR);
+      gl.bufferData(gl.ARRAY_BUFFER, tarr.subarray(0, tvp), gl.DYNAMIC_DRAW);
+    }
+
 
     /** 线框：白 = 正在看的实心体素，金 = 松手就落下去的空体素 */
     function wire(x0, y0, z0, x1, y1, z1, col) {
@@ -470,6 +517,12 @@
         if (cx < 0 || cz < 0 || cx >= W || cz >= H || cy < 0) return null;
         if (cx === px && cy === py && cz === pz) continue;
         if (solid(cx, cy, cz)) {
+          // 地表那一层若长着资源、且没有玩家方块占格，准星优先落在资源上：
+          // 左键 = 采它，而不是去拆脚下的地。
+          var nd = resAt(cx, cy, cz);
+          if (nd && !blockAt(cx, cz, cy)) {
+            return { cx: cx, cz: cz, layer: cy, entity: null, node: nd, place: null };
+          }
           // 只有"头所在的那一格"算被身体占用。脚下那格允许落块——块一落地，move()
           // 立刻把人抬到新块顶上，于是"低头、连点"就是 Minecraft 的原地起柱：
           // 一次点击一块，不卡跳跃帧。曾经连脚下也一起禁，结果平视/俯视的点击
@@ -749,6 +802,13 @@
         gl.enableVertexAttribArray(AT_S); gl.vertexAttribPointer(AT_S, 1, gl.FLOAT, false, 24, 20);
         gl.drawArrays(gl.TRIANGLES, 0, st.nE);
       }
+      if (st.nR) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, st.bufR);
+        gl.enableVertexAttribArray(AT_P); gl.vertexAttribPointer(AT_P, 3, gl.FLOAT, false, 24, 0);
+        gl.enableVertexAttribArray(AT_UV); gl.vertexAttribPointer(AT_UV, 2, gl.FLOAT, false, 24, 12);
+        gl.enableVertexAttribArray(AT_S); gl.vertexAttribPointer(AT_S, 1, gl.FLOAT, false, 24, 20);
+        gl.drawArrays(gl.TRIANGLES, 0, st.nR);
+      }
       gl.enable(gl.CULL_FACE);
 
       // 粒子（放置/拆除反馈）
@@ -790,9 +850,11 @@
         st.regionKey = key; st.dirty = false;
         buildTerrain(x0, z0);
         buildEntities(x0, z0);
+        buildResources(x0, z0);
         st.entAt = now;
       } else if (now - st.entAt > 90) {
         // 活物呼吸/走动：约 11Hz 重算实体网格。比每帧上传便宜，也够让画面不再"定格"。
+        // 资源不长脚，只在地形/资源集变化时重铺，不跟着这一层一起上传。
         st.entAt = now;
         buildEntities(x0, z0);
       }
@@ -909,10 +971,15 @@
         look = null;
       }
     }
-    /** 一次编辑动作：0 = 拆（释放归属），2 = 造（签一条 claim 记录） */
+    /** 一次编辑动作：0 = 拆/采（释放归属或采走资源），2 = 造（签一条 claim 记录） */
     function act(kind) {
       var t = st.target;
       if (!t) { hooks.onEmpty && hooks.onEmpty(kind); return; }
+      // 准星落在资源上：左键是"采"，不拆地、不拆别人的方块
+      if (t.node) {
+        if (kind === 0) hooks.onHarvest && hooks.onHarvest(t.cx, t.cz, t.node);
+        return;
+      }
       if (kind === 2) {
         if (!t.place) { hooks.onBlocked && hooks.onBlocked(t); return; }
         hooks.onPlace && hooks.onPlace(t.place.cx, t.place.cz, t.place.layer, st.slot);
@@ -982,6 +1049,28 @@
         st.dirty = true;
       },
       setColors: function (c) { st.colors = c; st.dirty = true; },
+      /** 资源节点列表（world_resources 的原样结构）：签名只算没采走的节点 */
+      setResources: function (list) {
+        var nodes = list || [];
+        var sig = 0, live = 0;
+        for (var i = 0; i < nodes.length; i++) {
+          var n = nodes[i];
+          if (n.taken) continue;
+          live++;
+          sig = (sig * 31 + n.x * 3 + n.y * 5 + n.kind * 7) | 0;
+        }
+        var key = sig + ':' + live + ':' + nodes.length;
+        if (key === st.resSig) return;
+        st.resSig = key;
+        st.res = nodes;
+        st.resMap = {};
+        for (var j = 0; j < nodes.length; j++) {
+          var m = nodes[j];
+          // taken 的也留着：地形层要靠它把"这一轮被采走的树"从装饰林里摘掉
+          st.resMap[cellKey(m.x, m.y)] = m;
+        }
+        st.dirty = true;
+      },
       setSlot: function (i) { st.slot = i; },
       setSlots: function (n) { st.slots = Math.max(1, Math.min(16, n | 0 || 1)); if (st.slot >= st.slots) st.slot = 0; },
       setTime: function (height) { st.height = Math.max(0, height | 0); st.heightAt = performance.now(); },

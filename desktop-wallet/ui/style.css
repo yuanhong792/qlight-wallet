@@ -393,6 +393,36 @@ body {
 .er-o { font-size: 11px; color: var(--gold-dk); font-weight: 600; flex-shrink: 0; }
 .tag.era1 { background: linear-gradient(135deg, #FCEBA8, var(--gold)); color: #3A2A05; border-color: rgba(168,122,24,.4); }
 
+/* ---------- 光尘（QL-DUST-v1）：采来的自然物换来的可花代币 ---------- */
+.dust-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.dust-num { display: flex; align-items: baseline; gap: 4px; }
+.dust-num b { font-size: 26px; font-weight: 700; letter-spacing: -.4px; font-variant-numeric: tabular-nums; }
+.dust-sym { color: var(--gold-dk); font-size: 15px; }
+.panel-title.sub { margin-top: 16px; margin-bottom: 8px; font-size: 12px; }
+.send-grid2 { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; margin-top: 10px; }
+.er-o.plus { color: #1D7A4B; }
+.er-o.minus { color: #B4432F; }
+#dust-night-line.gold { color: var(--gold-dk); font-weight: 700; }
+#dust-recent { max-height: 220px; overflow-y: auto; }
+
+/* ---------- 旅人摊位（QL-TRADER-v1）：只卖情报，光尘付给烧毁地址 ---------- */
+.trader-offers { max-height: none; gap: 2px; }
+.trader-offer {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 6px;
+  background: none; border: none; border-bottom: 1px solid #F1F3F6; text-align: left;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.trader-offer:last-child { border-bottom: none; }
+.trader-offer:hover:not(:disabled) { background: #FFFDF4; }
+.trader-offer:disabled { opacity: .55; cursor: default; }
+.trader-offer .to-price { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--gold-dk); flex-shrink: 0; }
+.trader-result { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: #FFFDF4; border: 1px solid #EFE3C3; }
+.trader-result .tr-title { font-size: 12.5px; font-weight: 700; color: var(--gold-dk); }
+.trader-result .ts-line { font-family: "SF Mono", Menlo, monospace; font-size: 11px; color: #3A4456; line-height: 1.6; }
+.trader-result .ts-line b { color: var(--ink, #12161F); }
+#panel-trader.flash { animation: trflash .9s ease-out 1; }
+@keyframes trflash { 0% { box-shadow: 0 0 0 3px rgba(227,181,74,.55); } 100% { box-shadow: 0 0 0 0 rgba(227,181,74,0); } }
+
 /* ---------- 第一人称体素编辑器（Minecraft 式创造） ---------- */
 .send-grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 10px; }
 .w3d-enter { width: 100%; margin-top: 12px; }

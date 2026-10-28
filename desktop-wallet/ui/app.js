@@ -13,6 +13,8 @@ const fmtAmt = (units) => {
   const q = fmtQlx(units);
   return q.frac === "000000000" ? `${q.int}` : `${q.int}.${q.frac.replace(/0+$/, "")}`;
 };
+// 光尘没有小数位：它按"个"计，不像 QLX 分 9 位。用 fmtAmt 会把 60 印成 0.00000006。
+const fmtDust = (n) => Number(n || 0).toLocaleString("en-US");
 const short = (addr) => `${addr.slice(0, 10)}…${addr.slice(-8)}`;
 const ts = (unix) => new Date(unix * 1000).toLocaleString(LANG === "en" ? "en-US" : "zh-CN", { hour12: false });
 
@@ -364,6 +366,196 @@ function surfaceLayer(x, z) {
   return t.heights[z * QLWorld.W + x] >> QLWorld3D.LEVEL_SHIFT;
 }
 
+// —— 光尘（QL-DUST-v1）：采来的自然物是唯一来源，采集记录才进账本
+let dustSnap = null;
+let worldRes = [];        // world_resources 的全图结果（含 taken）
+let worldResSig = "";     // 只在光尘总量/轮次/昼夜变了才重扫
+let dustBusy = false;
+
+// —— 旅人摊位（QL-TRADER-v1）：只卖情报，光尘付给没有私钥的烧毁地址
+let traderSnap = null;    // 这一程在哪、卖什么、你有多少光尘
+let traderQuote = null;   // 刚买到的那件情报（2 秒轮询重渲染时不丢）
+let traderQuoteLang = ""; // 上次渲染用的语言：只在切语言时重刷，不打断阅读
+let traderBusy = false;
+
+/** 该格上能不能采：资源点由种子算出，taken 来自整本光尘账本的重放 */
+const resAtCell = (x, y) => worldRes.find((n) => n.x === x && n.y === y && !n.taken) || null;
+
+async function loadDust() {
+  const d = await invoke("world_dust_state").catch(() => null);
+  if (!d) return;
+  dustSnap = d;
+  renderDust();
+  // 采集状态的变化（自己采的、邻居采的）都会推动 minted_total 或轮次，签名因此够用
+  const sig = `${d.epoch}|${d.night}|${d.minted_total}`;
+  if (sig !== worldResSig) {
+    worldResSig = sig;
+    worldRes = await invoke("world_resources", { x0: 0, y0: 0, x1: QLWorld.W, y1: QLWorld.H }).catch(() => []);
+    paintWorld();
+    if (w3) w3.setResources(worldRes);
+  }
+}
+
+function renderDust() {
+  const d = dustSnap;
+  if (!d) return;
+  $("dust-balance").textContent = fmtDust(d.balance);
+  $("dust-meta").textContent = t("dust.meta", {
+    minted: fmtDust(d.minted_total), h: d.height, epoch: d.epoch + 1, n: d.epoch_blocks,
+  });
+  const pct = d.quota ? (d.harvested_this_epoch / d.quota) * 100 : 0;
+  $("dust-quota-bar").style.width = `${Math.min(100, pct)}%`;
+  $("dust-quota-line").textContent = t("dust.quota", {
+    used: d.harvested_this_epoch, q: d.quota, left: Math.max(0, d.epoch_end - d.height),
+  });
+  const night = $("dust-night-line");
+  night.textContent = d.night
+    ? t("dust.night", { half: d.night_multiplier_permille / 1000 })
+    : t("dust.day");
+  night.classList.toggle("gold", !!d.night);
+
+  const box = $("dust-recent");
+  if (!d.recent.length) {
+    box.innerHTML = `<div class="muted small">${t("dust.recent.empty")}</div>`;
+    return;
+  }
+  const mine = d.address;
+  const sink = traderSnap ? traderSnap.sink : "";
+  box.innerHTML = d.recent
+    .slice()
+    .reverse()
+    .map((r) => {
+      const out = r.op === "send";
+      const toTrader = out && sink && r.to === sink;
+      const who = out
+        ? (r.owner === mine
+          ? (toTrader ? t("dust.row.trader") : t("dust.row.toself", { to: short(r.to || "") }))
+          : t("dust.row.from", { from: short(r.owner) }))
+        : t("dust.row.harvest", { kind: t(`world.kind.${r.kind}`) });
+      const amt = out
+        ? (r.owner === mine ? `−${fmtDust(r.amount)}` : `+${fmtDust(r.amount)}`)
+        : `+${fmtDust(r.amount)}`;
+      return `<div class="ent-row">
+        <div class="er-main">
+          <div class="er-n">${who}${r.op === "harvest" ? ` <span class="muted small">(${r.x}, ${r.y})</span>` : ""}</div>
+          <div class="er-m">#${r.height}${r.op === "harvest" ? ` · ${t("dust.row.epoch", { n: r.epoch + 1 })}` : ""}</div>
+        </div>
+        <div class="er-o ${out && r.owner === mine ? "minus" : "plus"}">${amt}</div>
+      </div>`;
+    })
+    .join("");
+}
+
+/** 采一格：种类与产量都由后端按坐标和链头重算，前端只提交坐标 */
+async function harvestNode(x, y) {
+  if (dustBusy) return;
+  if (!worldSnap || !worldSnap.unlocked) { worldErr(t("world.err.locked")); return; }
+  dustBusy = true;
+  try {
+    const r = await invoke("world_harvest", { x, y });
+    QLSfx.chop();
+    if (w3) w3.burst(x, surfaceLayer(x, y), y, r.kind);
+    worldOk(t("dust.ok.harvest", {
+      kind: t(`world.kind.${r.kind}`), n: fmtDust(r.amount), used: r.harvested_this_epoch, q: r.quota,
+    }));
+    await loadWorld();
+  } catch (e) {
+    QLSfx.deny();
+    worldErr(String(e));
+  }
+  dustBusy = false;
+}
+
+// —— 旅人摊位：情报全由后端按链头算，前端只负责摆出来
+async function loadTrader() {
+  const s = await invoke("world_trader_state").catch(() => null);
+  if (!s) return;
+  traderSnap = s;
+  renderTrader();
+  renderDust(); // 摊位的烧毁地址到手后，"付给旅人"那几行才认得出来
+  paintWorld(); // 摊子只在这一程内动地方，重画一次就够
+}
+
+function renderTrader() {
+  const s = traderSnap;
+  if (!s) return;
+  $("trader-meta").textContent = t("trader.meta", {
+    p: s.period + 1, x: s.x, z: s.y, left: Math.max(0, s.leaves_at - s.height),
+  });
+  const bal = dustSnap ? dustSnap.balance : s.balance;
+  $("trader-offers").innerHTML = s.offers
+    .map((o) => {
+      const afford = bal >= o.price;
+      return `<button class="trader-offer" type="button" data-id="${o.id}"${afford ? "" : " disabled"}>
+        <div class="er-main">
+          <div class="er-n">${esc(t(`trader.offer.${o.id}`))}</div>
+          <div class="er-m">${esc(t(`trader.offer.${o.id}.d`))}</div>
+        </div>
+        <div class="to-price">${o.price} ✦</div>
+      </button>`;
+    })
+    .join("");
+  // 只在切换语言后重绘一次：每 2 秒重刷会把正在读的人手里的选区冲掉
+  if (traderQuote && traderQuoteLang !== document.documentElement.lang) renderQuote(traderQuote);
+}
+
+/** 把一件情报讲成几行：路线给站，冷清之地给区域，账本给排行 */
+function renderQuote(q) {
+  const box = $("trader-result");
+  let html = `<div class="tr-title">${esc(t(`trader.offer.${q.id}`))} · ${esc(t("trader.paid", { n: fmtDust(q.price) }))}</div>`;
+  if (q.id === "route") {
+    html += `<div class="ts-line">${esc(t("trader.route.total", { n: q.count, r: fmtDust(q.total) }))}</div>`;
+    html += q.stops
+      .map((s, i) => `<div class="ts-line">${i + 1}. <b>X ${s.x} · Z ${s.y}</b> · ${esc(t(`world.kind.${s.kind}`))} +${fmtDust(s.reward)} <span class="muted">(${esc(t("trader.steps", { n: s.steps }))})</span></div>`)
+      .join("");
+  } else if (q.id === "frontier") {
+    const a = q.area || { x: 0, y: 0, size: 32 };
+    html += `<div class="ts-line">${esc(t("trader.area.line", {
+      x: a.x, z: a.y, x2: a.x + a.size - 1, z2: a.y + a.size - 1, n: q.count, r: fmtDust(q.total),
+    }))}</div>`;
+  } else {
+    html += `<div class="ts-line">${esc(t("trader.ledger.line", { people: q.count, n: q.total }))}</div>`;
+    html += q.top.map((h) => `<div class="ts-line">${esc(short(h.addr))} · ${h.count}</div>`).join("");
+  }
+  html += `<div class="ts-line muted">${esc(t("trader.world.line", { n: q.world_nodes, r: fmtDust(q.world_reward) }))}</div>`;
+  if (q.night) html += `<div class="ts-line">${esc(t("trader.night"))}</div>`;
+  box.innerHTML = html;
+  box.hidden = false;
+  traderQuoteLang = document.documentElement.lang;
+}
+
+async function buyInfo(id) {
+  if (traderBusy) return;
+  $("err-trader").textContent = "";
+  if (!worldSnap || !worldSnap.unlocked) { $("err-trader").textContent = t("world.err.locked"); return; }
+  traderBusy = true;
+  try {
+    const p = await invoke("world_trader_buy", { id });
+    QLSfx.claim();
+    traderQuote = p.quote;
+    renderQuote(p.quote);
+    await loadWorld();
+  } catch (e) {
+    QLSfx.deny();
+    $("err-trader").textContent = String(e);
+  }
+  traderBusy = false;
+}
+
+/** 地图上点到摊子：把面板拉到眼前并闪一下 */
+function focusTrader() {
+  const el = $("panel-trader");
+  el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  el.classList.remove("flash");
+  void el.offsetWidth;
+  el.classList.add("flash");
+}
+
+$("trader-offers").addEventListener("click", (e) => {
+  const b = e.target.closest(".trader-offer");
+  if (b) buyInfo(b.dataset.id);
+});
+
 const KIND_CANVAS = [];
 function kindCanvas(kind) {
   const k = Math.max(0, Math.min(15, kind | 0));
@@ -378,8 +570,18 @@ const kdIcon = (kind, released) =>
 function paintWorld() {
   if (!worldSnap) return;
   const s = worldSnap;
-  QLWorld.paint(wctx, buildTerrain(s).rgb);
+  const tr = buildTerrain(s);
+  QLWorld.paint(wctx, tr.rgb);
   wctx.imageSmoothingEnabled = false;
+
+  // 可采点：石头灰点、树金点、花红点，各占一个像素。
+  // 资源点约占全图 2.4%，画成 2×2 会把地形糊成一身麻点——1px 才看得出地貌。
+  for (const n of worldRes) {
+    if (n.taken) continue;
+    wctx.fillStyle = n.kind === 1 ? "#E3B54A" : n.kind === 0 ? "#C7CDD8" : "#E8604C";
+    wctx.fillRect(n.x, n.y, 1, 1);
+  }
+
   for (const e of s.entities) {
     if (e.released) continue; // 断租不删除，但也不再显形/占格（与 world.rs live_at 同判据）
     // 地图上的物件不再是 3×3 色点：画同一张 16×16 像素图，俯视图和走进去看到的是同一个东西
@@ -389,6 +591,17 @@ function paintWorld() {
       wctx.strokeRect(e.x - 5.5, e.y - 5.5, 12, 12);
     }
   }
+  // 旅人摊位：金框黑心的小方块，和实体区分开（他不是方块，也拆不掉）
+  if (traderSnap) {
+    const { x, y } = traderSnap;
+    wctx.fillStyle = "#12161F";
+    wctx.fillRect(x - 4, y - 4, 9, 9);
+    wctx.fillStyle = "#E3B54A";
+    wctx.fillRect(x - 3, y - 3, 7, 7);
+    wctx.fillStyle = "#12161F";
+    wctx.fillRect(x - 1, y - 1, 3, 3);
+  }
+
   const sel = entById(wSel);
   if (sel) {
     wctx.strokeStyle = "#FFFFFF";
@@ -607,6 +820,8 @@ async function loadWorld() {
   // 3D 视图开着时必须同步实体表：写完的方块只进了 2D 面板的话，玩家会看到
   // 「坐标回执 + 一击火花」但币面上什么都没有，要关了重开才显形。
   if (w3) w3.setEntities(worldSnap.entities, worldSnap.address);
+  await loadDust();
+  await loadTrader();
 }
 
 /** 免费写入的即时回执：签名即落账，不存在"等一个块"的第二阶段 */
@@ -674,17 +889,39 @@ wcvs.addEventListener("mousemove", (ev) => {
   }
   const cx = c.x >> 4, cy = c.y >> 4;
   const ch = worldSnap.chunks.find((k) => k.cx === cx && k.cy === cy);
+  const node = resAtCell(c.x, c.y);
+  const onTrader = traderSnap && Math.abs(c.x - traderSnap.x) <= 3 && Math.abs(c.y - traderSnap.y) <= 3;
   el.textContent =
     `X ${c.x} · Z ${c.y} · Y ${surfaceLayer(c.x, c.y)}` +
+    (onTrader ? ` · ✦ ${t("trader.map.tag")}` : "") +
+    (node ? ` · ✦ ${t(`world.kind.${node.kind}`)} +${fmtDust(node.reward)}` : "") +
     (ch ? ` · chunk ${cx},${cy}` : "") +
     (ch ? ` · ${t("world.f3.ch", { n: ch.count })} ${ch.root_hex.slice(0, 8)}…` : "");
 });
 
 wcvs.addEventListener("mouseleave", () => ($("world-cursor").textContent = "X – · Z –"));
 
+// 右键 = 采这一格。左键留给"选实体 / 填坐标"，采伐不会把填坐标的手感抢走。
+wcvs.addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  const c = toCell(ev);
+  if (!c || !worldSnap) return;
+  const n = resAtCell(c.x, c.y);
+  if (!n) {
+    worldErr(t("dust.err.nonode", { x: c.x, z: c.y }));
+    QLSfx.deny();
+    return;
+  }
+  harvestNode(c.x, c.y);
+});
+
 wcvs.addEventListener("click", (ev) => {
   const c = toCell(ev);
   if (!c || !worldSnap) return;
+  if (traderSnap && Math.abs(c.x - traderSnap.x) <= 3 && Math.abs(c.y - traderSnap.y) <= 3) {
+    focusTrader();
+    return;
+  }
   const hit = worldSnap.entities
     .filter((e) => !e.released)
     .map((e) => ({ e, d: Math.abs(e.x - c.x) + Math.abs(e.y - c.y) }))
@@ -748,6 +985,32 @@ $("btn-mine-ore").addEventListener("click", async () => {
 $("ent-list").addEventListener("click", (e) => {
   const row = e.target.closest(".ent-row");
   if (row) selectEnt(row.dataset.id);
+});
+
+// 💸 转光尘：收款地址与余额都由重放裁判，客户端只能提议
+$("btn-dust-send").addEventListener("click", async () => {
+  $("err-dust").textContent = "";
+  $("ok-dust").hidden = true;
+  const to = $("dust-to").value.trim();
+  const amount = Number($("dust-amount").value);
+  if (!to.startsWith("ql1")) { $("err-dust").textContent = t("send.err.addr"); return; }
+  if (!Number.isFinite(amount) || amount <= 0) { $("err-dust").textContent = t("dust.err.amount"); return; }
+  const bal = dustSnap ? dustSnap.balance : 0;
+  if (amount > bal) { $("err-dust").textContent = t("dust.err.balance", { b: fmtDust(bal) }); return; }
+  $("btn-dust-send").disabled = true;
+  try {
+    const rec = await invoke("world_dust_send", { to, amount: Math.round(amount) });
+    QLSfx.claim();
+    $("dust-amount").value = "";
+    const ok = $("ok-dust");
+    ok.hidden = false;
+    ok.textContent = t("dust.ok.send", { n: fmtDust(rec.amount), to: short(rec.to) });
+    setTimeout(() => (ok.hidden = true), 6000);
+    await loadWorld();
+  } catch (e) {
+    $("err-dust").textContent = String(e);
+  }
+  $("btn-dust-send").disabled = false;
 });
 
 $("ent-sel").addEventListener("click", async (e) => {
@@ -844,7 +1107,10 @@ function ensureWorld3D() {
       onUnsupported: () => { w3Toast(t("world3d.unsupported"), true); closeWorld3D(); },
       onSlot: (i) => { wSlot = i; buildHotbar(); buildW3Hotbar(); if (w3) w3.setSlot(i); QLSfx.chop(); },
       onPlace: (x, z, layer) => w3Place(x, z, layer, wSlot),
-      onBreak: (x, z, layer, ent) => w3Break(ent),      onBlocked: () => w3Toast(t("world3d.err.blocked"), true),
+      onBreak: (x, z, layer, ent) => w3Break(ent),
+      // 左键对准资源 = 采（打树、撬石头、摘花），不拆地
+      onHarvest: (x, z) => harvestNode(x, z),
+      onBlocked: () => w3Toast(t("world3d.err.blocked"), true),
       onEmpty: () => w3Toast(t("world3d.err.notarget"), true),
       onSound: (on) => w3Toast(on ? t("world3d.sound.on") : t("world3d.sound.off")),
       onLock: (on) => { $("w3d-cross").classList.toggle("locked", on); w3Hint(); },
@@ -868,6 +1134,7 @@ function syncWorld3D() {
   w3.setMaxLayer(worldSnap.max_layer || QLWorld3D.MAX_LAYER);
   w3.setColors(KIND_COLORS);
   w3.setEntities(worldSnap.entities, worldSnap.address);
+  w3.setResources(worldRes);
   w3.setSlots(worldSnap.slot_count || 16);
   w3.setTime(worldSnap.height || 0);
   w3.setSlot(wSlot);
@@ -906,7 +1173,11 @@ function renderW3Hud(s) {
   const row = (k, v, cls = "") => `<div class="f3k">${k}</div><div class="f3v ${cls}">${v}</div>`;
   const pos = row(t("world3d.f3.pos"), `X ${s.x} · Y ${s.layer} · Z ${s.z}`);
   const surf = row(t("world3d.f3.surface"), `${s.surface} · ${t(`world3d.biome.${s.block & 7}`)}`);
-  const tgt = row(t("world3d.f3.target"), tg ? `${tg.cx}, ${tg.layer}, ${tg.cz}${tg.entity ? ` · ${esc(tg.entity.name)}` : ""}` : "—", tg && tg.entity && tg.entity.owner === s0.address ? "gold" : "");
+  const tgt = row(t("world3d.f3.target"), tg
+    ? `${tg.cx}, ${tg.layer}, ${tg.cz}` +
+      (tg.node ? ` · ✦ ${t(`world.kind.${tg.node.kind}`)} +${fmtDust(tg.node.reward)}` : "") +
+      (tg.entity ? ` · ${esc(tg.entity.name)}` : "")
+    : "—", tg && tg.node ? "gold" : tg && tg.entity && tg.entity.owner === s0.address ? "gold" : "");
   const plc = row(t("world3d.f3.place"), tg ? (tg.place ? `${tg.place.cx}, ${tg.place.layer}, ${tg.place.cz}` : t("world3d.f3.nospace")) : "—");
   const slot = row(t("world3d.f3.slot"), `${wSlot + 1} / ${s.slots || 16} · ${t(`world.kind.${wSlot}`)}`);
   const tod = s.day > 0.72 ? t("world3d.time.day") : s.dusk > 0.4 ? t("world3d.time.dusk") : t("world3d.time.night");
@@ -992,6 +1263,11 @@ $("w3d-hotbar").addEventListener("click", (e) => {
 });
 
 // ---------------------------------------------------------------- 出块事件（实时推送）
+
+// 邻居的光尘记录合进来 = 账本变了：面板要立刻反映，不能等下一次自己动一下
+listen("world_dust", () => {
+  if (worldActive() && !$("view-main").classList.contains("hidden")) loadWorld().catch(() => {});
+});
 
 listen("chain_block", (ev) => {
   const e = ev.payload;

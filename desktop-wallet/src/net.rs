@@ -93,6 +93,10 @@ const BOOT_RETRY_MS: u64 = 4000;
 const ENT_HEAD_EVERY_MS: u64 = 9000;
 /// 实体快照的条数上限（演示规模；也是给对端的 CPU/磁盘放大器设的闸门）
 const ENT_SNAP_MAX_LINES: usize = 65_536;
+/// 光尘指纹公告周期（比实体慢一档：光尘记录多，补齐也更贵）
+const DUST_HEAD_EVERY_MS: u64 = 13_000;
+/// 光尘快照条数上限
+const DUST_SNAP_MAX_LINES: usize = 65_536;
 
 const TOPIC_REG: &str = "qlx/reg/v1";
 const TOPIC_TX: &str = "qlx/tx/v1";
@@ -100,6 +104,8 @@ const TOPIC_BLOCK: &str = "qlx/block/v1";
 const TOPIC_SYNC: &str = "qlx/sync/v1";
 /// 世界实体中继（M0「彼此看见」）：对方造了一个方块，我的小窗里当场显形
 const TOPIC_ENT: &str = "qlx/ent/v1";
+/// 光尘中继：采集与转账记录（独立账本，独立前缀）
+const TOPIC_DUST: &str = "qlx/dust/v1";
 /// 门票消息前缀（签名域隔离）
 const TICKET_PREFIX: &[u8] = b"QL-TICKET-V1";
 
@@ -123,6 +129,9 @@ pub enum NetMsg {
     Block {
         header: BlockHeader,
         txs: Vec<TxWire>,
+        /// v5 起：块内光尘记录（旧版本节点发来的消息没有这个字段，按空读）
+        #[serde(default)]
+        dusts: Vec<crate::world::dust::DustRecord>,
     },
     Ticket {
         addr: String,
@@ -165,6 +174,14 @@ pub enum NetMsg {
         digest_hex: String,
         snap: String,
     },
+    /// 光尘记录中继：本机新签的一条，或应答对端索要的历史。
+    Dust(Vec<crate::world::dust::DustRecord>),
+    /// 光尘集合指纹公告 `(条数, 指纹)`
+    DustHead { count: u64, digest_hex: String },
+    /// 我缺光尘记录：请把你那份发来
+    DustAsk { count: u64, digest_hex: String },
+    /// 整本光尘快照：base64(gzip(dust.jsonl))
+    DustSnap { digest_hex: String, snap: String },
 }
 
 #[derive(NetworkBehaviour)]
@@ -190,6 +207,7 @@ struct Topics {
     block: gossipsub::IdentTopic,
     sync: gossipsub::IdentTopic,
     ent: gossipsub::IdentTopic,
+    dust: gossipsub::IdentTopic,
 }
 
 // ---------------------------------------------------------------- 出块轮状态机
@@ -220,6 +238,10 @@ struct MachineState {
     ent_next: u64,
     /// 上次索要的实体集合指纹（同一个缺失只问一次，防追赶风暴）
     ent_asked: Option<String>,
+    /// 下次公告光尘指纹的时刻
+    dust_next: u64,
+    /// 上次索要的光尘集合指纹
+    dust_asked: Option<String>,
 }
 
 impl Default for MachineState {
@@ -233,6 +255,8 @@ impl Default for MachineState {
             sync_asked: None,
             ent_next: now + 2500,  // 尽快对一次世界，掉线期间漏掉的方块当场补回
             ent_asked: None,
+            dust_next: now + 3000,
+            dust_asked: None,
         }
     }
 }
@@ -244,6 +268,8 @@ pub struct Net {
     pub chain: Arc<SimChain>,
     /// 世界实体账本（与 AppState 同一个 Arc）：邻居中继来的记录合并到这里
     pub entities: Arc<crate::world::EntityLedger>,
+    /// 光尘账本（与 AppState 同一个 Arc）
+    pub dust: Arc<crate::world::dust::DustLedger>,
     /// 与 AppState 共用的解锁核心槽（同槽 Arc：unlock/lock 两侧自动同步，无需两处写）
     pub core_slot: Arc<RwLock<Option<Arc<WalletCore>>>>,
     /// 注册表：bech32 地址 → (pk 原始字节, addr_salt)
@@ -259,6 +285,7 @@ pub struct Net {
 enum NetCmd {
     BroadcastTx(TxWire),
     BroadcastEntity(Vec<crate::world::EntityRecord>),
+    BroadcastDust(Vec<crate::world::dust::DustRecord>),
 }
 
 fn now_ms() -> u64 {
@@ -299,6 +326,7 @@ impl Net {
         app: AppHandle,
         chain: Arc<SimChain>,
         entities: Arc<crate::world::EntityLedger>,
+        dust: Arc<crate::world::dust::DustLedger>,
         core_slot: Arc<RwLock<Option<Arc<WalletCore>>>>,
         boot_path: PathBuf,
     ) -> Arc<Net> {
@@ -306,6 +334,7 @@ impl Net {
         let net = Arc::new(Net {
             chain,
             entities,
+            dust,
             core_slot,
             registry: Mutex::new(HashMap::new()),
             cmd_tx,
@@ -319,6 +348,11 @@ impl Net {
     /// 本机新签的实体记录广播给联邦（落盘成功后调用；DESIGN.md §9.15 M0）
     pub fn broadcast_entity(&self, rec: crate::world::EntityRecord) {
         let _ = self.cmd_tx.send(NetCmd::BroadcastEntity(vec![rec]));
+    }
+
+    /// 本机新签的光尘记录广播给联邦（落盘成功后调用）
+    pub fn broadcast_dust(&self, rec: crate::world::dust::DustRecord) {
+        let _ = self.cmd_tx.send(NetCmd::BroadcastDust(vec![rec]));
     }
 
     /// 本机发出的交易广播给联邦（入池成功后调用；原件自带公钥与地址盐，对端无需注册表）
@@ -378,6 +412,10 @@ impl Net {
     /// 本机世界指纹：`(去重条数, 排序哈希指纹)`
     fn ent_head(&self) -> (u64, String) {
         crate::world::set_digest(&self.entities.load())
+    }
+
+    fn dust_head(&self) -> (u64, String) {
+        crate::world::dust::set_digest(&self.dust.load())
     }
 
     // -------------------------------------------------------------- 事件分发
@@ -582,8 +620,8 @@ impl Net {
                 }
             }
 
-            NetMsg::Block { header, txs } => {
-                self.on_block_wire(header, txs, swarm, ms, topics, app, chain)
+            NetMsg::Block { header, txs, dusts } => {
+                self.on_block_wire(header, txs, dusts, swarm, ms, topics, app, chain)
             }
 
             NetMsg::Entity(list) => {
@@ -723,6 +761,128 @@ impl Net {
                 }
             }
 
+            // —— 光尘中继：与实体同一套推送 + 指纹补齐 ——
+            NetMsg::Dust(list) => {
+                const DUST_BATCH_MAX: usize = 256;
+                if list.len() > DUST_BATCH_MAX {
+                    eprintln!("[QLight] 拒收超量光尘批次：{} 条", list.len());
+                    return;
+                }
+                let view = crate::world::dust::DustView {
+                    tip: chain.height(),
+                };
+                match self.dust.merge(&list, &view) {
+                    Ok(rep) => {
+                        if rep.accepted > 0 {
+                            eprintln!(
+                                "[QLight] 邻居光尘记录（合并：收下 {}，已见过 {}，拒收 {}）",
+                                rep.accepted, rep.known, rep.rejected
+                            );
+                            let _ = app.emit(
+                                "world_dust",
+                                serde_json::json!({
+                                    "accepted": rep.accepted,
+                                    "known": rep.known,
+                                    "rejected": rep.rejected,
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("[QLight] 光尘合并失败：{e}"),
+                }
+            }
+
+            NetMsg::DustHead { count, digest_hex } => {
+                let mine = self.dust_head();
+                if mine.1 == digest_hex {
+                    if ms.dust_asked.as_deref() == Some(format!("{count}:{digest_hex}").as_str()) {
+                        ms.dust_asked = None;
+                    }
+                    return;
+                }
+                if !ent_head_wins((count, digest_hex.clone()), &mine) {
+                    return;
+                }
+                let key = format!("{count}:{digest_hex}");
+                if ms.dust_asked.as_deref() == Some(key.as_str()) {
+                    return;
+                }
+                ms.dust_asked = Some(key);
+                pub_msg(
+                    swarm,
+                    &topics.dust,
+                    &NetMsg::DustAsk {
+                        count,
+                        digest_hex: digest_hex.clone(),
+                    },
+                );
+                eprintln!(
+                    "[QLight] 光尘对不上（本机 {} 条，邻居 {count} 条）：索要整本光尘快照",
+                    mine.0
+                );
+            }
+
+            NetMsg::DustAsk { count, digest_hex } => {
+                let mine = self.dust_head();
+                let requested = (count, digest_hex.clone());
+                if mine.1 != digest_hex && !ent_head_wins(mine.clone(), &requested) {
+                    return;
+                }
+                match std::fs::read(self.dust.path()) {
+                    Ok(raw) if !raw.is_empty() => match snapshot_pack(&raw) {
+                        Some(snap) if snap.len() <= SYNC_MAX_BYTES => pub_msg(
+                            swarm,
+                            &topics.dust,
+                            &NetMsg::DustSnap {
+                                digest_hex: mine.1,
+                                snap,
+                            },
+                        ),
+                        Some(_) => eprintln!("[QLight] 光尘快照过大（压缩后仍超上限），暂不回"),
+                        None => eprintln!("[QLight] 光尘快照压缩失败，暂不回"),
+                    },
+                    _ => {}
+                }
+            }
+
+            NetMsg::DustSnap { digest_hex, snap } => {
+                let mine = self.dust_head();
+                // 无论这次合并结果如何，都允许下个周期重问：链追赶上来以后
+                // 早先因"块高超过本机链头"被拒的记录才有机会真正入账
+                ms.dust_asked = None;
+                let Some(list) = dust_snap_records(&snap) else {
+                    eprintln!("[QLight] 光尘快照解析失败（超限或坏行），整份丢弃");
+                    return;
+                };
+                let claimed = crate::world::dust::set_digest(&list);
+                if claimed.1 != digest_hex || !ent_head_wins(claimed.clone(), &mine) {
+                    return;
+                }
+                let view = crate::world::dust::DustView {
+                    tip: chain.height(),
+                };
+                match self.dust.merge(&list, &view) {
+                    Ok(rep) => {
+                        let after = self.dust_head();
+                        eprintln!(
+                            "[QLight] 光尘快照合并：收下 {}，已见过 {}，拒收 {}（本机 {} → {} 条）",
+                            rep.accepted, rep.known, rep.rejected, mine.0, after.0
+                        );
+                        if rep.accepted > 0 {
+                            let _ = app.emit(
+                                "world_dust",
+                                serde_json::json!({
+                                    "accepted": rep.accepted,
+                                    "known": rep.known,
+                                    "rejected": rep.rejected,
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("[QLight] 光尘快照合并失败：{e}"),
+                }
+            }
+
             NetMsg::Ticket {
                 addr,
                 height,
@@ -812,6 +972,7 @@ impl Net {
         &self,
         header: BlockHeader,
         txs: Vec<TxWire>,
+        dusts: Vec<crate::world::dust::DustRecord>,
         swarm: &mut libp2p::Swarm<QlBehaviour>,
         ms: &mut MachineState,
         topics: &Topics,
@@ -859,7 +1020,7 @@ impl Net {
 
         // —— 高度衔接：整块真验（原件逐笔验签 + 凭据对照 + 块哈希重算）——
         // 不再先查注册表：块自带公钥与地址盐，验证不需要"对方先注册过"。
-        match chain.apply_remote_block(&header, txs) {
+        match chain.apply_remote_block(&header, txs, dusts) {
             Ok(mut event) => {
                 event.balance = self
                     .core_slot
@@ -1034,6 +1195,16 @@ impl Net {
                 &NetMsg::EntHead { count, digest_hex },
             );
         }
+        // —— 光尘指纹公告：采集与转账是长流水，比实体更容易漏 ——
+        if self.peers.load(Ordering::Relaxed) > 0 && now >= ms.dust_next {
+            ms.dust_next = now + DUST_HEAD_EVERY_MS;
+            let (count, digest_hex) = self.dust_head();
+            pub_msg(
+                swarm,
+                &topics.dust,
+                &NetMsg::DustHead { count, digest_hex },
+            );
+        }
 
         // —— 解锁沿检测：给刚解锁的钱包一个很快的首拍 ——
         let unlocked_now = self.core_slot.read().unwrap().is_some();
@@ -1049,7 +1220,7 @@ impl Net {
             Phase::Direct if now >= ms.beat_next => {
                 if self.peers.load(Ordering::Relaxed) == 0 {
                     // A 档行为：单机直出
-                    if let Some((event, _, _)) = chain.mine_block(&core) {
+                    if let Some((event, ..)) = chain.mine_block(&core) {
                         let _ = app.emit("chain_block", &event);
                     }
                     ms.beat_next = now + BEAT_MS;
@@ -1091,8 +1262,8 @@ impl Net {
                     .map(|(_, addr)| addr.clone());
                 let mine_now = winner.as_deref() == Some(core.address.as_str());
                 if mine_now {
-                    if let Some((event, header, wires)) = chain.mine_block(&core) {
-                        pub_block(swarm, &topics.block, &header, &wires);
+                    if let Some((event, header, wires, dusts)) = chain.mine_block(&core) {
+                        pub_block(swarm, &topics.block, &header, &wires, &dusts);
                         let _ = app.emit("chain_block", &event);
                     }
                 } else {
@@ -1113,8 +1284,8 @@ impl Net {
             Phase::Waiting { height, until_ms } if now >= *until_ms => {
                 // 自愈兜底：胜者一直没出块（掉线/作恶），本机接手（演示网 liveness）
                 eprintln!("[QLight] 高度 {height} 胜者超时未出块，本机兜底出块");
-                if let Some((event, header, wires)) = chain.mine_block(&core) {
-                    pub_block(swarm, &topics.block, &header, &wires);
+                if let Some((event, header, wires, dusts)) = chain.mine_block(&core) {
+                    pub_block(swarm, &topics.block, &header, &wires, &dusts);
                     let _ = app.emit("chain_block", &event);
                 }
                 ms.phase = Phase::Direct;
@@ -1178,6 +1349,23 @@ pub fn ent_snap_records(snap: &str) -> Option<Vec<crate::world::EntityRecord>> {
     Some(out)
 }
 
+/// 光尘快照解包：与实体同一套上限与坏行判定
+fn dust_snap_records(snap: &str) -> Option<Vec<crate::world::dust::DustRecord>> {
+    let lines = snapshot_unpack(snap)?;
+    let mut out: Vec<crate::world::dust::DustRecord> = Vec::new();
+    for line in lines.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if out.len() >= DUST_SNAP_MAX_LINES {
+            return None;
+        }
+        out.push(serde_json::from_str::<crate::world::dust::DustRecord>(line).ok()?);
+    }
+    Some(out)
+}
+
 /// 毫秒级 nonce：消息 ID 每次不同 → 绕过 gossipsub duplicate cache，
 /// 同内容重发（尤其 SyncResp 整链快照）不再被静默吞掉
 fn pub_msg(swarm: &mut libp2p::Swarm<QlBehaviour>, topic: &gossipsub::IdentTopic, msg: &NetMsg) {
@@ -1193,6 +1381,7 @@ fn pub_block(
     topic: &gossipsub::IdentTopic,
     header: &BlockHeader,
     wires: &[TxWire],
+    dusts: &[crate::world::dust::DustRecord],
 ) {
     pub_msg(
         swarm,
@@ -1200,6 +1389,7 @@ fn pub_block(
         &NetMsg::Block {
             header: header.clone(),
             txs: wires.to_vec(),
+            dusts: dusts.to_vec(),
         },
     );
 }
@@ -1295,8 +1485,16 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
         block: gossipsub::IdentTopic::new(TOPIC_BLOCK),
         sync: gossipsub::IdentTopic::new(TOPIC_SYNC),
         ent: gossipsub::IdentTopic::new(TOPIC_ENT),
+        dust: gossipsub::IdentTopic::new(TOPIC_DUST),
     };
-    for t in [&topics.reg, &topics.tx, &topics.block, &topics.sync, &topics.ent] {
+    for t in [
+        &topics.reg,
+        &topics.tx,
+        &topics.block,
+        &topics.sync,
+        &topics.ent,
+        &topics.dust,
+    ] {
         if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(t) {
             eprintln!("[QLight] 订阅失败：{e}");
         }
@@ -1369,6 +1567,9 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
                 Some(NetCmd::BroadcastTx(wire)) => {
                     pub_msg(&mut swarm, &topics.tx, &NetMsg::Tx(wire));
                 }
+                Some(NetCmd::BroadcastDust(list)) => {
+                    pub_msg(&mut swarm, &topics.dust, &NetMsg::Dust(list));
+                }
                 None => break,
             },
             _ = ticker.tick() => {
@@ -1389,7 +1590,7 @@ async fn local_miner(app: AppHandle, chain: Arc<SimChain>, core_slot: Arc<RwLock
     loop {
         if now_ms() >= next {
             if let Some(core) = core_slot.read().unwrap().clone() {
-                if let Some((event, _, _)) = chain.mine_block(&core) {
+                if let Some((event, ..)) = chain.mine_block(&core) {
                     let _ = app.emit("chain_block", &event);
                 }
             }

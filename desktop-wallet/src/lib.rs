@@ -52,13 +52,18 @@ pub fn run() {
             // 引导注册表放公共根目录：所有实例（根目录 + node-N）都读写同一份，
             // 互相读到对方的「节点号 + 监听地址」就 TCP 直连（macOS 同机组播不通的替代正路）
             let entities = Arc::new(world::EntityLedger::new(entities_path));
+            let dust_path = data_dir.join("dust.jsonl");
+            let dust = Arc::new(world::dust::DustLedger::new(dust_path));
             // v2 出块要向整本实体账本承诺世界（块哈希绑 `entity_root`），
             // 所以链必须在网络与命令层拿到副本之前就先看到它
             chain.attach_world(entities.clone());
+            // v5 起出块要把光尘记录带给全网：链必须看得到同一个光尘账本
+            chain.attach_dust(dust.clone());
             let net = net::Net::start(
                 app.handle().clone(),
                 chain.clone(),
                 entities.clone(),
+                dust.clone(),
                 core_slot.clone(),
                 base_dir.join("peers-registry.json"),
             );
@@ -69,6 +74,7 @@ pub fn run() {
                 ledger_path,
                 blocks_path,
                 entities: entities.clone(),
+                dust,
                 chain: chain.clone(),
                 core: core_slot,
                 net,
@@ -98,6 +104,16 @@ pub fn run() {
             commands::world_release,
             commands::world_mine_once,
             commands::world_proof,
+            commands::world_dust_state,
+            commands::world_resources,
+            commands::world_harvest,
+            commands::world_dust_send,
+            commands::world_trader_state,
+            commands::world_trader_buy,
+            commands::pool_state,
+            commands::pool_add,
+            commands::pool_remove,
+            commands::pool_swap,
         ])
         .run(tauri::generate_context!())
         .expect("QLight Wallet 启动失败");

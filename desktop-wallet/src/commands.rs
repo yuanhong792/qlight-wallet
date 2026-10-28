@@ -23,6 +23,8 @@ pub struct AppState {
     pub blocks_path: PathBuf,
     /// 世界实体账本（entities.jsonl，append-only 哈希链；DESIGN.md §9.11）
     pub entities: Arc<world::EntityLedger>,
+    /// 光尘账本（dust.jsonl，独立前缀与独立哈希链；DESIGN.md §9.17）
+    pub dust: Arc<world::dust::DustLedger>,
     pub chain: Arc<SimChain>,
     /// 解锁核心槽（与 net 层共用同一个 Arc<RwLock>：锁定/解锁两侧自动同步）
     pub core: Arc<RwLock<Option<Arc<WalletCore>>>>,
@@ -538,17 +540,7 @@ pub struct WorldSnapshot {
 
 /// 逐块读出 VRF 序列（世界的历史即种子；创世行的 VRF 是全零，异或进去不改变种子）
 fn vrf_sequence(blocks_path: &std::path::Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(blocks_path) else { return Vec::new() };
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if let Some(s) = v.get("vrf_hex").and_then(|x| x.as_str()) {
-            if s.len() == 64 {
-                out.push(s.to_string());
-            }
-        }
-    }
-    out
+    world::chain_vrfs(blocks_path)
 }
 
 #[tauri::command]
@@ -723,6 +715,354 @@ pub fn world_mine_once(state: AppCtx, kind: u8) -> Result<MineResult, String> {
     })
 }
 
+
+// ---------------------------------------------------------------- 光尘（§9.17）
+
+/// 光尘层的外部输入：链头高度。世界种子由 `dust` 模块自己取创世种子，
+/// 不接受调用方传入——防止把随出块漂移的地表种子混进判定。
+fn dust_view(state: &AppState) -> world::dust::DustView {
+    world::dust::DustView {
+        tip: state.chain.height(),
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct DustSnapshot {
+    pub unlocked: bool,
+    pub address: String,
+    pub balance: u64,
+    /// 只在 v5 起才有意义：`balance` 是共识结算后的余额，`pending` 是还没进块的增量
+    pub confirmed: bool,
+    pub pending: u64,
+    pub minted_total: u64,
+    pub height: u64,
+    pub epoch: u64,
+    pub epoch_blocks: u64,
+    /// 本轮结束（下一轮开始）的块高
+    pub epoch_end: u64,
+    pub night: bool,
+    pub harvested_this_epoch: u32,
+    pub quota: u32,
+    /// 夜里采集减半，UI 要能提前说清楚
+    pub night_multiplier_permille: u32,
+    pub report: world::dust::DustReport,
+    /// 与本机地址相关的最新记录（含收发）
+    pub recent: Vec<world::dust::DustRecord>,
+}
+
+fn dust_settled(
+    state: &AppState,
+) -> Result<(world::dust::DustState, Vec<world::dust::DustRecord>), String> {
+    let records = state.dust.load();
+    let (st, rep) = world::dust::replay(&records, &dust_view(state));
+    if !rep.ok {
+        return Err(format!(
+            "光尘账本第 {} 条起校验失败（{}）：{}",
+            rep.first_bad, rep.bad_owner, rep.reason
+        ));
+    }
+    Ok((st, records))
+}
+
+#[tauri::command]
+pub fn world_dust_state(state: AppCtx) -> DustSnapshot {
+    let core = state.core.read().unwrap().clone();
+    let address = core.as_ref().map(|c| c.address.clone()).unwrap_or_default();
+    let height = state.chain.height();
+    let records = state.dust.load();
+    let (st, report) = world::dust::replay(&records, &dust_view(&state));
+    let epoch = world::resource::epoch_of(height);
+    let mut recent: Vec<_> = records
+        .iter()
+        .filter(|r| r.owner == address || (!r.to.is_empty() && r.to == address))
+        .cloned()
+        .collect();
+    if recent.len() > 40 {
+        recent.drain(..recent.len() - 40);
+    }
+    // v5 起光尘是真共识：界面上先给"已确认"的数，再单独挂"待确认"，
+    // 这样"我有 60 ✦ 却换不动"不会再被当成 bug。
+    let active = state.chain.dust_fork_active();
+    let confirmed_balance = state.chain.dust_balance_pub(&address);
+    let (balance, pending) = if active {
+        (
+            confirmed_balance,
+            st.balance_of(&address).saturating_sub(confirmed_balance),
+        )
+    } else {
+        (st.balance_of(&address), 0)
+    };
+    DustSnapshot {
+        unlocked: core.is_some(),
+        balance,
+        confirmed: active,
+        pending,
+        minted_total: st.minted_total,
+        address,
+        height,
+        epoch,
+        epoch_blocks: world::resource::EPOCH_BLOCKS,
+        epoch_end: (epoch + 1) * world::resource::EPOCH_BLOCKS,
+        night: world::resource::is_night(height),
+        harvested_this_epoch: st.harvested_count(
+            core.as_ref().map(|c| c.address.as_str()).unwrap_or(""),
+            epoch,
+        ),
+        quota: world::resource::HARVEST_QUOTA,
+        night_multiplier_permille: if world::resource::is_night(height) { 500 } else { 1000 },
+        report,
+        recent,
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct ResourceNode {
+    pub x: u16,
+    pub y: u16,
+    pub kind: u8,
+    pub reward: u64,
+    /// 本轮已被采走（长出来的东西被采了，下一轮才回来）
+    pub taken: bool,
+}
+
+/// 一块视口里的资源点。坐标是权威，`taken` 来自整本光尘账本的重放。
+#[tauri::command]
+pub fn world_resources(state: AppCtx, x0: u16, y0: u16, x1: u16, y1: u16) -> Vec<ResourceNode> {
+    // 资源/光尘一律用创世种子：判定结果必须能被任意时刻重放复现
+    let words = world::resource_words();
+    let height = state.chain.height();
+    let epoch = world::resource::epoch_of(height);
+    let (st, _) = world::dust::replay(&state.dust.load(), &dust_view(&state));
+    world::resource::scan(x0 as u32, y0 as u32, x1 as u32, y1 as u32, &words)
+        .into_iter()
+        .map(|(x, y, kind)| ResourceNode {
+            x,
+            y,
+            kind,
+            reward: world::resource::reward_at(kind, height),
+            taken: st.harvested.contains(&(x, y, epoch)),
+        })
+        .collect()
+}
+
+#[derive(serde::Serialize)]
+pub struct DustHarvestResult {
+    pub record: world::dust::DustRecord,
+    pub x: u16,
+    pub y: u16,
+    pub kind: u8,
+    pub amount: u64,
+    pub balance: u64,
+    pub harvested_this_epoch: u32,
+    pub quota: u32,
+    pub epoch: u64,
+}
+
+/// ✋ 采一格：种类与产量都不接受前端输入，全部按坐标和链头重新算。
+///
+/// 采集记录里照抄这份结果，重放时每个邻居都会得到同一个金额——所以"采什么"
+/// 和"采到多少"都不是客户端说了算，而是世界说了算。
+#[tauri::command]
+pub fn world_harvest(state: AppCtx, x: u16, y: u16) -> Result<DustHarvestResult, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    let height = state.chain.height();
+    // 资源/光尘一律用创世种子：判定结果必须能被任意时刻重放复现
+    let words = world::resource_words();
+    let kind = world::resource::node_at(x as u32, y as u32, &words)
+        .ok_or_else(|| format!("({x},{y}) 没有可采的东西"))?;
+    let epoch = world::resource::epoch_of(height);
+    let amount = world::resource::reward_at(kind, height);
+    let (st, _) = dust_settled(&state)?;
+    if st.harvested.contains(&(x, y, epoch)) {
+        return Err(format!(
+            "({x},{y}) 本轮已被采走——第 {} 块长出新的",
+            (epoch + 1) * world::resource::EPOCH_BLOCKS
+        ));
+    }
+    let used = st.harvested_count(&core.address, epoch);
+    if used >= world::resource::HARVEST_QUOTA {
+        return Err(format!(
+            "本轮配额用完（{}／{}），第 {} 块进入新一轮",
+            used,
+            world::resource::HARVEST_QUOTA,
+            (epoch + 1) * world::resource::EPOCH_BLOCKS
+        ));
+    }
+    let pk_hash = world::signer_pk_hash(&core);
+    let rec = state
+        .dust
+        .commit_as(&pk_hash, &dust_view(&state), |seq, prev| {
+            world::dust::sign_record(
+                &core,
+                seq,
+                &prev,
+                &world::dust::DustDraft {
+                    op: world::dust::op::HARVEST,
+                    epoch,
+                    x,
+                    y,
+                    kind,
+                    amount,
+                    to: "",
+                    height,
+                    ts: now_unix(),
+                },
+            )
+        })?;
+    state.net.broadcast_dust(rec.clone());
+    Ok(DustHarvestResult {
+        record: rec,
+        x,
+        y,
+        kind,
+        amount,
+        balance: st.balance_of(&core.address) + amount,
+        harvested_this_epoch: used + 1,
+        quota: world::resource::HARVEST_QUOTA,
+        epoch,
+    })
+}
+
+/// 💸 转光尘：收款地址与余额都由重放裁判，客户端只能提议。
+#[tauri::command]
+pub fn world_dust_send(state: AppCtx, to: String, amount: u64) -> Result<world::dust::DustRecord, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    let height = state.chain.height();
+    let pk_hash = world::signer_pk_hash(&core);
+    let rec = state
+        .dust
+        .commit_as(&pk_hash, &dust_view(&state), |seq, prev| {
+            world::dust::sign_record(
+                &core,
+                seq,
+                &prev,
+                &world::dust::DustDraft {
+                    op: world::dust::op::SEND,
+                    epoch: 0,
+                    x: 0,
+                    y: 0,
+                    kind: 0,
+                    amount,
+                    to: &to,
+                    height,
+                    ts: now_unix(),
+                },
+            )
+        })?;
+    state.net.broadcast_dust(rec.clone());
+    Ok(rec)
+}
+
+// ---------------------------------------------------------------- 旅人摊位（§9.18）
+
+#[derive(serde::Serialize)]
+pub struct TraderOffer {
+    pub id: String,
+    pub price: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct TraderSnapshot {
+    pub rule: String,
+    pub x: u16,
+    pub y: u16,
+    /// 第几程（每 50 块一程）
+    pub period: u64,
+    /// 这一程收摊的块高
+    pub leaves_at: u64,
+    /// 光尘的去处：烧毁地址
+    pub sink: String,
+    pub balance: u64,
+    pub height: u64,
+    pub night: bool,
+    pub offers: Vec<TraderOffer>,
+}
+
+/// 旅人这一程在哪、卖什么、你有多少光尘。情报内容一律不在这里给。
+#[tauri::command]
+pub fn world_trader_state(state: AppCtx) -> TraderSnapshot {
+    let core = state.core.read().unwrap().clone();
+    let address = core.as_ref().map(|c| c.address.clone()).unwrap_or_default();
+    let height = state.chain.height();
+    let (x, y) = world::trader::stall_at(height);
+    let (st, _) = world::dust::replay(&state.dust.load(), &dust_view(&state));
+    TraderSnapshot {
+        rule: world::trader::TRADER_RULE_VERSION.into(),
+        x,
+        y,
+        period: world::trader::period_of(height),
+        leaves_at: (world::trader::period_of(height) + 1) * world::trader::TRADER_PERIOD,
+        sink: world::trader::sink_address(),
+        balance: st.balance_of(&address),
+        height,
+        night: world::resource::is_night(height),
+        offers: [world::trader::ROUTE, world::trader::FRONTIER, world::trader::LEDGER]
+            .into_iter()
+            .filter_map(|id| {
+                world::trader::price_of(id).map(|price| TraderOffer {
+                    id: id.to_string(),
+                    price,
+                })
+            })
+            .collect(),
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct TraderPurchase {
+    pub record: world::dust::DustRecord,
+    pub quote: world::trader::Quote,
+    /// 付完钱之后的余额
+    pub balance: u64,
+}
+
+/// 买一件情报：先算情报、再签一条 `send` 把光尘送去烧毁地址，最后才交货。
+///
+/// 顺序是刻意的——**算不出来就不该收钱**，所以报价放在前面；付款走的是已有的
+/// `send` 操作，不新增协议操作，老节点照收不误；收款方没有私钥，光尘是真烧掉的。
+#[tauri::command]
+pub fn world_trader_buy(state: AppCtx, id: String) -> Result<TraderPurchase, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    let price =
+        world::trader::price_of(&id).ok_or_else(|| format!("旅人没有这件情报：{id}"))?;
+    let height = state.chain.height();
+    let (st, _) = dust_settled(&state)?;
+    let balance = st.balance_of(&core.address);
+    if balance < price {
+        return Err(format!(
+            "光尘不够：这件情报要 {price} ✦，你有 {balance} ✦——去采一棵树（60 ✦）就够了"
+        ));
+    }
+    let quote = world::trader::quote(&id, height, &st)?;
+    let sink = world::trader::sink_address();
+    let pk_hash = world::signer_pk_hash(&core);
+    let rec = state
+        .dust
+        .commit_as(&pk_hash, &dust_view(&state), |seq, prev| {
+            world::dust::sign_record(
+                &core,
+                seq,
+                &prev,
+                &world::dust::DustDraft {
+                    op: world::dust::op::SEND,
+                    epoch: 0,
+                    x: 0,
+                    y: 0,
+                    kind: 0,
+                    amount: price,
+                    to: &sink,
+                    height,
+                    ts: now_unix(),
+                },
+            )
+        })?;
+    state.net.broadcast_dust(rec.clone());
+    Ok(TraderPurchase {
+        record: rec,
+        quote,
+        balance: balance - price,
+    })
+}
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -934,3 +1274,155 @@ pub fn world_proof(state: AppCtx, entity_id_hex: String) -> Result<String, Strin
     serde_json::to_string_pretty(hit).map_err(|e| e.to_string())
 }
 
+
+// ---------------------------------------------------------------- 兑换池（§9.19）
+
+/// 池子的只读快照：储备、价格、我的份额与两条余额。
+///
+/// 光尘分两本账：**共识里的**（v5 起进块结算，能拿去做市/兑换）和
+/// **gossip 里的**（刚签还没等到块）。UI 必须分开说，否则用户会以为
+/// "我有 60 ✦" 却换不动——那不是 bug，是还没确认。
+#[derive(serde::Serialize)]
+pub struct PoolSnapshot {
+    pub rule: String,
+    pub id: String,
+    pub fee_bps: u64,
+    /// 硬分叉 v5 的激活高度
+    pub activation_height: u64,
+    /// 本机链头是否已经在 v5 规则下出块
+    pub active: bool,
+    pub ready: bool,
+    /// QLX 储备（10^-9）
+    pub qlx: u64,
+    /// 光尘储备（✦）
+    pub dust: u64,
+    pub lp_total: u64,
+    /// 首次做市永久锁死的份额
+    pub locked_lp: u64,
+    pub my_lp: u64,
+    /// 1 QLX 值多少 ✦
+    pub price: Option<f64>,
+    pub my_qlx: u64,
+    /// 共识确认的光尘（能做市的那部分）
+    pub my_dust: u64,
+    /// 已签名、还没进块的增量
+    pub pending_dust: u64,
+    pub height: u64,
+    pub unlocked: bool,
+}
+
+#[tauri::command]
+pub fn pool_state(state: AppCtx) -> PoolSnapshot {
+    let core = state.core.read().unwrap().clone();
+    let address = core.as_ref().map(|c| c.address.clone()).unwrap_or_default();
+    let height = state.chain.height();
+    let pool = state.chain.pool_pub();
+    let active = state.chain.dust_fork_active();
+    let confirmed = state.chain.dust_balance_pub(&address);
+    let (gossip, _) = world::dust::replay(&state.dust.load(), &dust_view(&state));
+    let total = gossip.balance_of(&address);
+    let (my_dust, pending) = if active {
+        (confirmed, total.saturating_sub(confirmed))
+    } else {
+        // 分叉前共识里没有光尘，整本账还没被块结算：按现状显示为"可用"，
+        // 但 `active=false` 会让界面说清楚池子还不能开张。
+        (total, 0)
+    };
+    PoolSnapshot {
+        rule: world::pool::POOL_RULE_VERSION.into(),
+        id: world::pool::POOL_ID.into(),
+        fee_bps: world::pool::FEE_BPS,
+        activation_height: simchain::BLOCK_V_V5_ACTIVATION,
+        active,
+        ready: pool.ready(),
+        qlx: pool.qlx,
+        dust: pool.dust,
+        lp_total: pool.lp_total,
+        locked_lp: world::pool::MIN_LIQUIDITY,
+        my_lp: pool.shares_of(&address),
+        price: pool.price_dust_per_qlx(),
+        my_qlx: state.chain.balance_of(&address),
+        my_dust,
+        pending_dust: pending,
+        height,
+        unlocked: core.is_some(),
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct PoolTxResult {
+    pub tx_hash: String,
+    pub height: u64,
+    pub pending: bool,
+}
+
+/// 池子交易与普通转账走同一条提交路径：链内验签 + nonce + 余额试算，
+/// 入池后再由矿工按同一套 `apply_pool_op` 结算。池子没有地址、没有私钥，
+/// 所以这里没有任何"给池子转钱"的动作——储备只由曲线放行。
+fn submit_pool_op(state: &AppState, op: tx::PoolOp) -> Result<PoolTxResult, String> {
+    let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
+    let height = state.chain.height();
+    let envelope = tx::TxEnvelope::new(
+        bech32_decode_addr(&core.address)?,
+        state.chain.pending_nonce(&core.address),
+        height + 50,
+    )
+    .with_pool(op);
+    let digest = tx::tx_digest(&envelope);
+    let sig = crypto::sign(&core.signing_key, &digest);
+    let tx_hash = state.chain.submit(&core, envelope.clone(), sig.clone())?;
+    let wire =
+        simchain::BlockWire::new(&envelope, &sig, &core.pk_bytes, &core.addr_salt);
+    state.net.broadcast_tx(wire);
+    Ok(PoolTxResult {
+        tx_hash: hex::encode(tx_hash),
+        height,
+        pending: true,
+    })
+}
+
+/// 做市：两边都按现有比例存入（首次存入时自己定比例）。
+#[tauri::command]
+pub fn pool_add(state: AppCtx, qlx: String, dust: u64) -> Result<PoolTxResult, String> {
+    let qlx = parse_amount(&qlx)?;
+    if qlx == 0 || dust == 0 {
+        return Err("做市两边都要有：QLX 和光尘都得大于 0".into());
+    }
+    submit_pool_op(&state, tx::PoolOp::AddLiquidity { qlx, dust })
+}
+
+/// 撤资：按份额占比取回两边，锁死的那份永远取不回来。
+#[tauri::command]
+pub fn pool_remove(state: AppCtx, lp: u64) -> Result<PoolTxResult, String> {
+    if lp == 0 {
+        return Err("撤资份额必须大于 0".into());
+    }
+    submit_pool_op(&state, tx::PoolOp::RemoveLiquidity { lp })
+}
+
+/// 兑换：方向与数量由前端提议，报价、滑点与余额全部由链上重算。
+#[tauri::command]
+pub fn pool_swap(
+    state: AppCtx,
+    dir: String,
+    amount: String,
+    min_out: u64,
+) -> Result<PoolTxResult, String> {
+    match dir.as_str() {
+        "qlx" => submit_pool_op(
+            &state,
+            tx::PoolOp::SwapQlxForDust {
+                qlx_in: parse_amount(&amount)?,
+                min_out,
+            },
+        ),
+        "dust" => {
+            let dust_in: u64 = amount
+                .trim()
+                .parse()
+                .map_err(|_| "光尘数量必须是整数（✦）".to_string())?;
+            submit_pool_op(&state, tx::PoolOp::SwapDustForQlx { dust_in, min_out })
+        }
+        other => Err(format!("未知的兑换方向：{other}")),
+    }
+}

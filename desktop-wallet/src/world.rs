@@ -35,8 +35,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// 世界尺寸（与 tools/world 参考实现同一口径：256×256 格）
+pub mod dust;
 pub mod ore;
+pub mod pool;
+pub mod resource;
 pub mod terrain;
+pub mod trader;
 
 pub const WORLD_W: u16 = 256;
 pub const WORLD_H: u16 = 256;
@@ -1179,6 +1183,36 @@ pub fn genesis_prev() -> &'static str {
     ZERO_HASH
 }
 
+/// 从 `blocks.jsonl` 里按块序取出每块的 VRF（地表重画的唯一输入）
+pub fn chain_vrfs(blocks_path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(blocks_path) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if let Some(s) = v.get("vrf_hex").and_then(|x| x.as_str()) {
+            if s.len() == 64 {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 地表种子 `words`：渲染器与矿脉层共用这一份（同一片世界）
+pub fn chain_words(blocks_path: &Path) -> Vec<u32> {
+    terrain::seed_words(&crate::simchain::genesis_hash_hex(), &chain_vrfs(blocks_path))
+}
+
+/// 资源层种子：**只取创世块**，不折任何块 VRF。
+///
+/// 采集记录（`QL-DUST-v1`）里存的是坐标和种类，重放时要用 `resource::node_at`
+/// 按种子重算一遍来判定真假——所以这份种子必须永远不变，才能被任意时刻、
+/// 任意邻居复现出同一个结果。`chain_words` 每出一个块就把地表湿度重画一次，
+/// 拿它算资源会让手上那条记录在下一个块失效、余额凭空归零。
+pub fn resource_words() -> Vec<u32> {
+    terrain::seed_words(&crate::simchain::genesis_hash_hex(), &[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,6 +1227,25 @@ mod tests {
         p.push(format!("qlight-ent-{}-{}.jsonl", tag, std::process::id()));
         let _ = std::fs::remove_file(&p);
         EntityLedger::new(p)
+    }
+
+    #[test]
+    fn resource_words_do_not_drift_when_new_blocks_land() {
+        // 采集记录只存坐标和种类，真假全靠种子重算。地表种子每出一个块就重画，
+        // 资源层若跟着它走，采到手的记录下个块就会被判无效、余额凭空归零。
+        let mut p = std::env::temp_dir();
+        p.push(format!("qlight-blocks-{}.jsonl", std::process::id()));
+        std::fs::write(&p, "").unwrap();
+        let stable = resource_words();
+        let surface_at_genesis = chain_words(&p);
+        std::fs::write(&p, format!("{{\"vrf_hex\":\"{}\"}}\n", "11".repeat(32))).unwrap();
+        assert_eq!(stable, resource_words(), "资源种子不能随出块变化");
+        assert_ne!(
+            surface_at_genesis,
+            chain_words(&p),
+            "对照：地表种子确实会随出块变化，否则这条测试是空转"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     /// v4 的链视图：只带链头高度（免费写入不能超过它）
