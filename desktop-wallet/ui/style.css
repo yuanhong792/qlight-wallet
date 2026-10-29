@@ -175,8 +175,8 @@ body {
   box-shadow: 0 2px 8px rgba(28,36,48,.04);
 }
 .panel-title { font-size: 13px; color: var(--muted); letter-spacing: 1px; margin-bottom: 14px;
-  display: flex; align-items: center; gap: 8px; }
-.tag { font-size: 10px; background: #FFF7E0; color: #7A5410; border-radius: 10px; padding: 2px 8px; border: 1px solid rgba(227,181,74,.3); }
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tag { font-size: 10px; background: #FFF7E0; color: #7A5410; border-radius: 10px; padding: 2px 8px; border: 1px solid rgba(227,181,74,.3); white-space: nowrap; flex: none; }
 .addr-full {
   display: block; font-size: 12.5px; color: #5A6274; user-select: text;
   background: #FAFBFC; border: 1px solid var(--line); padding: 12px; border-radius: 10px;
@@ -305,18 +305,34 @@ body {
 
 /* ---------- 世界页：本地确定性渲染 + 实体编辑器 ---------- */
 .world-wrap {
-  display: grid; grid-template-columns: minmax(300px, 540px) minmax(300px, 1fr);
+  display: grid; grid-template-columns: minmax(300px, 470px) minmax(330px, 1fr);
   gap: 16px; align-items: start;
 }
 .world-side-col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 @media (max-width: 780px) { .world-wrap { grid-template-columns: 1fr; } } /* 窄窗口竖排，不出横向滚动 */
 .world-map-col { display: flex; flex-direction: column; }
+/* 地图是逐像素的事实图，颜色一个都不能改；能改的只有它和暗色面板之间的那道边。
+   深底衬 + 金色细框 + 四角压印，让 256 格位图读起来像摊在桌上的海图，而不是贴上去的截图。 */
+.map-frame {
+  position: relative; padding: 9px; border-radius: 15px;
+  background: linear-gradient(180deg, rgba(6, 16, 32, .94), rgba(6, 16, 32, .74));
+  border: 1px solid rgba(233, 194, 115, .3);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .05), 0 10px 26px rgba(0, 0, 0, .3);
+}
+.map-frame::after {
+  content: ""; position: absolute; inset: 9px; border-radius: 8px; pointer-events: none;
+  box-shadow: inset 0 0 40px rgba(3, 10, 22, .5);
+}
+.map-corner { position: absolute; width: 9px; height: 9px; border: 1px solid rgba(240, 214, 158, .6); pointer-events: none; }
+.map-corner.tl { top: 3px; left: 3px; border-right: 0; border-bottom: 0; }
+.map-corner.tr { top: 3px; right: 3px; border-left: 0; border-bottom: 0; }
+.map-corner.bl { bottom: 3px; left: 3px; border-right: 0; border-top: 0; }
+.map-corner.br { bottom: 3px; right: 3px; border-left: 0; border-top: 0; }
 #world-canvas {
   width: 100%; aspect-ratio: 1 / 1; display: block;
   image-rendering: pixelated; /* 256×256 放大必须逐像素，绝不做插值模糊 */
-  border: 1px solid var(--line); border-radius: 12px;
+  border: 0; border-radius: 8px;
   background: #0B1220; cursor: crosshair;
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
 }
 .hotbar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-top: 12px; }
 .hs {
@@ -343,9 +359,14 @@ body {
   margin-top: 10px; font-size: 11.5px; color: #5A6274;
   font-family: "SF Mono", Menlo, monospace; user-select: text;
 }
-.f3 { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 12px; align-items: baseline; }
+.f3 { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); gap: 4px 14px; font-size: 12px; align-items: baseline; }
 .f3k { color: var(--muted); white-space: nowrap; }
 .f3v { font-family: "SF Mono", Menlo, monospace; color: #3A4456; text-align: right; word-break: break-all; user-select: text; }
+/* 长句（节奏、换算）不塞进右值栏：整行铺开、左对齐，读起来才不像溢出的报错 */
+.f3-note { grid-column: 1 / -1; margin-top: 6px; padding: 8px 10px; border-radius: 9px;
+  font-size: 11.5px; line-height: 1.55; color: var(--muted);
+  background: rgba(28, 36, 48, .05); border: 1px solid var(--line); }
+.f3-note b { color: var(--gold-dk); font-weight: 600; }
 .mono { font-family: "SF Mono", Menlo, monospace; }
 .gold { color: var(--gold-dk); font-weight: 700; }
 .cpy { cursor: copy; border-bottom: 1px dashed #C6CCD8; }
@@ -444,8 +465,6 @@ body {
 .w3d { position: fixed; inset: 0; z-index: 80; background: #0B0F16; }
 .w3d[hidden] { display: none; }
 #w3d-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
-#w3d-three-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; background: #0B0F16; }
-#w3d-three-canvas[hidden] { display: none; }
 /* 进世界的门：封面本身也是这片地（黄昏），第一帧真画面出来后再淡掉 */
 .w3d-veil {
   position: absolute; inset: 0; z-index: 2; pointer-events: none; opacity: 1;
@@ -538,9 +557,7 @@ body {
 .guide { border-color: rgba(227,181,74,.45); background: linear-gradient(180deg, #FFFDF6, var(--card) 60%); }
 .guide-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
 .guide-list li { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
-.gd-mark { width: 18px; flex: none; text-align: center; color: var(--muted); font-weight: 700; }
-li.done .gd-mark { color: var(--green); }
-li.done .gd-text { color: var(--muted); text-decoration: line-through; }
+.gd-mark { width: 18px; flex: none; text-align: center; color: var(--gold-dk); font-weight: 700; }
 .gd-kind { font-size: 10px; border-radius: 8px; padding: 1px 6px; border: 1px solid var(--line); color: var(--muted); background: #F3F5F8; }
 .gd-kind.ledger { background: #EEF7EF; border-color: rgba(52,168,83,.35); color: #1F6B36; }
 .gd-go { margin-left: auto; padding: 4px 10px; font-size: 11.5px; }
@@ -608,6 +625,16 @@ body { background: #081325; }
   content: ""; position: absolute; inset: 0; pointer-events: none;
   background: radial-gradient(ellipse at 72% 42%, transparent 35%, rgba(3, 9, 24, .22) 100%);
 }
+/* 封面背景 = 星空里自转的真地球。画布垫在所有内容底下（z-index:-1 才压得住
+   .view 自己那层不透明题图），题图降级成"地球还没起来时"的兜底而不是主角。 */
+.bg-planet {
+  position: fixed; inset: 0; width: 100%; height: 100%; z-index: -1;
+  display: block; background: #04070d;
+}
+body.has-planet .view.auth {
+  background: linear-gradient(90deg, rgba(3, 10, 25, .93) 0%, rgba(5, 13, 31, .62) 32%, rgba(6, 16, 35, .12) 62%, rgba(4, 9, 20, .38) 100%),
+              linear-gradient(0deg, rgba(3, 10, 24, .66), transparent 46%);
+}
 .auth-card {
   position: relative; z-index: 1;
   margin-left: clamp(26px, 6vw, 92px);
@@ -663,6 +690,11 @@ body { background: #081325; }
   background: linear-gradient(90deg, rgba(5, 15, 34, .94), rgba(5, 16, 35, .7)),
               url("assets/world-gate-v1.png") center center / cover fixed no-repeat;
 }
+/* 地球起来之后，外壳整层换成半透明遮罩：固定层里的 #bg-planet 就是从星空转着的真地球，
+   题图只在地球起不来（没有 WebGL）时兜底。左边压暗是因为侧栏文字要读得清。 */
+body.has-planet .view.shell {
+  background: linear-gradient(90deg, rgba(4, 11, 26, .9) 0%, rgba(4, 12, 27, .6) 30%, rgba(4, 10, 22, .22) 66%, rgba(5, 12, 26, .42) 100%);
+}
 .sidebar {
   width: 206px;
   background: rgba(5, 15, 33, .84);
@@ -693,6 +725,10 @@ body { background: #081325; }
               url("assets/world-gate-v1.png") center 52% / cover no-repeat;
   border-color: rgba(233, 194, 115, .42); box-shadow: 0 22px 50px rgba(0,0,0,.2);
 }
+/* 余额卡不再自带题图：地球在整层背景里转，卡上只留一层读数遮罩，数字要压得住。 */
+body.has-planet .hero {
+  background: linear-gradient(90deg, rgba(6, 14, 30, .9) 0%, rgba(6, 15, 32, .58) 52%, rgba(6, 13, 28, .2) 78%, rgba(6, 12, 26, .46) 100%);
+}
 .hero-label, .hero-frac { color: #e5c88c; }
 .hero-num { color: #fff3d3; text-shadow: 0 4px 20px rgba(0,0,0,.45); }
 .q-btn, .hs, .panel input[type=text], .panel input[type=number], .w-select, #panel-feedback textarea, .addr-full, .vrf-log {
@@ -702,6 +738,8 @@ body { background: #081325; }
 .hs.active, .ent-row.active { background: rgba(221, 177, 94, .18); }
 .hs .hs-n, .f3v, .world-cursor, .addr-full, .proof, .vrf-log, .trader-result .ts-line { color: #dce5ef; }
 .tag, .gd-kind, .gd-kind.ledger { background: rgba(226, 184, 100, .13); color: #eed49d; }
+.f3-note { background: rgba(255, 255, 255, .045); border-color: rgba(197, 215, 237, .16); color: #b9c8da; }
+.f3-note b { color: #f0d397; }
 .mine-card, .trader-result, .guide { background: rgba(12, 28, 49, .86); color: #e6edf4; }
 .mine-card .gold, .trader-result .ts-line b { color: #f0d397; }
 .es-btn { background: rgba(219, 176, 89, .14); color: #f0d397; }
@@ -714,3 +752,63 @@ body { background: #081325; }
   .content { padding-left: 16px; padding-right: 16px; }
   .hero { flex-wrap: wrap; }
 }
+
+/* ---------- 世界页的挖矿程序台 + 世界里的三个柜台 ----------
+ * 「启动挖矿 · 进入世界」是世界页唯一的主动作；兑换池 / 旅人摊位 / 光尘灯不再摆在网页右侧，
+ * 而是站进世界里，走近了按 E 才开柜台。面板结构一个没改，这里的样式全是"搬进世界"的适配。 */
+.mine-deck { display: flex; flex-direction: column; margin-top: 6px; }
+.mine-go { margin-top: 12px; padding: 14px 12px; font-size: 15px; letter-spacing: .05em; }
+.mine-go.running {
+  background: linear-gradient(135deg, rgba(234, 196, 119, .34), rgba(199, 153, 74, .62) 60%, rgba(120, 88, 22, .7));
+  color: #fff3d3; box-shadow: 0 4px 18px rgba(0, 0, 0, .38), inset 0 0 0 1px rgba(255, 236, 180, .35);
+}
+.mine-stop { align-self: flex-start; margin-top: 9px; }
+.mine-adv { margin-top: 15px; padding-top: 11px; border-top: 1px solid var(--line); }
+.mine-adv summary { cursor: pointer; color: var(--muted); font-size: 12px; letter-spacing: .06em; }
+.mine-adv summary:hover { color: var(--gold-lt); }
+
+/* 码雨台：世界左下角一小格，滚的是这台机器真读到的链上字节 */
+.w3d-mine {
+  position: absolute; left: 14px; bottom: 14px; width: 244px; z-index: 3;
+  padding: 6px; border-radius: 10px; pointer-events: none;
+  background: rgba(4, 10, 18, .74); border: 1px solid rgba(233, 194, 115, .26);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .42); backdrop-filter: blur(6px);
+}
+.w3d-mine canvas { display: block; width: 100%; height: auto; border-radius: 6px; }
+.mine-cap {
+  margin-top: 5px; min-height: 1.5em;
+  font: 11px/1.5 "SF Mono", Menlo, monospace; color: #cfe0d8;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 走近站点的提示：压在物品栏上方，点一下也算开柜台（触屏没有 E 键） */
+.w3d-prompt {
+  position: absolute; left: 50%; bottom: 86px; transform: translateX(-50%); z-index: 4;
+  padding: 8px 17px; border-radius: 999px; cursor: pointer;
+  background: rgba(6, 14, 26, .88); border: 1px solid rgba(233, 194, 115, .45);
+  color: #ffe9b0; font-size: 13.5px; letter-spacing: .05em;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, .45);
+}
+
+/* 柜台：卡片只占屏幕一角，站在世界里还能看见身后的地 */
+.w3d-shop {
+  position: absolute; inset: 0; z-index: 6; display: flex;
+  align-items: center; justify-content: flex-end; padding: 0 26px 0 0;
+  background: rgba(3, 9, 18, .34);
+}
+.w3d-shop[hidden] { display: none; }
+.shop-card {
+  width: min(408px, calc(100vw - 52px)); max-height: min(76vh, 640px);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: rgba(9, 22, 42, .96); border: 1px solid rgba(233, 194, 115, .4); border-radius: 16px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, .55);
+}
+.shop-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 13px 16px; border-bottom: 1px solid rgba(210, 224, 242, .16);
+}
+.shop-title { color: #ffe9b0; font-size: 14.5px; letter-spacing: .1em; text-transform: uppercase; }
+.shop-panels { overflow-y: auto; padding: 8px; }
+.shop-panels .panel { display: none; padding: 14px 15px; border: 0; border-radius: 12px; box-shadow: none; background: rgba(6, 16, 32, .6); }
+.shop-panels .panel.on { display: block; }
+@media (max-height: 620px) { .w3d-mine { width: 196px; } .shop-card { max-height: 86vh; } }

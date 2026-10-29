@@ -24,5 +24,17 @@ node_modules/
 blocks.jsonl
 ledger.json
 
-# ---- 本机 UI 对拍/截图用的临时预览页（含假 __TAURI__ 桩，不入库）----
-desktop-wallet/ui/__*.html
+# ---- 本机 UI 对拍/截图用的临时页（含假 __TAURI__ 桩）：住 dev/，不入库 ----
+desktop-wallet/dev/__*.html
+
+# ---- DEM 原始瓦片缓存（重爬缓存，成品已固化进 data/earth-height.bin，不入库）----
+tools/world/dem_cache/
+
+# ---- 全球瓦片重爬缓存（成品固化进 data/earth-global-*，不入库）----
+tools/world/planet_cache/
+
+# ---- 卫星影像瓦片缓存（90 MB，成品是 ui/earth-global.jpg，不入库）----
+tools/world/img_cache/
+
+# 局部块生成器的对拍产物（tools/world/gen_planet_local.py --emit-js 写到 dev/）
+desktop-wallet/dev/earth-alt.js

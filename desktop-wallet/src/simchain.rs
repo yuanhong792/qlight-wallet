@@ -93,17 +93,19 @@ pub fn version_floor_at(height: u64) -> u8 {
         BLOCK_V_LEGACY
     }
 }
-/// 本机共识规则指纹：出块域版本 ‖ 实体记录语义 ‖ 光尘语义。
+/// 本机共识规则指纹：出块域版本 ‖ 实体记录语义 ‖ 光尘语义 ‖ 世界规则（含大地）。
 ///
-/// 联邦公告（`NetMsg::Announce`）带上它。三项里任何一项不同，两端就互相验不过
-/// 对方的块与记录——而这种分歧在链上是**静默**的：各出各的块、各自都认为自己
+/// 四项里任何一项不同，两端就互相验不过对方的块与记录——而这种分歧在链上是**静默**的：各出各的块、各自都认为自己
 /// 那条才是链，连接层看不出任何异常。所以只能趁"还连得上"的时候把它说出口。
+/// 第四项 `w{rules_id}` 尤其要紧：v3 起大地是嵌在二进制里的一张真实高程表，
+/// 两台机器可能版本号一模一样、却烘焙自不同的 DEM 瓦片，那连出的"矿"根本不是同一片地。
 pub fn rules_tag() -> String {
     format!(
-        "b{}|{}|{}",
+        "b{}|{}|{}|w{}",
         BLOCK_V,
         crate::world::RECORD_VERSION,
-        crate::world::dust::DUST_RECORD_VERSION
+        crate::world::dust::DUST_RECORD_VERSION,
+        crate::world::terrain::rules_id()
     )
 }
 /// 两次挖矿发行之间的最小间隔（块）。2 秒一块 → 约 100 秒一回合。
@@ -1259,7 +1261,7 @@ impl SimChain {
             if let Some((x, y, layer)) = claim {
                 let words = crate::world::terrain::seed_words(GENESIS_HASH_HEX, &ledger.vrfs);
                 if !crate::world::ore::is_ore(x as u32, y as u32, &words, ledger.height)
-                    || crate::world::ore::ore_layer(x as u32, y as u32, &words) != layer
+                    || crate::world::ore::ore_layer(x as u32, y as u32) != layer
                 {
                     return Err(format!("({x},{y}) 第 {layer} 层此刻不是矿——地表已经重画"));
                 }
@@ -1415,7 +1417,7 @@ impl SimChain {
                         && p.envelope.expiry > ledger.height
                         && claim_cell_of(&p.envelope).is_some_and(|(x, y, l)| {
                             crate::world::ore::is_ore(x as u32, y as u32, &words, ledger.height)
-                                && crate::world::ore::ore_layer(x as u32, y as u32, &words) == l
+                                && crate::world::ore::ore_layer(x as u32, y as u32) == l
                         })
                 }) {
                     claim_tx = Some(mp.remove(pos));
@@ -1798,8 +1800,8 @@ impl SimChain {
         if !crate::world::ore::is_ore(x32, y32, &words, height - 1) {
             return Err(format!("({x},{y}) 在块高 {} 的地表上不是矿", height - 1));
         }
-        if crate::world::ore::ore_layer(x32, y32, &words) != layer {
-            return Err(format!("矿格 ({x},{y}) 必须贴地（layer {}）", crate::world::ore::ore_layer(x32, y32, &words)));
+        if crate::world::ore::ore_layer(x32, y32) != layer {
+            return Err(format!("矿格 ({x},{y}) 必须贴地（layer {}）", crate::world::ore::ore_layer(x32, y32)));
         }
         Ok(())
     }
@@ -2193,7 +2195,7 @@ impl SimChain {
             if let Some((x, y, layer)) = claim {
                 let words = crate::world::terrain::seed_words(GENESIS_HASH_HEX, &ledger.vrfs);
                 if !crate::world::ore::is_ore(x as u32, y as u32, &words, ledger.height)
-                    || crate::world::ore::ore_layer(x as u32, y as u32, &words) != layer
+                    || crate::world::ore::ore_layer(x as u32, y as u32) != layer
                 {
                     return Err(format!("({x},{y}) 第 {layer} 层此刻不是矿——地表已经重画"));
                 }
@@ -2939,7 +2941,7 @@ mod tests {
                     return Some((
                         x as u16,
                         y as u16,
-                        crate::world::ore::ore_layer(x, y, &words),
+                        crate::world::ore::ore_layer(x, y),
                     ));
                 }
             }

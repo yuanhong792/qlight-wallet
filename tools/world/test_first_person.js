@@ -75,6 +75,7 @@ global.window = global;
 require(path.join(UI, 'sprites.js'));
 require(path.join(UI, 'qlight-hd-sprites.js'));
 require(path.join(UI, 'terrain-tex.js'));
+require(path.join(UI, 'earth-height.js'));
 require(path.join(UI, 'world.js'));
 require(path.join(UI, 'world3d.js'));
 const W = global.QLWorld, W3 = global.QLWorld3D;
@@ -197,10 +198,10 @@ press(2);
 check('E 准星确实落空', w3.state().target === null, w3.state().target);
 check('E 落空必须给出反馈（不许无声失败）', stat.empty - e0 === 1, stat.empty - e0);
 
-/* F 大地不随链长漂移（规则 v2 的种子分道） */
+/* F 大地不随链长漂移（规则 v3：大地干脆不看种子，它是烘焙进仓库的真实高程表） */
 const hg = (l) => W.fingerprint(W.render(W.seedWords(W.GENESIS_HASH, l)).heights);
 check('F 创世哈希 = 仓库锚定值', W.GENESIS_HASH === '5dc2205a8f0153a05f84e26ab94086009796bb68fdfddff439f97ebfd2aa3104', W.GENESIS_HASH.slice(0, 12));
-check('F 高度场指纹 = 7b2863f076bce5fa（与 test_rules_v2.py 同一常量）', hg([]) === '7b2863f076bce5fa', hg([]));
+check('F 高度场指纹 = 88d303cd75dcc913（与 test_rules_v3.py 同一常量）', hg([]) === '88d303cd75dcc913', hg([]));
 check('F 0 / 240 / 250 个块的历史渲染出同一片大地', hg(vrfs) === hg([]) && hg(vrfs.concat([hex64()])) === hg([]), hg(vrfs));
 
 /* G 快照 → 3D 场景的推送（app.js 的 loadWorld 每 2 秒做一次）
@@ -283,7 +284,9 @@ const blockBody = (appJs.match(/listen\("chain_block",\s*\(ev\)\s*=>\s*\{[\s\S]*
 check('G3 app.js 收到新块必须铸砖', /mintBlock\s*\(/.test(blockBody), blockBody.slice(-200));
 check('G3 砖上的发行量取 total_minted 的差，不是含手续费的 e.reward',
   /total_minted/.test(blockBody) && !/reward:\s*e\.reward/.test(blockBody), blockBody.slice(-260));
-const mineBody = (appJs.match(/\$\("btn-mine-ore"\)\.addEventListener\("click",\s*async \(\)\s*=>\s*\{[\s\S]*?\n\}\);/) || [''])[0];
+/* 锚点跟着 0.4.3 的改版换过一次：挖矿不再是 `btn-mine-ore` 那一下点击，
+   而是程序一跳一跳的 `mineTick()`。断言一个字没动——符文仍只许在矿签真落账之后起。 */
+const mineBody = (appJs.match(/async function mineTick\(\)\s*\{[\s\S]*?\n\}/) || [''])[0];
 check('G3 挖到矿必须在矿格上起一串符文', /noteMinedCell\(/.test(mineBody), mineBody.slice(0, 200));
 check('G3 符文只在矿签真的落账之后起（不许在签名前预告）',
   mineBody.indexOf('world_mine_once') >= 0 && mineBody.indexOf('world_mine_once') < mineBody.indexOf('noteMinedCell('), mineBody.slice(0, 240));

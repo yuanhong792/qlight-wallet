@@ -21,6 +21,18 @@
   var REACH = 7;                // 可编辑距离（格）
   var REGION = 64;              // 每次重建网格的边长（格）
   var EYE = 1.62;               // 视高（格）
+  // —— 真实世界的物理常数：一格就是一米，人就是一个 1.75 米高、0.6 米宽的盒子。
+  //    这套数字不是手感调参，是米每秒和米每二次方秒，任何人都能拿卷尺量。
+  var BODY_H = 1.75;            // 身高（米）
+  var BODY_R = 0.3;             // 半身宽（米）：身体占 0.6 米，比一格窄，才会卡在门缝里
+  var GRAV = 9.81;              // 重力加速度
+  var JUMP_V = 5.0;             // 起跳初速 → 跳 1.27 米高，正好上得去一格台阶
+  var WALK = 1.4;               // 人走路实测 1.4 米/秒
+  var RUN = 4.2;                // 全力跑 4.2 米/秒（旧版是 7 米/秒 = 每秒跨七米，不是人）
+  var STEP_UP = 0.62;           // 不用跳就能跨上去的高度（真人约半步）
+  var WATER_TOP = (((global.QLWorld && global.QLWorld.RULES.SEA) || 86) >> 3) + 1 - 0.36;
+  // 海面 y：海平面那一格的顶面再低 36 厘米——水线在沙滩顶面之下，岸才有厚度。
+  // 这个数和 world3d-three.js 的 WATER_Y 必须是同一个，否则眼睛里的水和画出来的水不是一层。
   // 雾：区域只有 REGION 格，边界外是真空。用距离雾在边界之前把地形融进天空，
   // 否则走两步就看见"世界在 32 格外被整齐切断"——确定性世界的边缘不该是穿帮。
   var SKY = [0.55, 0.72, 0.92];
@@ -194,7 +206,9 @@
       x: 128.5, z: 128.5, y: 30, yaw: 0.6, pitch: -0.45,
       keys: {}, dirty: true, regionKey: '', target: null, locked: false, drag: false,
       height: 0, heightAt: performance.now(), day: null, lastYaw: 1e9, lastAnim: 0, mesh: 0,
-      bob: 0, bobPhase: 0, stepMark: 0, parts: [], entAt: 0,
+      bob: 0, bobPhase: 0, stepMark: 0, parts: [], entAt: 0, speed: 0, punch: 0,
+      // 真实物理要的是速度状态，不是"按住键就位移"：vy 是竖直速度（米/秒）
+      vx: 0, vz: 0, vy: 0, grounded: false, inWater: false,
       // 资源层（QL-RES-v1）：长在地上的树/石/花，采伐记录才进光尘账本
       res: null, resMap: null, resSig: '',
       // 挖地账本（v5）：cellKey → 已挖掉的层数。挖出来的坑是"少了一层"的同一片地形，
@@ -1009,35 +1023,125 @@
         verts: st.nG, vcap: (st.arrG.length / 6) | 0,
         // 连续坐标与朝向：在场广播要的是"我这一刻站在哪"，取整的格子坐标不够用
         px: st.x, py: st.y - EYE, pz: st.z, yaw: st.yaw, pitch: st.pitch,
+        // 第一人称的手：手持格、实测速度（摆臂幅度由它定）、步相、出拳计数，
+        // 还有 above = 眼睛离自己脚下那一列顶面几米——离开人的高度，手就该消失。
+        held: st.slot, speed: st.speed, bob: st.bobPhase, bobY: st.bob, punch: st.punch,
+        // 物理状态要能被外部断言：没有这两条，"站住了吗""下水了吗"只能靠猜，
+        // 而 tools/ 里的物理对拍正是靠它们判定落地、起跳和浮力有没有真的生效
+        grounded: st.grounded, inWater: st.inWater,
+        above: (st.y - EYE) - support(cx, cz),
         peers: st.peers.length,
       };
     }
 
-    // —— 移动：站在算出来的地形或自己垒起来的方块顶上（创造模式可飞）
+    // —— 物理：一格一米，人有体重、有体积、会摔、要跳，水有浮力。
+    //    旧的 move() 没有竖直速度、水平方向零碰撞：能穿方块、能直接走上十米断崖、
+    //    走出崖边会永远悬在半空。那不叫创造模式，那叫没有物理。
+    /** 身体盒子（0.6 米宽 × 1.75 米高）在 (x, feet, z) 是否卡进实心格 */
+    function hits(x, feet, z) {
+      var x0 = Math.floor(x - BODY_R), x1 = Math.floor(x + BODY_R);
+      var z0 = Math.floor(z - BODY_R), z1 = Math.floor(z + BODY_R);
+      var y0 = Math.floor(feet + 0.002), y1 = Math.floor(feet + BODY_H - 0.002);
+      for (var cy = y0; cy <= y1; cy++)
+        for (var cx = x0; cx <= x1; cx++)
+          for (var cz = z0; cz <= z1; cz++)
+            if (solid(cx, cy, cz)) return true;
+      return false;
+    }
+
+    /** 身体占的那几列里、不高于 notAbove 的最高可站顶面：跨台阶和落地都读它 */
+    function standTop(x, z, notAbove) {
+      var best = -Infinity;
+      var x0 = Math.floor(x - BODY_R), x1 = Math.floor(x + BODY_R);
+      var z0 = Math.floor(z - BODY_R), z1 = Math.floor(z + BODY_R);
+      for (var cx = x0; cx <= x1; cx++) for (var cz = z0; cz <= z1; cz++) {
+        if (cx < 0 || cz < 0 || cx >= W || cz >= H) continue;
+        var t = support(cx, cz);
+        if (t <= notAbove + 0.001 && t > best) best = t;
+      }
+      return best;
+    }
+
     function move(dt) {
-      var k = st.keys, sp = (k['shift'] ? 15 : 7) * dt;
+      var k = st.keys;
+      dt = Math.min(dt, 0.05);                    // 卡帧一步跨两米会穿墙，先把时间夹住
+      var feet = st.y - EYE;
+      var sup = support(st.x | 0, st.z | 0);
+      var water = feet < WATER_TOP && sup < WATER_TOP - 0.01;
+      st.inWater = water;
+
+      // 自己把方块放在脚下了：先把自己抬出去，否则会卡死在墙里
+      if (hits(st.x, feet, st.z)) {
+        for (var up = 0.05; up <= 1.35; up += 0.05) {
+          if (!hits(st.x, feet + up, st.z)) { feet += up; if (st.vy < 0) st.vy = 0; break; }
+        }
+      }
+
+      // —— 水平：按键定目标速度，实际速度按加速度逼近（不是"一按就满速"的纸片手感）
       var fx = Math.sin(st.yaw), fz = Math.cos(st.yaw);
-      var dx = 0, dz = 0;
-      if (k['w'] || k['arrowup']) { dx += fx; dz += fz; }
-      if (k['s'] || k['arrowdown']) { dx -= fx; dz -= fz; }
-      if (k['a'] || k['arrowleft']) { dx += fz; dz -= fx; }
-      if (k['d'] || k['arrowright']) { dx -= fz; dz += fx; }
-      var n = Math.hypot(dx, dz);
-      if (n > 0) { dx = dx / n * sp; dz = dz / n * sp; }
+      var wx = 0, wz = 0;
+      if (k['w'] || k['arrowup']) { wx += fx; wz += fz; }
+      if (k['s'] || k['arrowdown']) { wx -= fx; wz -= fz; }
+      if (k['a'] || k['arrowleft']) { wx += fz; wz -= fx; }
+      if (k['d'] || k['arrowright']) { wx -= fz; wz += fx; }
+      var wn = Math.hypot(wx, wz);
+      var wish = water ? (k['shift'] ? RUN : WALK) * 0.62 : (k['shift'] && st.grounded ? RUN : WALK);
+      var tvx = 0, tvz = 0;
+      if (wn > 0) { tvx = wx / wn * wish; tvz = wz / wn * wish; }
+      var accel = water ? 5 : (st.grounded ? 16 : 5);   // 空中只能微调方向，不能想拐就拐
+      st.vx += (tvx - st.vx) * Math.min(1, accel * dt);
+      st.vz += (tvz - st.vz) * Math.min(1, accel * dt);
+
       var ox = st.x, oz = st.z;
-      st.x = Math.max(0.5, Math.min(W - 0.5, st.x + dx));
-      st.z = Math.max(0.5, Math.min(H - 0.5, st.z + dz));
-      if (k[' ']) st.y += sp;
-      if (k['c']) st.y -= sp;
-      var ground = support(st.x | 0, st.z | 0) + EYE;
-      if (st.y < ground) st.y = ground;
-      if (st.y > st.maxLayer + 8) st.y = st.maxLayer + 8;
+      // X 轴：撞墙就贴墙站住；脚下有 STEP_UP 以内的台阶就顺势跨上去
+      var nx = Math.max(0.5, Math.min(W - 0.5, st.x + st.vx * dt));
+      if (!hits(nx, feet, st.z)) st.x = nx;
+      else {
+        var lift = (st.grounded || water) ? standTop(nx, st.z, feet + STEP_UP) : -Infinity;
+        if (lift > feet + 0.001 && lift <= feet + STEP_UP && !hits(nx, lift, st.z)) { st.x = nx; feet = lift; }
+        else st.vx = 0;
+      }
+      var nz = Math.max(0.5, Math.min(H - 0.5, st.z + st.vz * dt));
+      if (!hits(st.x, feet, nz)) st.z = nz;
+      else {
+        var lift2 = (st.grounded || water) ? standTop(st.x, nz, feet + STEP_UP) : -Infinity;
+        if (lift2 > feet + 0.001 && lift2 <= feet + STEP_UP && !hits(st.x, lift2, nz)) { st.z = nz; feet = lift2; }
+        else st.vz = 0;
+      }
+
+      // —— 竖直：重力、浮力、跳跃，全部走速度，不再"按住键就升"
+      if (water) {
+        // 浮力按浸进水的身体比例给：头一出水净上浮就归零，人自然漂在水面上
+        var sub = Math.max(0, Math.min(1, (WATER_TOP - feet) / BODY_H));
+        st.vy += (sub * 13.5 - GRAV) * dt;
+        st.vy *= Math.max(0, 1 - 4.2 * dt);                 // 水阻
+        if (k[' ']) st.vy += 7.5 * dt;                       // 往上划
+        if (k['c']) st.vy -= 6.5 * dt;                       // 往下潜
+        st.grounded = false;
+      } else {
+        if (k[' '] && st.grounded) { st.vy = JUMP_V; st.grounded = false; }
+        st.vy -= GRAV * dt;
+        if (st.vy < -55) st.vy = -55;                        // 收尾速度
+      }
+      var ny = feet + st.vy * dt;
+      if (st.vy > 0) {
+        if (hits(st.x, ny + 0.02, st.z)) st.vy = 0;          // 顶头
+        else { feet = ny; if (!water) st.grounded = false; }
+      } else {
+        var top = standTop(st.x, st.z, feet + 0.001);
+        if (top > -Infinity && ny <= top) { feet = top; st.vy = 0; st.grounded = true; }
+        else { feet = ny; st.grounded = false; }
+      }
+      var cap = st.maxLayer + 8 - EYE;
+      if (feet > cap) { feet = cap; if (st.vy > 0) st.vy = 0; }
+      st.y = feet + EYE;
 
       // 走路时视线轻微起伏 + 脚步音：MC 的"在场感"一大半来自这两件小事
       var moved = Math.hypot(st.x - ox, st.z - oz);
-      if (moved > 1e-4 && st.y <= ground + 0.01) {
-        st.bobPhase += moved * 2.2;
-        st.bob = Math.sin(st.bobPhase) * 0.055;
+      st.speed = moved / dt;             // 米/秒：摆臂幅度读它，不能按"有没有按键"甩手
+      if (moved > 1e-4 && st.grounded && !water) {
+        st.bobPhase += moved * 5.2;                          // 步频跟着真实步幅走
+        st.bob = Math.sin(st.bobPhase) * 0.045;
         if (st.bobPhase - st.stepMark > Math.PI) {
           st.stepMark = st.bobPhase;
           if (global.QLSfx) global.QLSfx.step();
@@ -1109,6 +1213,7 @@
     }
     /** 一次编辑动作：0 = 挖/拆/采，2 = 造（签一条 claim 记录） */
     function act(kind) {
+      st.punch++;                       // 手要先挥出去：有没有打到东西是账本的事，挥拳是手感的事
       var t = st.target;
       if (!t) { hooks.onEmpty && hooks.onEmpty(kind); return; }
       // 准星落在资源上：左键是"采"，不拆地、不拆别人的方块

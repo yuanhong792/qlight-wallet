@@ -1,0 +1,164 @@
+<!doctype html><meta charset="utf-8"><title>QLight 星球对拍（真实地球 + 席位 + 俯冲）</title>
+<style>html,body{margin:0;width:100%;height:100%;background:#05070c;overflow:hidden}
+canvas{width:100%;height:100%;display:block;cursor:grab}
+canvas:active{cursor:grabbing}
+aside{position:fixed;left:16px;top:14px;color:#eaf2f8;font:12.5px/1.55 ui-monospace,Menlo,monospace;
+background:#050b14cc;padding:10px 13px;border:1px solid #ffffff22;z-index:5;white-space:pre;max-width:44ch}
+b{color:#ffd479}
+nav{position:fixed;right:16px;top:14px;z-index:5;display:flex;gap:8px;flex-direction:column}
+nav button{font:12.5px ui-monospace,Menlo,monospace;color:#eaf2f8;background:#0d1a28dd;
+border:1px solid #ffffff2b;border-radius:6px;padding:7px 11px;cursor:pointer}
+nav button:hover{background:#173049}
+</style>
+<canvas id="view"></canvas>
+<aside id="hud">loading…</aside>
+<nav>
+  <button id="bLao">崂山 · 出生地</button>
+  <button id="bSeat">我的席位</button>
+  <button id="bRand">换个地址</button>
+  <button id="bDive">俯冲落地</button>
+</nav>
+<script type="module">
+import * as THREE from '../ui/vendor/three/three.module.js';
+// 星球层口径、球体、大气、星空全部来自 planet-view.js——封面与这一页必须是同一份代码，
+// 否则"对拍"对的是两个实现，改了这边忘了那边（海悬崖那个黑裂缝就是这么留下的）。
+import {createPlanet, dirOf, heightAt, unquantize, GW, GH, SEA_CODES, loadPlanetAssets} from '../ui/planet-view.js';
+
+const q = new URLSearchParams(location.search);
+const EX = +(q.get('ex') || 16);       // 星球视图的垂直夸张：真实比例下 8848 米只占半径 0.14%，看不见
+const canvas = document.getElementById('view');
+
+// ── 席位：地址 ⊕ 创世 → SHA-256 → 全球陆地格拒绝采样 ────────────────────────
+// 同一地址永远同一个位置（不可重掷）；这里只是前端演示口径，进账本时 Rust 必须算出同一个格。
+async function seatOf(address, genesis) {
+  const {H} = await loadPlanetAssets();
+  const enc = new TextEncoder();
+  let seed = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(address + '|' + genesis)));
+  for (let tries = 0; tries < 4096; tries++) {
+    // 每次取 4 字节当行、4 字节当列的随机数；不够就再哈希一轮（链式，可复现）
+    if (tries % 8 === 4) seed = new Uint8Array(await crypto.subtle.digest('SHA-256', seed));
+    const rd = (o) => (seed[o] << 24 | seed[o + 1] << 16 | seed[o + 2] << 8 | seed[o + 3]) >>> 0;
+    const i = rd(0) % GW, j = rd(4) % GH;
+    const code = H[j * GW + i];
+    if (code >= SEA_CODES) {
+      const lon = -180 + (i + 0.5) / GW * 360, lat = 90 - (j + 0.5) / GH * 180;
+      return {lat, lon, i, j, code, m: unquantize(code), tries};
+    }
+  }
+  return null;
+}
+
+// ── 相机：轨道 + 俯冲 ───────────────────────────────────────────────────────
+// 截图对拍要能从确定状态出发：?lock=1 时忽略滚轮/拖动，否则面板的滚轮会把视角一路漂走
+const LOCK = q.get('lock') === '1';
+const sp = (q.get('sun') || '34,84').split(',').map(Number);
+const ctl = await createPlanet(canvas, {
+  exaggeration: EX, segs: [1024, 512], stars: 2600, spin: 0,
+  lat: +(q.get('lat') || 30), lon: +(q.get('lon') || 112), dist: +(q.get('dist') || 2.4),
+  sunLat: sp[0], sunLon: sp[1],
+});
+const {scene, cam, view, earth, atmo} = ctl;
+if (q.get('atmo') === '0') atmo.visible = false;
+atmo.rotation.order = 'YXZ';
+const H = (await loadPlanetAssets()).H;
+
+// 席位标记：一根从地表立起来的针 + 一个环，俯冲前先让人看见"我在那儿"
+const marker = new THREE.Group();
+{
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.0015, 0.0015, 0.05, 6),
+    new THREE.MeshBasicMaterial({color: 0xffd479}));
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.012, 0.0012, 6, 40),
+    new THREE.MeshBasicMaterial({color: 0xffe9b0}));
+  ring.rotation.x = Math.PI / 2;
+  marker.add(pole.translateY(0.025), ring.translateY(0.004));
+  marker.visible = false;
+  scene.add(marker);
+}
+function placeMarker(seat) {
+  if (!seat) { marker.visible = false; return; }
+  const d = dirOf(seat.lat, seat.lon);
+  // 标记挂在地球下面：球自转（或顶点位移后的半径变化）时针才不会插进地里
+  const lift = Math.max(unquantize(seat.code) * EX, 0) / 6371000;
+  marker.position.copy(d.multiplyScalar(1 + lift));
+  marker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), d.clone().normalize());
+  marker.visible = true;
+}
+
+const dive = {on: false, t: 0, from: null, to: null};
+function startDive(seat) {
+  dive.on = true; dive.t = 0;
+  dive.from = {lat: view.lat, lon: view.lon, dist: view.dist};
+  dive.to = {lat: seat.lat, lon: seat.lon, dist: 1.0075};
+}
+function tick(dt) {
+  if (!dive.on) return;
+  dive.t = Math.min(1, dive.t + dt / 4.2);
+  const e = dive.t < 0.62 ? Math.pow(dive.t / 0.62, 1.9) * 0.62 : 0.62 + (1 - Math.pow(1 - (dive.t - 0.62) / 0.38, 2)) * 0.38;
+  const l = (a, b) => a + (b - a) * e;
+  view.lat = l(dive.from.lat, dive.to.lat);
+  view.lon = l(dive.from.lon, dive.to.lon);
+  // 俯冲的"快"来自先慢后快的距离曲线，末段贴近地面时再收住——不然只是变焦
+  view.dist = Math.max(dive.to.dist, l(dive.from.dist, dive.to.dist));
+  cam.fov = 38 + 26 * Math.sin(e * Math.PI);   // 中段张角最大 = 速度感
+  cam.updateProjectionMatrix();
+  if (dive.t >= 1) { dive.on = false; cam.fov = 38; cam.updateProjectionMatrix(); }
+}
+
+// ── HUD ─────────────────────────────────────────────────────────────────────
+let seat = null, addr = 'QL1demo0000000000000000000000000000000000';
+async function refresh(hold) {
+  seat = await seatOf(addr, 'QL-GENESIS-DEMO');
+  placeMarker(seat);
+  const here = heightAt(H, view.lat, view.lon);
+  document.getElementById('hud').textContent =
+    `星球层  高程 ${GW}x${GH} · 1 格 ≈ 19.6 km · 夸张 ${EX}×\n` +
+    `地址   ${addr.slice(0, 22)}…\n` +
+    `席位   ${seat ? `${seat.lat.toFixed(3)}°, ${seat.lon.toFixed(3)}° · 格 ${seat.i},${seat.j} · ${seat.m.toFixed(0)} m` : '未命中陆地'}\n` +
+    `视角   ${view.lat.toFixed(2)}°, ${view.lon.toFixed(2)}° · 距地心 ${view.dist.toFixed(4)} R · 海拔 ${here > 0 ? here.toFixed(0) + ' m 地' : '海'}\n` +
+    (hold ? '' : '拖动转球 · 滚轮缩放');
+}
+await refresh();
+
+let last = performance.now();
+function frame() {
+  const n = performance.now(), dt = Math.min(0.05, (n - last) / 1000); last = n;
+  if (earth) { tick(dt); ctl.frame(dt); }
+  requestAnimationFrame(frame);
+}
+frame();
+
+let drag = null;
+canvas.addEventListener('pointerdown', e => { if (!LOCK) drag = {x: e.clientX, y: e.clientY}; });
+addEventListener('pointerup', () => drag = null);
+addEventListener('pointermove', e => {
+  if (!drag) return;
+  view.lon -= (e.clientX - drag.x) * 0.28 / Math.max(0.35, view.dist);
+  view.lat = Math.max(-89, Math.min(89, view.lat + (e.clientY - drag.y) * 0.22 / Math.max(0.35, view.dist)));
+  drag = {x: e.clientX, y: e.clientY};
+});
+addEventListener('wheel', e => { if (LOCK) return;
+  view.dist = Math.max(1.004, Math.min(14, view.dist * Math.exp(e.deltaY * 0.0012)));
+}, {passive: true});
+
+// LOCK 下连按钮也接不上：截图工具的一次误点就会把视角推进俯冲动画，而面板被遮住时
+// rAF 一帧不走，动画永远卡在半路——相机停在地表内侧看背面，画面全黑（踩过）。
+const btn = (id, fn) => { document.getElementById(id).onclick = () => { if (!LOCK) fn(); }; };
+btn('bLao', () => { view.lat = 36.15; view.lon = 120.67; view.dist = 1.9; });
+btn('bSeat', () => { if (seat) { view.lat = seat.lat; view.lon = seat.lon; view.dist = 1.9; } });
+btn('bRand', async () => {
+  addr = 'QL1' + Array.from(crypto.getRandomValues(new Uint8Array(16))).map(x => x.toString(16).padStart(2, '0')).join('');
+  await refresh(true); if (seat) { view.lat = seat.lat; view.lon = seat.lon; view.dist = 1.9; }
+});
+btn('bDive', () => seat && startDive(seat));
+
+// 截图对拍口：面板被遮住时 rAF 一帧都不走，调用方自己决定画几帧。
+// 注意别把 getter 和方法起同一个名：`seat` 被 `async seat()` 盖掉过，
+// 于是 __g.seat 是个函数、__g.seat.lat 是 undefined——对拍口自己就是错的。
+window.__g = {scene, cam, view, earth, H, get seat() { return seat; }, unquantize, dirOf, heightAt,
+              async setSeat(a) { addr = a; await refresh(true); return seat; },
+              fly(lat, lon, dist) { dive.on = false; view.lat = lat; view.lon = lon; view.dist = dist; ctl.place(); ctl.renderer.render(scene, cam); },
+              diveTo: startDive, tick,
+              render(n) { for (let i = 0; i < (n || 1); i++) { tick(0.016); ctl.frame(0.016); } return ++i0; },
+              ready: () => !!earth};
+let i0 = 0;
+</script>

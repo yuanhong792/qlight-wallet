@@ -64,7 +64,7 @@ pub fn node_at(x: u32, y: u32, words: &[u32]) -> Option<u8> {
     if x >= terrain::W as u32 || y >= terrain::H as u32 {
         return None;
     }
-    let hgt = terrain::height_at(x, y, words);
+    let hgt = terrain::height_at(x, y);
     if hgt <= terrain::SAND_LEVEL {
         return None;
     }
@@ -152,7 +152,7 @@ mod tests {
         let w = words();
         for y in 0..terrain::H as u32 {
             for x in 0..terrain::W as u32 {
-                if terrain::height_at(x, y, &w) <= terrain::SAND_LEVEL {
+                if terrain::height_at(x, y) <= terrain::SAND_LEVEL {
                     assert!(node_at(x, y, &w).is_none(), "({x},{y}) 水里长出了东西");
                 }
             }

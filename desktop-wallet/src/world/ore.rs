@@ -59,8 +59,10 @@ pub fn is_ore(x: u32, y: u32, words: &[u32], h: u64) -> bool {
 /// 矿格应当落在哪一层：**贴地**（`layer = 地表高度 >> 3`，与 §9.5 同一口径）。
 ///
 /// 挖矿必须把方块真正放到地上，不许悬空——否则脚本可以把整个 64 层空间刷满。
-pub fn ore_layer(x: u32, y: u32, words: &[u32]) -> u16 {
-    let l = terrain::height_at(x, y, words) >> 3;
+/// v3 起这个函数连种子都不读：矿落在真实山坡的第几层，是那张高程表说了算，
+/// 换台机器、换个钱包都不会差半格。
+pub fn ore_layer(x: u32, y: u32) -> u16 {
+    let l = terrain::height_at(x, y) >> 3;
     if l >= super::MAX_LAYER as u32 {
         super::MAX_LAYER - 1
     } else {
@@ -86,7 +88,7 @@ pub fn scan(words: &[u32], h: u64, taken: &Taken, limit: usize) -> Vec<(u16, u16
             if !is_ore(x, y, words, h) {
                 continue;
             }
-            let layer = ore_layer(x, y, words) as u32;
+            let layer = ore_layer(x, y) as u32;
             if taken.contains(&(x, y, layer)) {
                 continue;
             }
@@ -191,7 +193,7 @@ mod tests {
         for (x, y, l) in scan(&words, 0, &Taken::new(), 32) {
             assert_eq!(
                 l as u32,
-                (terrain::height_at(x as u32, y as u32, &words) >> 3).min(crate::world::MAX_LAYER as u32 - 1)
+                (terrain::height_at(x as u32, y as u32) >> 3).min(crate::world::MAX_LAYER as u32 - 1)
             );
             assert!((l as u32) < crate::world::MAX_LAYER as u32);
         }

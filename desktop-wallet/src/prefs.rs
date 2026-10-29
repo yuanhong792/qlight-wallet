@@ -16,8 +16,11 @@ use std::path::Path;
 pub struct Prefs {
     /// 欢迎页已经看过并且不再需要（勾选「以后不再显示」）
     pub welcome_done: bool,
-    /// 进过第一人称世界 —— 引导第 1 步。这是**导航事实**，不是账本事实，界面上要这么标
+    /// 进过第一人称世界 —— 引导第 1 步（按下「启动挖矿」）就把人送进去了，
+    /// 所以它不再单列一行，只留作导航事实
     pub opened_world: bool,
+    /// 按下过「启动挖矿」—— 世界不需要命名，解锁即绑定，但挖矿程序要人亲自启动一次
+    pub mining_started: bool,
     /// 看过自己的活动/记录 —— 引导第 4 步，同样是导航事实
     pub opened_history: bool,
     /// 玩家自己把引导清单收起来了（做完与否都允许收）
@@ -30,6 +33,7 @@ pub fn apply(p: &mut Prefs, key: &str, value: bool) -> Result<(), String> {
     match key {
         "welcome_done" => p.welcome_done = value,
         "opened_world" => p.opened_world = value,
+        "mining_started" => p.mining_started = value,
         "opened_history" => p.opened_history = value,
         "guide_done" => p.guide_done = value,
         other => return Err(format!("不认识的偏好键：{other}")),

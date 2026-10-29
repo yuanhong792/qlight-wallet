@@ -41,20 +41,34 @@ pub fn period_of(height: u64) -> u64 {
     height / TRADER_PERIOD
 }
 
+/// 能摆摊的陆地格：一次算好、进程内缓存。
+///
+/// v3 之前不需要这个东西——哈希噪声里没有"整一排格子全是海"这种事，
+/// 「落在水里就往东挪一格」总能挪出去。真实地球会：窗口南缘从
+/// (0,235) 到 (255,235) 全是黄海，往东走 256 步回到原地，格子还在水里。
+/// 所以先把陆格列成一张表，再让哈希在表里挑——纯函数不变，只是不再作弊。
+fn dry_cells() -> &'static Vec<(u32, u32)> {
+    static CELLS: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    CELLS.get_or_init(|| {
+        let mut v = Vec::new();
+        for y in 0..terrain::H as u32 {
+            for x in 0..terrain::W as u32 {
+                if terrain::height_at(x, y) > terrain::SAND_LEVEL {
+                    v.push((x, y));
+                }
+            }
+        }
+        v
+    })
+}
+
 /// 旅人这一程摆在哪。纯函数：同一条链、同一个回合，任何机器都指向同一格。
 pub fn stall_at(height: u64) -> (u16, u16) {
     let words = crate::world::resource_words();
     let p = period_of(height);
     let seed = words[0] ^ (p as u32).wrapping_mul(0x9E37_79B9);
-    let mut x = ((terrain::hash2(101, p as u32, seed) >> 8) % terrain::W as u32) as u32;
-    let y = ((terrain::hash2(211, p as u32, seed) >> 8) % terrain::H as u32) as u32;
-    // 摊子不摆在水里：落在水面/沙滩就往东挪一格，仍是纯函数
-    for _ in 0..terrain::W {
-        if terrain::height_at(x, y, &words) > terrain::SAND_LEVEL {
-            break;
-        }
-        x = (x + 1) % terrain::W as u32;
-    }
+    let d = dry_cells();
+    let (x, y) = d[(terrain::hash2(101, p as u32, seed) as usize) % d.len()];
     (x as u16, y as u16)
 }
 
@@ -311,11 +325,10 @@ mod tests {
     /// 摊子不摆在水里（水/沙滩高度 ≤ SAND_LEVEL）
     #[test]
     fn stall_stands_on_dry_land() {
-        let w = words();
         for p in 0..8u64 {
             let (x, y) = stall_at(p * TRADER_PERIOD);
             assert!(
-                terrain::height_at(x as u32, y as u32, &w) > terrain::SAND_LEVEL,
+                terrain::height_at(x as u32, y as u32) > terrain::SAND_LEVEL,
                 "第 {p} 程摊位 ({x},{y}) 落在水里"
             );
         }
@@ -436,17 +449,19 @@ mod tests {
         let c = core();
         let w = words();
         let h = 10;
+        // 找的是**树**，不是"随便第一个资源点"： assertion 讲的是"一棵树的产出买得起情报"，
+        // 采到一朵花（5 ✦）就把它拿来比 20 ✦ 的报价，是测试写错了，不是价格写错了。
         let (x, y, k) = {
             let mut found = None;
-            'outer: for yy in 0..128u32 {
-                for xx in 0..128u32 {
-                    if let Some(k) = resource::node_at(xx, yy, &w) {
-                        found = Some((xx as u16, yy as u16, k));
+            'outer: for yy in 0..terrain::H as u32 {
+                for xx in 0..terrain::W as u32 {
+                    if resource::node_at(xx, yy, &w) == Some(resource::NODE_TREE) {
+                        found = Some((xx as u16, yy as u16, resource::NODE_TREE));
                         break 'outer;
                     }
                 }
             }
-            found.expect("前 128×128 里没有资源点")
+            found.expect("整片大陆长不出一棵树")
         };
         let reward = resource::reward_at(k, h);
         let harvest = dust::sign_record(

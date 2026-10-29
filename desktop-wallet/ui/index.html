@@ -7,6 +7,10 @@
 </head>
 <body>
 
+<!-- 封面背景：真实地球（星球层高程 + 公有领域 BMNG 影像）在星空里自转。
+     静态题图留着当兜底：WebGL 起不来或 2.8 MB 星球层还没读到时，画面不能是黑的。 -->
+<canvas id="bg-planet" class="bg-planet" aria-hidden="true"></canvas>
+
 <!-- ============ 欢迎页（每次启动第一眼：先给方向，再谈技术） ============ -->
 <div id="view-welcome" class="view auth hidden">
   <div class="auth-card welcome-card">
@@ -16,7 +20,7 @@
     <p class="muted" data-i18n="welcome.sub">走进方块里、亲手盖出东西，就是这里挖矿的方式</p>
 
     <div class="welcome-acts">
-      <button id="btn-w-world" class="btn-primary" data-i18n="welcome.world">进入世界</button>
+      <button id="btn-w-world" class="btn-primary" data-i18n="mine.enter">⛏ 启动挖矿 · 进入世界</button>
       <button id="btn-w-how" class="btn-ghost" data-i18n="welcome.how">如何游玩</button>
       <button id="btn-w-wallet" class="btn-ghost" data-i18n="welcome.wallet">创建或恢复钱包</button>
     </div>
@@ -206,15 +210,51 @@
 
       <div class="world-wrap">
         <div class="panel world-map-col">
-          <div class="panel-title">
+          <!-- 世界不需要命名：解锁那一刻，这把钥匙就和这块世界绑死了。这一页要按的只有下面
+               这一个按钮——它同时启动挖矿程序、把你送进第一人称；码雨在世界里跑，不在这里。 -->
+          <div class="mine-deck">
+            <div class="panel-title">
+              <span data-i18n="mine.title">挖矿程序</span>
+              <span class="tag" id="mine-state-tag">–</span>
+            </div>
+            <div class="muted small" id="mine-line"></div>
+            <button id="btn-mine-start" class="btn-primary mine-go">⛏ 启动挖矿 · 进入世界</button>
+            <button type="button" id="btn-mine-stop" class="btn-ghost mine-stop" data-i18n="mine.stop" hidden>收工</button>
+            <div class="muted small" data-i18n="mine.enter.note"></div>
+            <div class="error" id="err-world"></div>
+            <div class="ok" id="ok-world" hidden></div>
+            <div class="muted small" id="world-fix-note" data-i18n="world.fix.note" hidden></div>
+            <button type="button" id="btn-world-archive" class="btn-ghost inline" data-i18n="world.fix.btn" hidden></button>
+          </div>
+
+          <div class="panel-title sub">
             <span data-i18n="world.map">世界地图</span>
             <span class="tag" data-i18n="world.map.tag">本地确定性渲染</span>
           </div>
-          <canvas id="world-canvas" width="256" height="256" aria-label="world"></canvas>
-          <div class="hotbar" id="world-hotbar"></div>
+          <div class="map-frame">
+            <canvas id="world-canvas" width="256" height="256" aria-label="world"></canvas>
+            <span class="map-corner tl"></span><span class="map-corner tr"></span>
+            <span class="map-corner bl"></span><span class="map-corner br"></span>
+          </div>
           <div class="world-cursor" id="world-cursor">X – · Z –</div>
-          <button id="btn-w3d" class="btn-primary w3d-enter" data-i18n="world3d.enter">进入世界（第一人称编辑）</button>
           <div class="muted small" data-i18n="world.map.note"></div>
+
+          <details class="mine-adv">
+            <summary data-i18n="world.editor.adv">高级：按坐标放置</summary>
+            <div class="hotbar" id="world-hotbar"></div>
+            <input id="ent-name" type="text" maxlength="64" data-i18n-ph="world.name.ph" placeholder="给它起个名字" spellcheck="false">
+            <div class="send-grid3">
+              <input id="ent-x" type="number" min="0" max="255" value="0" data-i18n-ph="world.x.ph" placeholder="X">
+              <input id="ent-z" type="number" min="0" max="255" value="0" data-i18n-ph="world.z.ph" placeholder="Z">
+              <input id="ent-layer" type="number" min="0" max="63" value="0" data-i18n-ph="world.y.ph" placeholder="Y">
+            </div>
+            <div class="muted small" data-i18n="world.y.note"></div>
+            <select id="ent-parent" class="w-select"></select>
+            <button id="btn-place" class="btn-primary inline" data-i18n="world.btn.place">签名并放置</button>
+            <div class="muted small" id="world-fee-line"></div>
+            <div class="muted small" id="world-ore-note"></div>
+            <div class="muted small" data-i18n="world.editor.note"></div>
+          </details>
         </div>
 
         <div class="world-side-col">
@@ -238,99 +278,6 @@
               <li><span data-i18n="world.how.s4"></span></li>
             </ol>
             <div class="muted small" data-i18n="world.how.vs"></div>
-          </div>
-
-          <div class="panel" id="panel-dust">
-            <div class="panel-title">
-              <span data-i18n="dust.title">光尘</span>
-              <span class="tag">QL-DUST-v1</span>
-            </div>
-            <div class="dust-head">
-              <div class="dust-num"><b id="dust-balance">0</b><span class="dust-sym">✦</span></div>
-              <div class="muted small" id="dust-meta"></div>
-            </div>
-            <div class="quota-bar"><i id="dust-quota-bar" style="width:0%"></i></div>
-            <div class="muted small" id="dust-quota-line"></div>
-            <div class="muted small" id="dust-night-line"></div>
-            <div class="send-grid2">
-              <input id="dust-to" type="text" maxlength="96" data-i18n-ph="dust.to.ph" placeholder="ql1 收款地址" spellcheck="false">
-              <input id="dust-amount" type="number" min="1" step="1" data-i18n-ph="dust.amount.ph" placeholder="数量">
-            </div>
-            <button id="btn-dust-send" class="btn-primary inline" data-i18n="dust.send">送出光尘</button>
-            <div class="error" id="err-dust"></div>
-            <div class="ok" id="ok-dust" hidden></div>
-            <div class="panel-title sub"><span data-i18n="dust.recent">最近的采集与转账</span></div>
-            <div id="dust-recent" class="ent-list"></div>
-            <div class="muted small" data-i18n="dust.note"></div>
-          </div>
-
-          <div class="panel" id="panel-trader">
-            <div class="panel-title">
-              <span data-i18n="trader.title">旅人摊位</span>
-              <span class="tag">QL-TRADER-v1</span>
-            </div>
-            <div class="muted small" id="trader-meta"></div>
-            <div id="trader-offers" class="ent-list trader-offers"></div>
-            <div id="trader-result" class="trader-result" hidden></div>
-            <div class="error" id="err-trader"></div>
-            <div class="muted small" data-i18n="trader.note"></div>
-          </div>
-
-          <div class="panel" id="panel-pool">
-            <div class="panel-title">
-              <span data-i18n="pool.title">兑换池</span>
-              <span class="tag">QL-POOL-v1</span>
-            </div>
-            <div class="dust-head">
-              <div class="dust-num"><b id="pool-price">–</b><span class="dust-sym">✦ / QLX</span></div>
-              <div class="muted small" id="pool-meta"></div>
-            </div>
-            <div class="muted small" id="pool-reserves"></div>
-            <div class="muted small" id="pool-mine"></div>
-            <div class="send-grid2">
-              <select id="pool-dir" class="w-select">
-                <option value="qlx" data-i18n="pool.dir.qlx">QLX → ✦</option>
-                <option value="dust" data-i18n="pool.dir.dust">✦ → QLX</option>
-              </select>
-              <input id="pool-amount" type="number" min="0" step="any" inputmode="decimal" data-i18n-ph="pool.amount.ph" placeholder="数量">
-            </div>
-            <div class="muted small" id="pool-quote"></div>
-            <button id="btn-pool-swap" class="btn-primary inline" data-i18n="pool.btn.swap">兑换</button>
-            <div class="panel-title sub"><span data-i18n="pool.lp.title">做市</span></div>
-            <div class="send-grid2">
-              <input id="pool-qlx" type="number" min="0" step="any" inputmode="decimal" data-i18n-ph="pool.add.qlx" placeholder="QLX">
-              <input id="pool-dust" type="number" min="0" step="1" data-i18n-ph="pool.add.dust" placeholder="✦">
-            </div>
-            <div class="send-grid2">
-              <button id="btn-pool-add" class="btn-primary inline" data-i18n="pool.btn.add">加入做市</button>
-              <button id="btn-pool-remove" class="btn-ghost inline" data-i18n="pool.btn.remove">全部撤出</button>
-            </div>
-            <div class="error" id="err-pool"></div>
-            <div class="ok" id="ok-pool" hidden></div>
-            <div class="muted small" data-i18n="pool.note"></div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-title">
-              <span data-i18n="world.editor">世界编辑器</span> <span class="tag" id="world-slot-tag">slot 0</span>
-            </div>
-            <input id="ent-name" type="text" maxlength="64" data-i18n-ph="world.name.ph" placeholder="给它起个名字" spellcheck="false">
-            <div class="send-grid3">
-              <input id="ent-x" type="number" min="0" max="255" value="0" data-i18n-ph="world.x.ph" placeholder="X">
-              <input id="ent-z" type="number" min="0" max="255" value="0" data-i18n-ph="world.z.ph" placeholder="Z">
-              <input id="ent-layer" type="number" min="0" max="63" value="0" data-i18n-ph="world.y.ph" placeholder="Y">
-            </div>
-            <div class="muted small" data-i18n="world.y.note"></div>
-            <select id="ent-parent" class="w-select"></select>
-            <button id="btn-place" class="btn-primary inline" data-i18n="world.btn.place">签名并放置</button>
-            <div class="muted small" id="world-fee-line"></div>
-            <button id="btn-mine-ore" class="btn-primary inline" data-i18n="world.btn.mine">⛏ 挖本回合矿脉</button>
-            <div class="muted small" id="world-ore-note"></div>
-            <div class="error" id="err-world"></div>
-            <div class="ok" id="ok-world" hidden></div>
-            <div class="muted small" id="world-fix-note" data-i18n="world.fix.note" hidden></div>
-            <button type="button" id="btn-world-archive" class="btn-ghost inline" data-i18n="world.fix.btn" hidden></button>
-            <div class="muted small" data-i18n="world.editor.note"></div>
           </div>
 
           <div class="panel">
@@ -437,7 +384,6 @@
     <!-- 第一人称体素编辑器：地形本地算，方块签了名才存在 -->
     <div id="w3d" class="w3d" hidden>
       <canvas id="w3d-canvas"></canvas>
-      <canvas id="w3d-three-canvas" aria-hidden="true"></canvas>
       <div class="w3d-grade" aria-hidden="true"></div>
       <div class="w3d-veil" id="w3d-veil" aria-hidden="true"></div>
       <div class="w3d-cross" id="w3d-cross"></div>
@@ -460,7 +406,96 @@
         <div class="muted small" id="share-out"></div>
       </div>
       <button type="button" id="w3d-exit" class="w3d-exit" data-i18n="world3d.exit">离开世界</button>
-    </div>
+
+      <!-- 码雨台：挖矿程序在世界里跑，滚的是真实块高与真实落格坐标（app.js 只喂真数据） -->
+      <div class="w3d-mine" id="w3d-mine">
+        <canvas id="mine-rain" width="236" height="120" aria-label="mining"></canvas>
+        <div class="mine-cap" id="mine-cap"></div>
+      </div>
+
+      <!-- 站点：光尘 / 旅人摊位 / 兑换池不再是网页面板，是世界里三个走得到的地方。
+           走近了按 E 才开柜台——面板的 id 一个没改，只是搬进了世界里。 -->
+      <div class="w3d-prompt" id="w3d-prompt" hidden></div>
+      <div class="w3d-shop" id="w3d-shop" hidden>
+        <div class="shop-card">
+          <div class="shop-head">
+            <span class="shop-title" id="shop-title">–</span>
+            <button type="button" class="btn-ghost tiny" id="btn-shop-close" data-i18n="shop.close">收起 (Esc)</button>
+          </div>
+          <div class="shop-panels" id="shop-panels">
+          <div class="panel" id="panel-dust">
+            <div class="panel-title">
+              <span data-i18n="dust.title">光尘</span>
+              <span class="tag">QL-DUST-v1</span>
+            </div>
+            <div class="dust-head">
+              <div class="dust-num"><b id="dust-balance">0</b><span class="dust-sym">✦</span></div>
+              <div class="muted small" id="dust-meta"></div>
+            </div>
+            <div class="quota-bar"><i id="dust-quota-bar" style="width:0%"></i></div>
+            <div class="muted small" id="dust-quota-line"></div>
+            <div class="muted small" id="dust-night-line"></div>
+            <div class="send-grid2">
+              <input id="dust-to" type="text" maxlength="96" data-i18n-ph="dust.to.ph" placeholder="ql1 收款地址" spellcheck="false">
+              <input id="dust-amount" type="number" min="1" step="1" data-i18n-ph="dust.amount.ph" placeholder="数量">
+            </div>
+            <button id="btn-dust-send" class="btn-primary inline" data-i18n="dust.send">送出光尘</button>
+            <div class="error" id="err-dust"></div>
+            <div class="ok" id="ok-dust" hidden></div>
+            <div class="panel-title sub"><span data-i18n="dust.recent">最近的采集与转账</span></div>
+            <div id="dust-recent" class="ent-list"></div>
+            <div class="muted small" data-i18n="dust.note"></div>
+          </div>
+    
+          <div class="panel" id="panel-trader">
+            <div class="panel-title">
+              <span data-i18n="trader.title">旅人摊位</span>
+              <span class="tag">QL-TRADER-v1</span>
+            </div>
+            <div class="muted small" id="trader-meta"></div>
+            <div id="trader-offers" class="ent-list trader-offers"></div>
+            <div id="trader-result" class="trader-result" hidden></div>
+            <div class="error" id="err-trader"></div>
+            <div class="muted small" data-i18n="trader.note"></div>
+          </div>
+    
+          <div class="panel" id="panel-pool">
+            <div class="panel-title">
+              <span data-i18n="pool.title">兑换池</span>
+              <span class="tag">QL-POOL-v1</span>
+            </div>
+            <div class="dust-head">
+              <div class="dust-num"><b id="pool-price">–</b><span class="dust-sym">✦ / QLX</span></div>
+              <div class="muted small" id="pool-meta"></div>
+            </div>
+            <div class="muted small" id="pool-reserves"></div>
+            <div class="muted small" id="pool-mine"></div>
+            <div class="send-grid2">
+              <select id="pool-dir" class="w-select">
+                <option value="qlx" data-i18n="pool.dir.qlx">QLX → ✦</option>
+                <option value="dust" data-i18n="pool.dir.dust">✦ → QLX</option>
+              </select>
+              <input id="pool-amount" type="number" min="0" step="any" inputmode="decimal" data-i18n-ph="pool.amount.ph" placeholder="数量">
+            </div>
+            <div class="muted small" id="pool-quote"></div>
+            <button id="btn-pool-swap" class="btn-primary inline" data-i18n="pool.btn.swap">兑换</button>
+            <div class="panel-title sub"><span data-i18n="pool.lp.title">做市</span></div>
+            <div class="send-grid2">
+              <input id="pool-qlx" type="number" min="0" step="any" inputmode="decimal" data-i18n-ph="pool.add.qlx" placeholder="QLX">
+              <input id="pool-dust" type="number" min="0" step="1" data-i18n-ph="pool.add.dust" placeholder="✦">
+            </div>
+            <div class="send-grid2">
+              <button id="btn-pool-add" class="btn-primary inline" data-i18n="pool.btn.add">加入做市</button>
+              <button id="btn-pool-remove" class="btn-ghost inline" data-i18n="pool.btn.remove">全部撤出</button>
+            </div>
+            <div class="error" id="err-pool"></div>
+            <div class="ok" id="ok-pool" hidden></div>
+            <div class="muted small" data-i18n="pool.note"></div>
+          </div>
+          </div>
+        </div>
+      </div>
+        </div>
   </main>
 </div>
 
@@ -469,6 +504,7 @@
 <script src="qlight-hd-sprites.js"></script>
 <script src="terrain-tex.js"></script>
 <script src="sfx.js"></script>
+<script src="earth-height.js"></script>
 <script src="world.js"></script>
 <script src="world3d.js"></script>
 <script src="app.js"></script>

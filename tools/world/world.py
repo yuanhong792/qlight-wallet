@@ -6,7 +6,8 @@
 铁律（违反即视为实现不合格）：
   - 全程整数，无一处浮点；缩放一律 2 的幂右移，不用除法
   - 无平台数学库、无内置 PRNG
-  - 随机一律由链派生：大地 = 创世哈希，地表 = 创世哈希 ⊕ 各块 VRF 的 XOR 折叠
+  - 大地 = 真实地球高程（earth-height.bin，SHA-256 钉进规则串）；
+    地表 = 创世哈希 ⊕ 各块 VRF 的 XOR 折叠——植被与矿脉因此仍然不可预挖
   - 同一 (seed, rules_version, history) 必须与 world.js 产出逐位一致的像素
 
 用法：
@@ -15,7 +16,7 @@
 import argparse, hashlib, json, os, struct, sys, zlib
 
 W = H = 256
-RULES_VERSION = "QL-WORLD-RULES-v2"
+RULES_VERSION = "QL-WORLD-RULES-v3"
 SEA, SAND, SNOW = 86, 98, 190
 M_FOREST, M_DESERT = 120, 60
 DENS_FOREST, DENS_DESERT, DENS_GRASS = 225, 240, 232
@@ -27,10 +28,33 @@ SEED_SPLIT = 4
 # 创世哈希：与 simchain.rs 的 GENESIS_HASH_HEX 同一个锚定值（公开常量）
 GENESIS_HASH = "5dc2205a8f0153a05f84e26ab94086009796bb68fdfddff439f97ebfd2aa3104"
 
+# 大地 = 真实地球（tools/world/fetch_earth_dem.py 从公开 DEM 烤出来的一份字节）。
+# 它的 SHA-256 直接进规则串：换一片土地 = 换一套世界规则 = 换一批指纹，
+# 谁也没法在"规则版本号没变"的幌子下悄悄把大陆搬走。
+EARTH_BIN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "..", "..", "desktop-wallet", "data", "earth-height.bin"))
+EARTH_SHA256 = "805868b90a88e3df2d43658cb8579dee9cebd1fe566794d52afabf05184248f8"
+EARTH = None
+
+
+def earth():
+    """读那 65536 字节，并核对哈希：不对就停，绝不拿一片别的大陆去对拍。"""
+    global EARTH
+    if EARTH is None:
+        raw = open(EARTH_BIN, "rb").read()
+        if len(raw) != W * H:
+            raise SystemExit("earth-height.bin 长度 %d 应为 %d" % (len(raw), W * H))
+        got = hashlib.sha256(raw).hexdigest()
+        if got != EARTH_SHA256:
+            raise SystemExit("earth-height.bin 指纹分叉：%s ≠ %s" % (got[:16], EARTH_SHA256[:16]))
+        EARTH = raw
+    return EARTH
+
+
 # 规则参数表：全部写进版本哈希——动任何一个阈值都会换出另一个世界（DESIGN.md §9.6）
 PARAMS = ",".join(map(str, [W, H, SEA, SAND, SNOW, M_FOREST, M_DESERT,
                             DENS_FOREST, DENS_DESERT, DENS_GRASS, SEED_SPLIT]))
-RULES_CANON = RULES_VERSION + "|" + PARAMS
+RULES_CANON = RULES_VERSION + "|" + PARAMS + "|" + EARTH_SHA256
 RULES_SEED = int.from_bytes(hashlib.shake_256(RULES_CANON.encode()).digest(4), "big")
 
 
@@ -109,7 +133,7 @@ def render(words):
     era1 = ents = 0
     for y in range(H):
         for x in range(W):
-            h = fbm(x, y, words)
+            h = earth()[y * W + x]          # 大地：真实地球高程，与种子无关（v3）
             m = fbm(x, y, words[4:])
             e = hash2(x + 7919, y + 104729, words[0])
             era = (e >> 24) & 0xFF                  # 0 = 创世世代（约 1/256）
@@ -189,9 +213,10 @@ def is_ore(x, y, words, h):
     return era == 0 and ore_seed(x, y, words) < ore_quota(h)
 
 
-def ore_layer(x, y, words):
-    """贴地层：挖矿必须把方块放到地上，不许悬空刷满 64 层"""
-    return min(MAX_LAYER - 1, fbm(x, y, words[:4]) >> 3)
+def ore_layer(x, y):
+    """贴地层：挖矿必须把方块放到地上，不许悬空刷满 64 层。
+    v3 起只读真实高程表，连种子都不看——链历史长多少格，矿都在同一层。"""
+    return min(MAX_LAYER - 1, earth()[y * W + x] >> 3)
 
 
 def ore_cells(words, h, limit, taken=()):
@@ -201,7 +226,7 @@ def ore_cells(words, h, limit, taken=()):
         for x in range(W):
             if not is_ore(x, y, words, h):
                 continue
-            cell = (x, y, ore_layer(x, y, words))
+            cell = (x, y, ore_layer(x, y))
             if cell in taken:
                 continue
             hits.append((fbm(x, y, words[4:]), x, y, cell))

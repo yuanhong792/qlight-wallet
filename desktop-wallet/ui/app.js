@@ -127,17 +127,74 @@ function show(view) {
   for (const v of ["view-welcome", "view-create", "view-lock", "view-main"]) {
     $(v).classList.toggle("hidden", v !== view);
   }
+  syncPlanetBackdrop();
 }
+
+// ---------------------------------------------------------------- 背景：星空里自转的地球
+// 从封面到解锁后的钱包，整层背景都是这颗真地球（星球层 1 字节高程 + 公有领域 BMNG 影像）；
+// 静态黄昏题图降级成"地球起不来时"的兜底，不再是主角。
+// 唯一停帧的时候是第一人称世界开着：它自己是一个 WebGL 上下文，两个满帧同跑桌面端必掉帧。
+let planetCtl = null, planetBooting = false;
+
+function planetShouldRun() {
+  // 只看"第一人称世界开没开"：背景地球和它是两个 WebGL 上下文，同帧必掉。
+  // 窗口被遮住不在这儿判——那时 rAF 本来就不发帧，交给下面的 visibilitychange 重新起链。
+  return $("w3d").hidden;
+}
+
+async function mountPlanetBackdrop() {
+  if (planetCtl || planetBooting) return;
+  planetBooting = true;
+  try {
+    const { createPlanet } = await import("./planet-view.js");
+    planetCtl = await createPlanet($("bg-planet"), {
+      spin: 0.03,                     // 弧度/秒：一分钟转 100°，看得出在转又不晕
+      biasX: 0.26, biasY: 0,          // 球心落在版面 76% 处、微微出血：地球从右边探进来，左边整块留给文字
+      dist: 3.4,                      // 1120×740 里球冠半径 ≈ 316 px ≈ 屏高 85%
+      exaggeration: 10,               // 陆抬起 10 倍：真实比例下 8848 米只占半径 0.14%，看不见；再大就在边缘造悬崖
+      segs: [512, 256],               // 封面用 13 万顶点：1024×512 的 52 万顶点是给"贴着看"的星球页用的，封面只是背景
+      lat: 24, lon: 104,              // 默认看得见亚洲——第一次打开就该认得出这是地球
+      sunLat: 30, sunLon: 122,        // 太阳跟着相机这一侧偏 30°：球转到哪一面都是"半月"式的立体，不会处处正午
+      sunIntensity: 6.2, ambient: 1.15,
+    });
+    document.body.classList.add("has-planet");
+    window.__planet = planetCtl;        // 对拍口：封面被遮住时 rAF 一帧不走，截图工具自己点帧
+    planetCtl.start();
+  } catch (e) {
+    // 起不来就继续用题图：封面是装饰，不值得让它把启动流程变成白屏
+    console.warn("星球封面未就绪，保留静态题图：", e && e.message);
+    planetCtl = null;
+  } finally {
+    planetBooting = false;
+  }
+}
+
+function syncPlanetBackdrop() {
+  // 不在这里再判一次 document.hidden 之外的可见性：窗口被遮住时 rAF 本来就不发帧，
+  // 多一个分支只会让"回到封面却不起动画"这种怪状态更难查（可见性由下面的事件管）
+  if (!planetCtl) { if (planetShouldRun()) mountPlanetBackdrop(); return; }
+  if (planetShouldRun()) planetCtl.start();
+  else planetCtl.stop();
+}
+
+document.addEventListener("visibilitychange", () => {
+  // 隐藏时停的是"循环本身"：rAF 不发帧，那条 start() 里排下去的链就断了，
+  // 光靠 running 标记回来时接不上，所以显式 stop → 再 visible 时 start 重新起链。
+  if (document.hidden) { if (planetCtl) planetCtl.stop(); return; }
+  syncPlanetBackdrop();
+});
 
 // 外壳偏好（prefs.json）：欢迎页还要不要弹、引导走到哪一步。
 // 进度跟账本走（同机多开的实例各有各的 prefs），所以存文件而不是 localStorage。
-let prefsCache = { welcome_done: false, opened_world: false, opened_history: false, guide_done: false };
+let prefsCache = { welcome_done: false, opened_world: false, mining_started: false, opened_history: false, guide_done: false };
 async function loadPrefs() {
-  try { prefsCache = await invoke("get_prefs"); } catch { /* 旧后端：按首次运行处理 */ }
+  try { const r = await invoke("get_prefs"); if (r) prefsCache = r; } catch { /* 旧后端：按首次运行处理 */ }
   return prefsCache;
 }
 async function setPref(key, value) {
-  try { prefsCache = await invoke("set_pref", { key, value }); } catch { /* 写失败就别假装存下了 */ }
+  // 只有后端把整份偏好读回来才替换缓存：拿到 null 还照单全收，下一次读偏好就会炸成
+  // "Cannot read properties of null"，把一个写失败的角落变成整页白屏
+  try { const r = await invoke("set_pref", { key, value }); if (r) prefsCache = r; } catch { /* 写失败就别假装存下了 */ }
   return prefsCache;
 }
 
@@ -159,7 +216,8 @@ async function enterMain() {
   if (wantWorld) {
     wantWorld = false;
     document.querySelector('.sb-item[data-page="world"]').click();
-    openWorld3D();
+    // 欢迎页那一个按钮就是世界页那一个按钮：启动挖矿 + 进第一人称，不拆成两件事
+    await mineStart();
   }
 }
 
@@ -217,7 +275,7 @@ function guideSteps() {
   const dug = s ? (s.dug || []).length : 0;
   const owned = s ? s.entities.filter((e) => !e.released && e.owner === s.address).length : 0;
   return [
-    { done: !!prefsCache.opened_world, nav: true },
+    { done: !!prefsCache.mining_started, nav: true },
     { done: dug > 0, ledger: true, n: dug },
     { done: owned > 0, ledger: true, n: owned },
     { done: !!prefsCache.opened_history, nav: true },
@@ -232,23 +290,27 @@ function renderGuide() {
   const steps = guideSteps();
   const done = steps.filter((s) => s.done).length;
   $("guide-count").textContent = t("guide.count", { done, total: steps.length });
-  const go = ["world", "world", "world", "history"];
-  $("guide-list").innerHTML = steps.map((s, i) => `
-    <li class="${s.done ? "done" : ""}">
-      <span class="gd-mark">${s.done ? "✓" : i + 1}</span>
+  // 达成的步骤直接消失：划掉一行读起来像报错，留着也没有下一步可指。
+  if (done === steps.length) { panel.hidden = true; return; }
+  const go = ["mine", "world", "world", "history"];
+  $("guide-list").innerHTML = steps.map((s, i) => s.done ? "" : `
+    <li>
+      <span class="gd-mark">${i + 1}</span>
       <div class="gd-text">
         <b>${esc(t(`guide.s${i + 1}t`))}</b>
         <span class="gd-kind ${s.ledger ? "ledger" : ""}">${t(s.ledger ? "guide.ledger" : "guide.nav")}</span>
         <div class="muted small">${esc(t(`guide.s${i + 1}`))}${s.n ? ` · <span class="mono">${s.n}</span>` : ""}</div>
       </div>
-      ${s.done ? "" : `<button type="button" class="btn-ghost gd-go" data-go="${go[i]}">${t("guide.go")}</button>`}
+      <button type="button" class="btn-ghost gd-go" data-go="${go[i]}">${t("guide.go")}</button>
     </li>`).join("");
 }
 $("guide-list").addEventListener("click", (e) => {
   const b = e.target.closest("[data-go]");
   if (!b) return;
-  document.querySelector(`.sb-item[data-page="${b.dataset.go}"]`).click();
-  if (b.dataset.go === "world") openWorld3D();
+  document.querySelector(`.sb-item[data-page="${b.dataset.go === "mine" ? "world" : b.dataset.go}"]`).click();
+  // 第 1 步按的就是世界页那个按钮：启动挖矿、进第一人称，一次点击两件事
+  if (b.dataset.go === "mine") $("btn-mine-start").click();
+  else if (b.dataset.go === "world") openWorld3D();
 });
 $("btn-guide-hide").addEventListener("click", async () => {
   await setPref("guide_done", true);
@@ -297,7 +359,6 @@ $("btn-fb").addEventListener("click", async () => {
   if ($("fb-shot").checked && !$("fb-shot").disabled) {
     screenshot = await new Promise((resolve) => {
       if (!w3) return resolve(null);
-      if (w3three) return resolve(w3three.snapshot());
       let got = false;
       w3.snapshot((u) => { got = true; resolve(u); });
       setTimeout(() => { if (!got) resolve(null); }, 500);
@@ -554,7 +615,6 @@ let wSlot = 0;
 let wSel = ""; // 选中实体 id（空 = 未选中）
 let wProof = { id: "", json: "" }; // 展开的可验证记录（2 秒轮询重渲染时不能丢）
 let w3 = null; // 第一人称体素编辑器（惰性创建）
-let w3three = null; // Three.js 视觉层；编辑与账本判定继续使用 w3
 let w3VeilDone = false; // 封面已淡入真实画面（每次进世界重置）
 
 const worldActive = () => !$("page-world").classList.contains("hidden");
@@ -945,6 +1005,20 @@ function paintWorld() {
     wctx.fillStyle = "#12161F";
     wctx.fillRect(x - 1, y - 1, 3, 3);
   }
+  // 站点也标在地图上：兑换池与光尘灯不再是网页右侧的面板，是世界里走得到的两个地方，
+  // 地图上要能看出它们守在哪——走近了按 E 才开柜台。
+  if (!spawnAnchor) spawnAnchor = pickSpawn(128, 128);
+  refreshStations(tr);
+  for (const st of stations) {
+    if (st.type === "trader") continue;
+    const col = st.type === "pool" ? "#5FD3E8" : "#F0D397";
+    wctx.fillStyle = "#12161F";
+    wctx.fillRect(st.x - 4, st.z - 4, 9, 9);
+    wctx.strokeStyle = col;
+    wctx.strokeRect(st.x - 3.5, st.z - 3.5, 8, 8);
+    wctx.fillStyle = col;
+    wctx.fillRect(st.x - 1, st.z - 1, 3, 3);
+  }
 
   const sel = entById(wSel);
   if (sel) {
@@ -968,7 +1042,6 @@ function buildHotbar() {
     b.innerHTML = `<i class="kd" style="background-image:url('${KIND_ICON(i, 32)}')"></i><b class="hs-n">${esc(t(`world.kind.${i}`))}</b><em class="hs-k">${i + 1}</em>`;
     bar.appendChild(b);
   }
-  $("world-slot-tag").textContent = `slot ${wSlot + 1} · ${t(`world.kind.${wSlot}`)}`;
   renderHeld();
 }
 
@@ -993,18 +1066,6 @@ function renderF3() {
     [t("world.f3.ent"), `${s.entities.length}`],
     [t("world.f3.layers"), `${s.max_layer} · ${t("world.f3.layers.note")}`],
     [t("world.f3.chunks"), `${s.chunks.length}`],
-    [
-      t("world.status.pace"),
-      `${t("world.status.pace.line", {
-        n: s.mine_claims_by_me || 0,
-        f: s.mine_floor || s.mine_cooldown_blocks,
-        nf: s.mine_next_floor || s.mine_cooldown_blocks,
-      })} · ${t("world.status.craft", {
-        cells: (s.craft || {}).cells || 0,
-        kept: (s.craft || {}).kept_blocks || 0,
-        score: (s.craft || {}).score || 0,
-      })}`,
-    ],
     [t("world.f3.addr"), s.address ? `<span class="cpy mono" data-copy="${s.address}">${short(s.address)}</span>` : `<span class="muted">${t("world.locked")}</span>`],
   ];
   let led;
@@ -1012,7 +1073,16 @@ function renderF3() {
   else if (s.report.ok) led = `<span class="ok-inline">${t("world.ledger.ok", { n: s.report.total })}</span>`;
   else led = `<span class="bad-inline">${t("world.ledger.bad", { n: s.report.first_bad, r: s.report.reason })}</span>`;
   rows.push([t("world.f3.ledger"), led]);
-  $("world-f3").innerHTML = rows.map(([k, v]) => r(k, v)).join("");
+  const pace = `<div class="f3-note"><b>${t("world.status.pace")}</b> · ${t("world.status.pace.line", {
+    n: s.mine_claims_by_me || 0,
+    f: s.mine_floor || s.mine_cooldown_blocks,
+    nf: s.mine_next_floor || s.mine_cooldown_blocks,
+  })} · ${t("world.status.craft", {
+    cells: (s.craft || {}).cells || 0,
+    kept: (s.craft || {}).kept_blocks || 0,
+    score: (s.craft || {}).score || 0,
+  })}</div>`;
+  $("world-f3").innerHTML = rows.map(([k, v]) => r(k, v)).join("") + pace;
 }
 
 function renderParentSelect() {
@@ -1110,6 +1180,7 @@ function renderWorld() {
   renderEntList();
   renderSelected();
   renderStatus();
+  renderMineDeck();
   paintWorld();
   syncWorld3D();
   // 3D 覆盖层开着时切语言，物品栏与提示也要立刻换文字
@@ -1193,6 +1264,12 @@ $("btn-world-archive").addEventListener("click", async () => {
 
 async function loadWorld() {
   worldSnap = await invoke("world_snapshot");
+  // 程序是活的：上一次按过「启动挖矿」，这次解锁之后它自己接上——不用人再守一遍
+  if (!mineResumed && worldSnap.unlocked && prefsCache.mining_started) {
+    mineResumed = true;
+    mineOn = true;
+    mineSay(t("mine.line.resumed", { h: worldSnap.height }));
+  } else if (!mineResumed) mineResumed = true;
   renderWorld();
   // 3D 视图开着时必须同步实体表：写完的方块只进了 2D 面板的话，玩家会看到
   // 「坐标回执 + 一击火花」但币面上什么都没有，要关了重开才显形。
@@ -1347,22 +1424,276 @@ $("btn-place").addEventListener("click", async () => {
   $("btn-place").disabled = false;
 });
 
-$("btn-mine-ore").addEventListener("click", async () => {
+// —— 挖矿程序：解锁那一刻，这把钥匙就和这块世界绑死了，世界本身不用再起名字。
+// 「启动挖矿 · 进入世界」只做两件事：打开第一人称，然后在这个程序活着的时候，
+// 每逢链上节奏允许就替你把同一条 world_mine_once 按下去。落不落得下一格、下一笔几块后
+// 结算，全都还是链上说了算——程序不会跑得比世界重画地表更快，挂机也就刷不出额外的币。
+
+let mineOn = false;
+let mineBusy = false;
+let mineResumed = false;
+let mineFeed = [];   // 只存真实回执：第几块、哪一格、+多少；雨里一个字都不编
+
+function mineSay(text, cls) {
+  mineFeed.unshift({ text, cls: cls || "" });
+  if (mineFeed.length > 6) mineFeed.length = 6;
+  const cap = $("mine-cap");
+  if (cap) cap.textContent = text;
+}
+
+function setMineLine(text) {
+  const el = $("mine-line");
+  if (el) el.textContent = text;
+}
+
+function renderMineDeck() {
+  const s = worldSnap;
+  const btn = $("btn-mine-start");
+  if (!btn) return;
+  btn.textContent = t(mineOn ? "mine.running" : "mine.enter");
+  btn.classList.toggle("running", mineOn);
+  $("btn-mine-stop").hidden = !mineOn;
+  $("mine-state-tag").textContent = t(mineOn ? "mine.state.run" : "mine.state.idle");
+  if (!s) return;
+  if (!s.unlocked) { setMineLine(t("mine.line.locked")); return; }
+  if (!mineOn) { setMineLine(t("mine.line.off", { n: s.mine_claims_by_me || 0 })); return; }
+  const left = Math.max(0, (s.next_claim_height || 0) - s.height - 1);
+  setMineLine(left > 0
+    ? t("mine.line.next", { h: s.next_claim_height, left, f: s.mine_floor || s.mine_cooldown_blocks })
+    : t("mine.line.scan", { h: s.height, n: s.ore_candidates }));
+}
+
+async function mineStart() {
+  // 从欢迎页那一个按钮直接进来时，世界快照可能还没读过：先读，再谈锁不锁
+  if (!worldSnap) {
+    try {
+      await loadWorld();
+    } catch (e) {
+      worldErr(String(e));
+      return;
+    }
+  }
+  const s = worldSnap;
+  if (!s || !s.unlocked) { worldErr(t("world.err.locked")); return; }
   worldErr("");
-  if (!worldSnap || !worldSnap.unlocked) { worldErr(t("world.err.locked")); return; }
-  $("btn-mine-ore").disabled = true;
+  if (!mineOn) {
+    mineOn = true;
+    if (!prefsCache.mining_started) await setPref("mining_started", true);
+    mineSay(t("mine.line.started", { h: s.height }));
+    renderMineDeck();
+    mineTick();
+  }
+  openWorld3D();
+}
+
+function mineStop(text) {
+  if (!mineOn) return;
+  mineOn = false;
+  mineSay(text || t("mine.line.stopped"));
+  renderMineDeck();
+}
+
+/** 一跳：先看链上到没到节奏，到了才按真命令；没到就什么都不做（不是重试，是不该按） */
+async function mineTick() {
+  if (!mineOn || mineBusy) return;
+  const s = worldSnap;
+  if (!s) return;
+  if (!s.unlocked) { mineStop(t("mine.line.locked")); return; }
+  if ((s.next_claim_height || 0) > s.height + 1) { renderMineDeck(); return; }
+  mineBusy = true;
   try {
     const p = await invoke("world_mine_once", { kind: wSlot });
     QLSfx.claim();
     if (w3) w3.burst(p.x, p.layer, p.y, wSlot);
     noteMinedCell(p);
+    mineSay(t("mine.line.hit", {
+      h: worldSnap.height, x: p.x, z: p.y, y: p.layer, r: fmtAmt(p.reward), f: p.pace_next_floor,
+    }));
     worldOk(mineMsg(p));
     await loadWorld();
   } catch (e) {
-    worldErr(String(e));
+    const msg = String(e);
+    mineSay(msg, "bad");
+    worldErr(msg);
+    // 余额不够、账本不认这种"再试一百次也不会变好"的错，直接收工并把原因留在屏上
+    if (/余额|未解锁|锁定|账本|拒绝/.test(msg)) mineStop(msg);
   }
-  $("btn-mine-ore").disabled = false;
-});
+  mineBusy = false;
+  renderMineDeck();
+}
+
+$("btn-mine-start").addEventListener("click", () => mineStart());
+$("btn-mine-stop").addEventListener("click", () => mineStop());
+setInterval(mineTick, 1200);
+
+// —— 码雨：滚的是这台机器真读到的链上十六进制，节奏由挖矿程序活着与否决定
+const RAIN = { ctx: null, cols: [], src: "", si: 0, last: 0, timer: 0 };
+
+function rainBoot() {
+  const c = $("mine-rain");
+  if (!c || RAIN.ctx) return;
+  RAIN.ctx = c.getContext("2d");
+  RAIN.cols = [];
+  for (let x = 0; x < c.width; x += 10) {
+    RAIN.cols.push({ x, y: Math.random() * -c.height, sp: 26 + Math.random() * 62 });
+  }
+}
+
+/** 字源取自链尖 VRF 与创世哈希——雨里那些字符是链上的字节，不是随机噪声 */
+function rainSource(s) {
+  const tip = s && s.vrfs && s.vrfs.length ? s.vrfs[s.vrfs.length - 1] : "";
+  const gen = s ? s.genesis_hash_hex : "";
+  const src = `${tip}${gen}`.replace(/[^0-9a-f]/g, "");
+  return src.length > 8 ? src : "0123456789abcdef";
+}
+
+function rainFrame() {
+  const c = $("mine-rain");
+  const g = RAIN.ctx;
+  if (!c || !g || $("w3d").hidden) return;
+  const now = performance.now();
+  const dt = Math.min(0.25, (now - RAIN.last) / 1000 || 0);
+  RAIN.last = now;
+  const s = worldSnap;
+  const speed = mineOn ? 1 : 0.22;
+  g.fillStyle = "rgba(4,10,16,0.30)";
+  g.fillRect(0, 0, c.width, c.height);
+  if (!RAIN.src || RAIN.si > RAIN.src.length - 32) { RAIN.src = rainSource(s); RAIN.si = 0; }
+  g.font = '10px "SF Mono", Menlo, monospace';
+  g.textBaseline = "top";
+  for (const col of RAIN.cols) {
+    col.y += col.sp * speed * dt;
+    if (col.y > c.height + 40) { col.y = -30; col.sp = 26 + Math.random() * 62; }
+    for (let k = 0; k < 5; k++) {
+      const yy = Math.floor(col.y) - k * 11;
+      if (yy < -11 || yy > c.height) continue;
+      const ch = RAIN.src[(RAIN.si + col.x + k * 7) % RAIN.src.length];
+      g.fillStyle = k === 0 ? "rgba(210,255,232,0.95)" : `rgba(74,196,158,${0.62 - k * 0.13})`;
+      g.fillText(ch, col.x, yy);
+    }
+  }
+  // 真回回执压在雨面上：这一行是"程序替我挖到了什么"，不是动画
+  g.font = '10px "SF Mono", Menlo, monospace';
+  mineFeed.forEach((f, i) => {
+    const y = 6 + i * 14;
+    g.fillStyle = "rgba(3,9,15,0.72)";
+    g.fillRect(0, y - 2, c.width, 13);
+    g.fillStyle = f.cls === "bad" ? "#e88f8f" : "#f0d397";
+    g.fillText(f.text.length > 40 ? f.text.slice(0, 40) + "…" : f.text, 5, y);
+  });
+}
+
+function rainRun(on) {
+  rainBoot();
+  RAIN.last = performance.now();
+  if (on && !RAIN.timer) RAIN.timer = setInterval(rainFrame, 90);
+  if (!on && RAIN.timer) { clearInterval(RAIN.timer); RAIN.timer = 0; }
+}
+
+// —— 站点：兑换池 / 旅人摊位 / 光尘灯从网页面板变成世界里三个走得到的地方。
+// 位置不是随便摆的：摊位跟着链史算出的旅人坐标走，池子和光尘灯守在出生点旁边，
+// 而出生点由同一份链史算出——别人来看你的世界，站在同一片地方看得见同一个摊位。
+const STATIONS = [
+  { type: "pool", dx: 8, dz: 1 },
+  { type: "dust", dx: 2, dz: -8 },
+];
+let stations = [];
+let spawnAnchor = null;
+let nearType = "";
+let shopType = "";
+
+function planStations(t, anchor) {
+  const W = QLWorld.W, H = QLWorld.H, seaLv = QLWorld.RULES.SEA >> 3;
+  const lvl = (x, z) => t.heights[z * W + x] >> 3;
+  const kind = (x, z) => t.blocks[z * W + x] & 7;
+  const tree = (x, z) => (t.blocks[z * W + x] & 8) !== 0;
+  // 地标要看得见：走近的路上撞着一堵树墙，等于柜台被树吃掉了——圈两层都清空
+  const open = (x, z) => {
+    for (let dz = -2; dz <= 2; dz++) for (let dx = -2; dx <= 2; dx++) if (tree(x + dx, z + dz)) return false;
+    return true;
+  };
+  const out = [], used = new Set();
+  for (const st of STATIONS) {
+    let spot = null, any = null;
+    // 要岸上、要和出生点同一阶台地：水里砌不了池，差十几层就变成互相看不见的两间房
+    for (let r = 0; r <= 5 && !spot; r++) {
+      for (let a = 0; a < 8 && !spot; a++) {
+        const x = Math.min(W - 8, Math.max(7, anchor.x + st.dx + Math.round(Math.cos((a * Math.PI) / 4) * r)));
+        const z = Math.min(H - 8, Math.max(7, anchor.z + st.dz + Math.round(Math.sin((a * Math.PI) / 4) * r)));
+        const k = kind(x, z);
+        if (k === 0 || k === 2 || lvl(x, z) < seaLv + 1) continue;
+        if (Math.abs(lvl(x, z) - anchor.layer) > 2) continue;
+        if (used.has(`${x}:${z}`)) continue;
+        if (!any) any = { x, z, layer: lvl(x, z) };
+        if (!open(x, z)) continue;
+        used.add(`${x}:${z}`);
+        spot = { x, z, layer: lvl(x, z) };
+      }
+    }
+    spot = spot || any;
+    if (spot) { used.add(`${spot.x}:${spot.z}`); out.push({ type: st.type, ...spot }); }
+  }
+  if (traderSnap && Number.isFinite(traderSnap.x) && Number.isFinite(traderSnap.y)) {
+    used.add(`${traderSnap.x}:${traderSnap.y}`);
+    out.push({ type: "trader", x: traderSnap.x, z: traderSnap.y, layer: lvl(traderSnap.x, traderSnap.y) });
+  }
+  return out;
+}
+
+function refreshStations(t) {
+  const terrain = t || buildTerrain(worldSnap);
+  if (!terrain || !terrain.blocks) return;
+  stations = spawnAnchor ? planStations(terrain, spawnAnchor) : [];
+}
+
+function stationWatch(s) {
+  let best = null, bd = 3.6;
+  for (const st of stations) {
+    const d = Math.hypot(s.px - (st.x + 0.5), s.pz - (st.z + 0.5));
+    if (d < bd) { bd = d; best = st.type; }
+  }
+  if (best === nearType) return;
+  nearType = best || "";
+  const el = $("w3d-prompt");
+  if (!el) return;
+  if (shopType || !nearType) { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = t("mine.prompt", { name: t(`mine.station.${nearType}`) });
+}
+
+const SHOPS = ["pool", "trader", "dust"];
+
+function shopOpen(type) {
+  if (!type) return;
+  shopType = type;
+  $("w3d-shop").hidden = false;
+  $("shop-title").textContent = t(`mine.station.${type}`);
+  for (const k of SHOPS) $("panel-" + k).classList.toggle("on", k === type);
+  $("w3d-prompt").hidden = true;
+  if (document.pointerLockElement) document.exitPointerLock();
+  worldErr("");
+}
+
+function shopClose() {
+  if (!shopType) return;
+  shopType = "";
+  $("w3d-shop").hidden = true;
+}
+
+$("btn-shop-close").addEventListener("click", shopClose);
+$("w3d-prompt").addEventListener("click", () => shopOpen(nearType));
+
+// 站在站点跟前时 E 归柜台用（其余时候它还是转视角）；柜台开着 Esc 只收柜台，不出世界。
+// 捕获阶段先拦，拦下就 stopPropagation，world3d.js 的冒泡监听收不到这一次按键。
+document.addEventListener("keydown", (e) => {
+  if ($("w3d").hidden || e.metaKey || e.ctrlKey || e.altKey || e.target.tagName === "INPUT") return;
+  const k = e.key.toLowerCase();
+  if (shopType) {
+    if (k === "escape") { e.stopPropagation(); e.preventDefault(); shopClose(); }
+    return;
+  }
+  if (k === "e" && nearType) { e.stopPropagation(); e.preventDefault(); shopOpen(nearType); }
+}, true);
 
 $("ent-list").addEventListener("click", (e) => {
   const row = e.target.closest(".ent-row");
@@ -1464,9 +1795,13 @@ function w3Name(slot, x, z, layer) {
   return `${t(`world.kind.${slot}`)}·${x}_${z}_${layer}`.slice(0, 40);
 }
 
-/** 出生点：不是"最近的一块陆地"，而是附近视野最好的一块干地。
- *  第一眼决定别人会不会觉得被骗——站在低洼水边只能看见一堵黑墙，
- *  站到高一点、前方有落差的位置，才有封面里那种峡谷与远山的构图。 */
+/** 出生点：第一眼是一幅风景，不是一道坎。判据是"相机看得出去"而不是"附近有没有水"——
+ *  全图普查（256×256 逐格）显示：脚下 9 格真正平整、不沾水、三格内没树干的格子
+ *  只有 31 个，且个个都在密林里（九格内 17~39 棵树）。所以"开阔草地"这张图根本没有，
+ *  能要的是：一块平地 + 一条穿过树林的视线。于是朝向按射线打分（50 格剖面）：
+ *  两米以上的断崖要在 22 格外，地形轮廓仰角要低于 4°，水要在 26~48 格之间当远景，
+ *  16 格内的树干越少越好。旧目标只数"脚下 5 格"和"14 格那一点"，结果每次都赢在
+ *  台地边缘：睁眼是一道九米的坎加一谷沼泽，正是"地上怎么还有蓝色"的那一帧。 */
 function pickSpawn(x, z) {
   const t = buildTerrain(worldSnap);
   if (!t.blocks || !t.heights) return { x: 128, z: 128 };
@@ -1476,51 +1811,68 @@ function pickSpawn(x, z) {
   const water = (cx, cz) => kindAt(cx, cz) === 0;
   const tree = (cx, cz) => (t.blocks[cz * W + cx] & 8) !== 0;
   const at = (cx, cz) => [Math.min(W - 1, Math.max(0, cx)), Math.min(H - 1, Math.max(0, cz))];
-  const inside = (cx, cz) => cx > 6 && cz > 6 && cx < W - 7 && cz < H - 7;
-  let best = null, bestScore = -1e9;
-  for (let dz = -34; dz <= 34; dz += 2) for (let dx = -34; dx <= 34; dx += 2) {
-    const cx = Math.min(W - 7, Math.max(6, x + dx)), cz = Math.min(H - 7, Math.max(6, z + dz));
+  const inside = (cx, cz) => cx > 7 && cz > 7 && cx < W - 8 && cz < H - 8;
+  // 别人（或自己）盖过的格子一律避开：support() 取的是"地形顶与活方块的最大值"，
+  // 出生在一座塔上，睁眼就是离地几十层的悬崖，HUD 的 Y 和地表层也对不上。
+  const built = new Set();
+  for (const e of worldSnap.entities || []) if (!e.released) built.add(`${Math.floor(e.x)}:${Math.floor(e.y)}`);
+  let best = null, bestScore = -1e9, soft = null, softScore = -1e9;
+  for (let dz = -46; dz <= 46; dz++) for (let dx = -46; dx <= 46; dx++) {
+    const cx = x + dx, cz = z + dz;
     if (!inside(cx, cz) || water(cx, cz) || kindAt(cx, cz) === 2) continue; // 雪峰只长云杉、露出白石，出生在那种地方第一眼是堵墙
+    if (built.has(`${cx}:${cz}`)) continue;
     const lv = lvl(cx, cz);
     if (lv < seaLv + 2) continue; // 水边低地只能看见一堵黑墙，站在岸上才看得下去
-    // 出生点不能落在树里：两格内有树干 = 睁眼就是一根柱子，树冠还会糊住整个上半屏
-    let woods = 0, buried = false;
-    for (let tz = -4; tz <= 4 && !buried; tz++) for (let tx = -4; tx <= 4; tx++) {
-      const nx = cx + tx, nz = cz + tz;
-      if (nx < 0 || nz < 0 || nx >= W || nz >= H || !tree(nx, nz)) continue;
-      if (Math.abs(tx) <= 2 && Math.abs(tz) <= 2) { buried = true; break; }
-      woods += 1;
+    // 脚下九格：一整块平地（span≤2、台阶≤34%）、不沾一滴水、三格内没有树干。
+    // 一格一跌的梯田会把前景铺满泥条，贴脸的树干会糊掉半个屏幕。
+    let span = 0, steps = 0, tot = 0, wet = 0, woods = 0, buried = false;
+    for (let gz = -9; gz <= 9 && !buried; gz++) for (let gx = -9; gx <= 9; gx++) {
+      if (gx * gx + gz * gz > 81) continue;
+      const nx = cx + gx, nz = cz + gz;
+      const v = lvl(nx, nz), d = Math.abs(v - lv);
+      tot += 1; if (d > 0) steps += 1; if (d > span) span = d;
+      if (water(nx, nz)) wet += 1;
+      if (tree(nx, nz)) { woods += 1; if (gx * gx + gz * gz <= 9) buried = true; }
     }
-    if (buried) continue;
-    // 站的地方四周不能比脚下高：贴脸一堵坡，视野就没了（雪峰那种白石墙最糟）
-    let walls = 0;
-    for (let a = 0; a < 8; a++) {
-      const [nx, nz] = at(cx + Math.round(Math.cos((a * Math.PI) / 4) * 2), cz + Math.round(Math.sin((a * Math.PI) / 4) * 2));
-      walls += Math.max(0, lvl(nx, nz) - lv);
-    }
-    if (walls > 0) continue;
-    // 看八个方向：近处（5 格）和远处（12 格）各取一次落差——近处要有边才看得下去，
-    // 远处要有景才不空。看得到水面再加分。
-    let vista = 0, near = 0, face = { x: 0, z: 1 }, faceScore = -1e9;
+    // 八个方向各射一条 50 格剖面，取"最看得出去"的那一眼
+    let faceYaw = 0.6, faceScore = -1e9;
     for (let a = 0; a < 8; a++) {
       const ux = Math.cos((a * Math.PI) / 4), uz = Math.sin((a * Math.PI) / 4);
-      const [n5x, n5z] = at(cx + Math.round(ux * 5), cz + Math.round(uz * 5));
-      const [n12x, n12z] = at(cx + Math.round(ux * 12), cz + Math.round(uz * 12));
-      const drop5 = Math.max(0, lv - lvl(n5x, n5z));
-      const drop12 = Math.max(0, lv - lvl(n12x, n12z));
-      vista += drop12;
-      if (water(n12x, n12z)) near += 1;
-      const s2 = drop5 * 1.6 + drop12 + (water(n12x, n12z) ? 2.4 : 0) + (water(n5x, n5z) ? 1.2 : 0);
-      if (s2 > faceScore) { faceScore = s2; face = { x: ux, z: uz }; }
+      let edge = 99, maxEl = -99, waterD = 99, near = 0, far = 0;
+      for (let d = 1; d <= 50; d++) {
+        const [nx, nz] = at(cx + Math.round(ux * d), cz + Math.round(uz * d));
+        // 轮廓仰角：这一格顶面相对眼睛（lv+2.62）张开的角度。前景只要有一格仰角超过
+        // 十几度，画面中段就被土墙占满——"地面上是空的""全是墙"说的都是这一条。
+        const el = Math.atan2(lvl(nx, nz) + 1 - (lv + 2.62), d) * 180 / Math.PI;
+        if (el > maxEl) maxEl = el;
+        if (edge === 99 && lv - lvl(nx, nz) >= 2) edge = d;
+        if (waterD === 99 && water(nx, nz)) waterD = d;
+        if (tree(nx, nz)) { if (d <= 16) near += 1; if (d <= 30) far += 1; }
+      }
+      let s = 0;
+      s += edge >= 22 ? 9 : edge >= 15 ? 5 : edge >= 10 ? 0 : -12;
+      s += maxEl < 4 ? 5 : maxEl < 8 ? 2 : maxEl < 14 ? -2 : -9;
+      s += waterD >= 26 && waterD <= 48 ? 7 : waterD >= 16 ? 2 : waterD < 16 ? -9 : 0;
+      s -= near * 2.2 + far * 0.7;
+      if (s > faceScore) { faceScore = s; faceYaw = Math.atan2(ux, uz); }
     }
-    const gentle = kindAt(cx, cz) === 5 ? 1.5 : 0;
-    const score = vista * 1.4 + near * 2.2 + (lv - seaLv) * 1.0 - Math.hypot(dx, dz) * 0.3 - woods * 2.5 + gentle;
+    // 离地图边界太近，视线尽头是世界的墙而不是地平线：扣分，但不设死门槛
+    const rim = Math.min(cx, cz, W - 1 - cx, H - 1 - cz);
+    const score = faceScore + (lv - seaLv) * 0.25 + (kindAt(cx, cz) === 5 ? 1.5 : 0)
+      - woods * 0.35 - Math.hypot(dx, dz) * 0.06 - steps * 0.06
+      - (rim < 40 ? (40 - rim) * 0.35 : 0);
+    const cand = { x: cx, z: cz, layer: lv, yaw: faceYaw };
+    if (buried || wet > 0 || span > 2 || steps > tot * 0.34 || woods > 16 || faceScore < 8) {
+      // 一整片邻居都泡在水里时，宁可选"最不糟的那块"，也不要退回默认坐标 128,128
+      if (score > softScore) { softScore = score; soft = cand; }
+      continue;
+    }
     if (score > bestScore) {
       bestScore = score;
-      best = { x: cx, z: cz, yaw: Math.atan2(face.x, face.z) };
+      best = cand;
     }
   }
-  return best || { x: 128, z: 128, yaw: 0.6 };
+  return best || soft || { x: 128, z: 128, yaw: 0.6 };
 }
 
 function ensureWorld3D() {
@@ -1541,25 +1893,14 @@ function ensureWorld3D() {
       onSound: (on) => w3Toast(on ? t("world3d.sound.on") : t("world3d.sound.off")),
       onLock: (on) => { $("w3d-cross").classList.toggle("locked", on); w3Hint(); },
       onFrame: (s) => {
-        if (w3three) {
-          try {
-            w3three.render(s);
-            // 第一张真画面已经画出来了，才把封面淡掉：先看到的是"同一片地方"，
-            // 不是先看到一块粗糙的替身。rAF 保证中间至少有完整一帧。
-            if (!w3VeilDone) {
-              w3VeilDone = true;
-              requestAnimationFrame(() => $("w3d-veil").classList.add("gone"));
-            }
-          } catch (e) {
-            console.warn('Three.js rendering stopped:', e);
-            $("w3d-three-canvas").hidden = true;
-            $("w3d-veil").classList.add("gone");
-            w3three = null;
-            w3Toast(`画质层已切回基础渲染：${String(e)}`, true);
-          }
+        // 封面淡掉要等第一帧真的画出来：先淡的话用户看到的是"封面 → 一块没上色的地"，
+        // 而不是"封面 → 同一片地方"。图集是本地现画的，一帧就是完整画面，不需要等纹理。
+        if (!w3VeilDone) {
+          w3VeilDone = true;
+          requestAnimationFrame(() => $("w3d-veil").classList.add("gone"));
         }
         const n = performance.now();
-        if (n - w3HudAt > 120) { w3HudAt = n; renderW3Hud(s); }
+        if (n - w3HudAt > 120) { w3HudAt = n; renderW3Hud(s); stationWatch(s); }
         presenceTick(s);
       },
       onClose: () => closeWorld3D(),
@@ -1586,7 +1927,7 @@ function syncWorld3D() {
   w3.setSlots(worldSnap.slot_count || 16);
   w3.setTime(worldSnap.height || 0);
   w3.setSlot(wSlot);
-  if (w3three) w3three.setWorld(t.heights, t.blocks, worldSnap.entities, worldSnap.dug || [], worldRes);
+  refreshStations(t);
   renderHeld();
 }
 
@@ -1621,6 +1962,19 @@ function w3Hint() {
   $("w3d-hint").textContent = t("world3d.hint");
 }
 
+/** 脚下这一格在真实地球上的位置。大地不是算出来的，是崂山东麓的一次卫星测量，
+ *  所以 HUD 报得出经纬度——这一行也是"1 格 = 35 米"这条比例的唯一出处：
+ *  方块内部仍然一米一格（人和树按米建模），对世界而言一格是 35 米地面。 */
+function earthReadout(x, z) {
+  const E = window.QLEarth;
+  if (!E || !E.bbox) return "—";
+  const w = E.bbox[0], so = E.bbox[1], e = E.bbox[2], n = E.bbox[3];
+  const lon = w + ((x + 0.5) / QLWorld.W) * (e - w);
+  const lat = n - ((z + 0.5) / QLWorld.H) * (n - so);
+  return `${E.place} · ${lat.toFixed(4)}°N ${lon.toFixed(4)}°E · ` +
+    t("world3d.f3.scale", { m: E.metersPerCell });
+}
+
 function renderW3Hud(s) {
   const s0 = worldSnap;
   if (!s0) return;
@@ -1628,6 +1982,7 @@ function renderW3Hud(s) {
   const ch = s0.chunks.find((k) => k.cx === (s.x >> 4) && k.cy === (s.z >> 4));
   const row = (k, v, cls = "") => `<div class="f3k">${k}</div><div class="f3v ${cls}">${v}</div>`;
   const pos = row(t("world3d.f3.pos"), `X ${s.x} · Y ${s.layer} · Z ${s.z}`);
+  const earth = row(t("world3d.f3.earth"), earthReadout(s.x, s.z));
   const surf = row(t("world3d.f3.surface"),
     `${s.surface} · ${t(`world3d.biome.${s.block & 7}`)}` +
     (s.dug ? ` · ${t("world3d.f3.top")} ${s.top} (−${s.dug})` : ""));
@@ -1646,7 +2001,7 @@ function renderW3Hud(s) {
   const chn = row(t("world3d.f3.chunk"), ch ? `${ch.count} · ${ch.root_hex.slice(0, 8)}…` : "0");
   const fp = row(t("world3d.f3.fp"), `<span class="mono gold">${terrain.fp}</span>`);
   const fps = row("FPS", `${s.fps}${s.locked ? "" : " · " + t("world3d.f3.unlocked")}`);
-  $("w3d-f3").innerHTML = [pos, surf, matRow, tgt, plc, slot, time, chn, fp, fps].join("");
+  $("w3d-f3").innerHTML = [pos, earth, surf, matRow, tgt, plc, slot, time, chn, fp, fps].join("");
 }
 
 async function w3Place(x, z, layer, slot) {
@@ -1713,32 +2068,23 @@ async function openWorld3D() {
   }
   $("w3d").hidden = false;
   document.body.classList.add("w3d-on");
+  syncPlanetBackdrop();   // 第一人称自己就是一个 WebGL 上下文，背景地球让帧
   // 每次进世界都从封面开始：封面是这片地的黄昏，淡入后落在同一个地方
   $("w3d-veil").classList.remove("gone");
   w3VeilDone = false;
-  if (!w3three) {
-    try {
-      const { ThreeWorld } = await import('./world3d-three.js');
-      w3three = new ThreeWorld($("w3d-three-canvas"));
-      $("w3d-three-canvas").hidden = false;
-    } catch (e) {
-      $("w3d-three-canvas").hidden = true;
-      w3Toast(`画质层不可用，已切回基础渲染：${String(e)}`, true);
-    }
-  }
-  if (!w3three) $("w3d-veil").classList.add("gone");
   if (!ensureWorld3D()) { closeWorld3D(); return; }
   buildW3Hotbar();
   w3Hint();
   if (!w3Spawned) {
     const c = pickSpawn(Number($("ent-x").value) || 128, Number($("ent-z").value) || 128);
-    w3.jumpTo(c.x, c.z, null);
+    w3.jumpTo(c.x, c.z, c.layer == null ? null : c.layer);
     // 面向这块地视野最开的方向：出生第一眼就要是"景"，不是一堵山壁
     if (c.yaw != null) w3.setView(c.yaw, -0.05);
-    if (w3three) w3three.setSpawn(c.x, c.z);
+    spawnAnchor = c;
     w3Spawned = true;
   }
   syncWorld3D();
+  rainRun(true);
   w3.open();
   // 第 1 步是导航事实：进过世界就记下来（不改账本）
   if (!prefsCache.opened_world) setPref("opened_world", true).then(renderGuide);
@@ -1747,15 +2093,17 @@ async function openWorld3D() {
 
 function closeWorld3D() {
   if ($("w3d").hidden && !w3) return;
+  shopClose();
+  rainRun(false);
   if (w3) w3.close();
   $("w3d").hidden = true;
   document.body.classList.remove("w3d-on");
+  syncPlanetBackdrop();   // 世界关了，背景地球重新满帧转起来
   $("w3d-pos").hidden = true;
   $("w3d-share").hidden = true;
   renderFeedback();
 }
 
-$("btn-w3d").addEventListener("click", openWorld3D);
 $("w3d-exit").addEventListener("click", () => closeWorld3D());
 $("w3d-hotbar").addEventListener("click", (e) => {
   const b = e.target.closest(".hs");
@@ -1795,7 +2143,6 @@ let shareShot = null;
 function currentShot() {
   return new Promise((resolve) => {
     if (!w3 || $("w3d").hidden) return resolve(null);
-    if (w3three) return resolve(w3three.snapshot());
     let got = false;
     w3.snapshot((u) => { got = true; resolve(u); });
     setTimeout(() => { if (!got) resolve(null); }, 500);

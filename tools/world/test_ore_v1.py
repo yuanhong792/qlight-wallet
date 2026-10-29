@@ -18,6 +18,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import world  # noqa: E402
 
@@ -45,6 +46,10 @@ H_FIX = 400
 LIMIT = 64
 
 JS = r"""
+/* 大地是真实高程表，不是算式：JS 侧没有它就必须当场炸，所以这里先把
+   desktop-wallet/ui/earth-height.js 挂上——对拍对的是钱包里那一块地，
+   不是某个测试专用的替身。 */
+require(process.argv[4]);
 const QL = require(process.argv[2]);
 const fs = require('fs');
 const spec = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
@@ -136,8 +141,8 @@ def main():
             x, y, layer = (int(v) for v in s.split(","))
             if not world.is_ore(x, y, words, c["height"]):
                 bad.append((x, y, "不中矿"))
-            elif layer != world.ore_layer(x, y, words):
-                bad.append((x, y, "层不对 %d≠%d" % (layer, world.ore_layer(x, y, words))))
+            elif layer != world.ore_layer(x, y):
+                bad.append((x, y, "层不对 %d≠%d" % (layer, world.ore_layer(x, y))))
         mark("h=%s n=%s 每一格都验得过" % (c["height"], c["n"]),
              not bad, bad or "%d 格全通过" % len(c["cells"]))
 
@@ -153,8 +158,11 @@ def main():
         js_path = os.path.join(HERE, "_ore_probe.js")
         with open(js_path, "w", encoding="utf-8") as f:
             f.write(JS)
+        # 大地是真实高程表，不是算式：JS 侧缺了它就当场炸，所以先把钱包 ui 里那份
+        # earth-height.js 挂上——对拍对的是玩家脚下那片地，不是测试专用的替身。
+        earth_js = os.path.join(REPO, "desktop-wallet", "ui", "earth-height.js")
         try:
-            r = subprocess.run([NODE, js_path, os.path.join(HERE, "world.js"), spec_path],
+            r = subprocess.run([NODE, js_path, os.path.join(HERE, "world.js"), spec_path, earth_js],
                                capture_output=True, text=True)
             if r.returncode != 0:
                 mark("node 侧跑起来", False, r.stderr.strip()[:200])

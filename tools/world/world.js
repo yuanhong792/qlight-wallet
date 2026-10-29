@@ -15,16 +15,22 @@
   'use strict';
 
   var W = 256, H = 256;
-  var RULES_VERSION = 'QL-WORLD-RULES-v2';
+  var RULES_VERSION = 'QL-WORLD-RULES-v3';
   var SEA = 86, SAND = 98, SNOW = 190;
   var M_FOREST = 120, M_DESERT = 60;
   var DENS_FOREST = 225, DENS_DESERT = 240, DENS_GRASS = 232;
-  // 种子分道（v2 的全部改动）：前 4 个字 = 大地（只由创世哈希决定），
-  // 后 4 个字 = 地表（创世哈希 ⊕ 链历史）。高度场随块漂移会让 (x, z, layer)
-  // 失去意义——签了名的塔会被埋进地里或悬在半空，世界就不可能被建造。
+  // 种子分道（v2 定下的、v3 沿用）：前 4 个字 = 大地，后 4 个字 = 地表。
+  // v3 之后大地已经不看种子了（它来自真实高程），但**湿度/矿脉仍按这条分道走**：
+  // 高度场随块漂移会让 (x, z, layer) 失去意义——签了名的塔会被埋进地里或悬在
+  // 半空，世界就不可能被建造。
   var SEED_SPLIT = 4;
 
   var GENESIS_HASH = '5dc2205a8f0153a05f84e26ab94086009796bb68fdfddff439f97ebfd2aa3104';
+
+  /* 大地 = 真实地球。缺失即致命：静默退回噪声会让这份实现悄悄画出
+   * 另一片大陆，而四份副本的对拍正是这个项目"可验证"的全部凭据。 */
+  if (!global.QLEarth) throw new Error('world.js: 缺少 earth-height.js，大地无从确定');
+  var EARTH = global.QLEarth.load();
 
   var AMPS = [32, 16, 8, 4, 2];
   var CELLS = [64, 32, 16, 8, 4];
@@ -33,11 +39,11 @@
   var u32 = function (x) { return x >>> 0; };
 
   /* 规则指纹（DESIGN.md §9.6）：
-       canon = "QL-WORLD-RULES-v2|256,256,86,98,190,120,60,225,240,232,4"
-       seed  = shake_256(canon)[0..4]  → 0xd120fe8f
+       canon = "QL-WORLD-RULES-v3|256,256,86,98,190,120,60,225,240,232,4|<大地 SHA-256>"
+       seed  = shake_256(canon)[0..4]  → 0x50d296e0
      与 world.py 同源。规则版本必须是公开常量而非每次重算，故此处直接锚定；
-     改上面任何一个阈值都必须同步改这里，否则两份实现会静默分叉。 */
-  var RULES_SEED = 0xd120fe8f;
+     改上面任何一个阈值、或换一片土地，都必须同步改这里，否则两份实现会静默分叉。 */
+  var RULES_SEED = 0x50d296e0;
 
   function setRulesSeed(v) { RULES_SEED = v >>> 0; }
 
@@ -80,9 +86,11 @@
   }
 
   /* 种子 = 大地 ⊕ 地表两条道：
-       words[0..3] = 创世哈希            → 高度场 + 天然实体（永不变）
+       words[0..3] = 创世哈希            → 天然实体与创世纪元格（永不变）
        words[4..7] = 创世哈希 ⊕ 全部块 VRF → 湿度场（链长一格，地表重画一次）
-     这就是「链即世界的历史」在可建造前提下的唯一写法。 */
+     这就是「链即世界的历史」在可建造前提下的唯一写法。
+     （v3 起高度场已经在这两条道之外——它是真实地球；但实体与矿脉照旧走分道，
+       所以"下一块之前谁也算不出未来哪里有矿"这条一分未动。） */
   function seedWords(genesisHex, vrfList) {
     var raw = hexToBytes(genesisHex);
     var folded = raw.slice(0);
@@ -107,7 +115,7 @@
     var era1 = 0, ents = 0;
     for (var y = 0; y < H; y++) {
       for (var x = 0; x < W; x++) {
-        var hgt = fbm(x, y, words, 0);
+        var hgt = EARTH[y * W + x];   // 大地：真实地球高程，与种子无关（v3）
         var mo = fbm(x, y, words, 4);
         var e = hash2(x + 7919, y + 104729, words[0]);
         var era = (e >>> 24) & 0xFF;
@@ -185,15 +193,17 @@
     var era = (hash2(x + 7919, y + 104729, words[0]) >>> 24) & 0xFF;
     return era === 0 && oreSeed(x, y, words) < oreQuota(h);
   }
-  function oreLayer(x, y, words) {
-    return Math.min(MAX_LAYER - 1, fbm(x, y, words, 0) >> 3);
+  /* 贴地层：v3 起直接读真实高程表——它不看种子，所以「矿落在第几层」与链历史
+   * 无关，签进账本的 (x, y, layer) 永远不会被后来的块改判。 */
+  function oreLayer(x, y) {
+    return Math.min(MAX_LAYER - 1, EARTH[y * W + x] >> 3);
   }
   function oreCells(words, h, limit, taken) {
     var hits = [], m, key;
     for (var y = 0; y < H; y++) {
       for (var x = 0; x < W; x++) {
         if (!isOre(x, y, words, h)) continue;
-        var l = oreLayer(x, y, words);
+        var l = oreLayer(x, y);
         key = x + ',' + y + ',' + l;
         if (taken && taken[key]) continue;
         m = fbm(x, y, words, 4);
@@ -210,7 +220,7 @@
   global.QLWorld = {
     W: W, H: H, GENESIS_HASH: GENESIS_HASH, RULES_VERSION: RULES_VERSION,
     setRulesSeed: setRulesSeed, seedWords: seedWords, render: render,
-    fingerprint: fingerprint, hash2: hash2, fbm: fbm,
+    fingerprint: fingerprint, hash2: hash2, fbm: fbm, earth: global.QLEarth,
     oreQuota: oreQuota, oreSeed: oreSeed, isOre: isOre,
     oreLayer: oreLayer, oreCells: oreCells, ORE_RULE_VERSION: 'QL-ORE-v1',
     ORE_SEED_SPACE: ORE_SEED_SPACE, ORE_SCAN_CAP: ORE_SCAN_CAP,

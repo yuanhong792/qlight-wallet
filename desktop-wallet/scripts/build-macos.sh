@@ -15,6 +15,11 @@ VER="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 test -n "$VER" || { echo "读不到 Cargo.toml 的 version"; exit 1; }
 echo "版本 v${VER}"
 
+# frontendDist 就是整个 ui/ 目录：编译期会把里面每一个文件原样嵌进二进制。
+# 对拍用的假 __TAURI__ 页一旦留在 ui/ 里，就会跟着发行包一起发出去——那是包里躺着一个假钱包。
+LEAK="$(find ui -name '__*' -print -quit)"
+test -z "$LEAK" || { echo "ui/ 里有对拍临时文件，它会一起进包：$LEAK（挪到 dev/ 再打）"; exit 1; }
+
 echo "① cargo build --release ..."
 export PATH="$HOME/.cargo/bin:$PATH"
 # 外置盘会生成 ._ 资源叉文件，会破坏 tauri 的 build script —— 编译输出默认放内置盘，

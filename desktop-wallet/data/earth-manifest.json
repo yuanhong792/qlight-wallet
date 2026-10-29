@@ -1,0 +1,143 @@
+{
+  "rule": "QL-EARTH-DEM-v1",
+  "place": "崂山东麓 · 青岛 · 黄海之滨",
+  "center_lat": 36.1527,
+  "center_lon": 120.6652,
+  "width_km": 8.96,
+  "meters_per_cell": 35.0,
+  "zoom": 13,
+  "tile_source": "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+  "tile_decode": "elev_m = (R*256 + G + B/256) - 32768",
+  "underlying_dem": "SRTM30m / Copernicus GLO-30 全球合成DEM（只测陆地）",
+  "tiles": {
+    "count": 12,
+    "ids": [
+      [
+        13,
+        6840,
+        3211
+      ],
+      [
+        13,
+        6841,
+        3211
+      ],
+      [
+        13,
+        6842,
+        3211
+      ],
+      [
+        13,
+        6843,
+        3211
+      ],
+      [
+        13,
+        6840,
+        3212
+      ],
+      [
+        13,
+        6841,
+        3212
+      ],
+      [
+        13,
+        6842,
+        3212
+      ],
+      [
+        13,
+        6843,
+        3212
+      ],
+      [
+        13,
+        6840,
+        3213
+      ],
+      [
+        13,
+        6841,
+        3213
+      ],
+      [
+        13,
+        6842,
+        3213
+      ],
+      [
+        13,
+        6843,
+        3213
+      ]
+    ],
+    "ids_sha256_16": "35af1dadadcc6e82"
+  },
+  "bbox_deg": [
+    120.615359,
+    36.112456,
+    120.715041,
+    36.192944
+  ],
+  "real_elevation_m": {
+    "min": 0.5,
+    "max": 1092.3
+  },
+  "seabed": {
+    "kind": "model",
+    "note": "源 DEM 不含海底：离岸每格下切 0.5 米、封顶 40.0 米（黄海近岸量级）",
+    "m_per_cell": 0.5,
+    "max_m": 40.0
+  },
+  "quantize": {
+    "sea_field": 86,
+    "sand_field": 98,
+    "top_field": 247,
+    "beach_m": 4.0,
+    "land_min_m": 0.5,
+    "resample": "area-mean over land pixels only",
+    "bytes_per_cell": 1,
+    "row_order": "行主序，y=0 是最北（与 terrain::height_at(x,y) 的 y 同向）"
+  },
+  "grid": [
+    256,
+    256
+  ],
+  "bytes": 65536,
+  "sha256": "805868b90a88e3df2d43658cb8579dee9cebd1fe566794d52afabf05184248f8",
+  "heights_fingerprint": "88d303cd75dcc913",
+  "water_cells": 21068,
+  "land_layers": 20,
+  "planet": {
+    "rule": "QL-EARTH-PLANET-v1",
+    "projection": "equirectangular",
+    "grid_unit_m": 1,
+    "lod": [
+      "planet",
+      "region-30m",
+      "workvolume-1m"
+    ],
+    "height": {
+      "file": "earth-global-h.bin",
+      "zoom_src": 5,
+      "width": 2048,
+      "height": 1024,
+      "bytes": 2097152,
+      "sha256": "5050a85cedfb82808a8a1d76f38b20e5263c36eae553a03468718ecf3e4d84e1",
+      "cell_m_equator": 19.568,
+      "quantize": "LAND_BUCKETS/OCEAN_STEP in fetch_earth_planet.py"
+    },
+    "imagery": {
+      "file": "earth-global.jpg",
+      "source": "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_NextGeneration/default/2012-01-01/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpg",
+      "attribution": "NASA Blue Marble Next Generation (2012) via NASA GIBS — public domain",
+      "zoom_src": 4,
+      "width": 4096,
+      "height": 2048,
+      "bytes": 797593,
+      "sha256": "bb690daac7d3720a2ddc77c6a5813b22857f6ce4037dca6771720fcf323b4aa6"
+    }
+  }
+}

@@ -387,6 +387,7 @@ pub async fn import_backup(state: AppCtx<'_>, app: AppHandle) -> Result<Option<S
 pub struct PrefsDto {
     pub welcome_done: bool,
     pub opened_world: bool,
+    pub mining_started: bool,
     pub opened_history: bool,
     pub guide_done: bool,
 }
@@ -396,6 +397,7 @@ impl From<&prefs::Prefs> for PrefsDto {
         PrefsDto {
             welcome_done: p.welcome_done,
             opened_world: p.opened_world,
+            mining_started: p.mining_started,
             opened_history: p.opened_history,
             guide_done: p.guide_done,
         }

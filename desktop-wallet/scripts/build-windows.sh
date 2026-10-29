@@ -24,6 +24,10 @@ VER="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 test -n "$VER" || { echo "读不到 Cargo.toml 的 version"; exit 1; }
 echo "版本 v${VER} · 目标 $TARGET"
 
+# 同 macOS：frontendDist = 整个 ui/，里面的对拍临时页会原样进 exe。
+LEAK="$(find ui -name '__*' -print -quit)"
+test -z "$LEAK" || { echo "ui/ 里有对拍临时文件，它会一起进包：$LEAK（挪到 dev/ 再打）"; exit 1; }
+
 MINGW_HOME=${MINGW_HOME:-$(echo "$HOME"/qlx-tools/llvm-mingw-*(N) /opt/homebrew/opt/llvm-mingw(N) /usr/local/opt/llvm-mingw(N) | awk '{print $1}')}
 test -n "$MINGW_HOME" -a -d "$MINGW_HOME" \
   || { echo "找不到 llvm-mingw：设 MINGW_HOME=/path/to/llvm-mingw 再跑"; exit 1; }

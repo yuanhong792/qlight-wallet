@@ -286,19 +286,14 @@ pub fn derive_entity_id(prev_hash: &[u8; 32], pk_hash: &[u8; 32], r: &EntityReco
 
 // ---------------------------------------------------------------- 挖掘（v5）
 
-/// 大地种子：只取创世哈希，**不折任何块 VRF**。
+/// 该列的大地高度（0..247）——v3 起是真实地球的高程表，与种子和历史彻底无关。
 ///
-/// 挖掘判定必须用它：地表湿度（`chain_words`）每出一个块就重画一次，
+/// 这正是挖掘判定敢用它的理由：地表湿度（`chain_words`）每出一个块就重画一次，
 /// 拿它判定"这一列地表在第几层"，昨天挖的那一格今天就会变成非法——
-/// 一笔历史被后来的块改判，等于整个重放不可复现。
-fn ground_words() -> &'static Vec<u32> {
-    static WORDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-    WORDS.get_or_init(|| terrain::seed_words(&crate::simchain::genesis_hash_hex(), &[]))
-}
-
-/// 该列的大地高度（0..247，历史无关）
+/// 一笔历史被后来的块改判，等于整个重放不可复现。而 `earth-height.bin`
+/// 连一个字节都不随链生长，`(x, y, layer)` 才是能签进账本的承诺。
 pub fn ground_height(x: u16, y: u16) -> u32 {
-    terrain::height_at(x as u32, y as u32, ground_words())
+    terrain::height_at(x as u32, y as u32)
 }
 
 /// 该列原始地表所在的层：地表方块就占这一层，顶面在 `layer + 1`
@@ -2258,13 +2253,13 @@ mod tests {
         let c = core();
         let ledger = tmp_ledger("dig-water");
         let view = view_at(50);
-        // (40,60) 大地高度 76 < 海面 86
-        assert!(is_water(40, 60));
+        // (128,250) 是窗口南缘的正经海面：36.114°N 120.665°E，黄海，大地高度 25 < 海面 86
+        assert!(is_water(128, 250));
         let err = ledger
             .commit_as(&signer_pk_hash(&c), &view, |seq, prev| {
                 sign_record(&c, seq, &prev, &Draft {
                     op: op::DIG, entity_id_hex: "", parent_hex: "", name: "",
-                    x: 40, y: 60, layer: surface_layer(40, 60), kind: MAT_SOIL,
+                    x: 128, y: 250, layer: surface_layer(128, 250), kind: MAT_SOIL,
                     height: 50, ts: 1,
                 })
             })
