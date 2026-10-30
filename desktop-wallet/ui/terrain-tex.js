@@ -29,14 +29,21 @@
     ERA_GOLD: 36, BEDROCK: 37,
   };
 
-  // —— 调色板：取《我的世界》方块图鉴的配色（亮/基/暗/最暗四档）——
-  var GRASS = [[110, 169, 74], [138, 196, 94], [87, 140, 59], [71, 117, 47]];
-  var DIRT = [[139, 106, 70], [160, 124, 84], [116, 86, 57], [95, 68, 45]];
-  var STONE = [[127, 127, 127], [150, 150, 150], [105, 105, 105], [88, 88, 88]];
-  var DEEP = [[86, 88, 92], [104, 106, 110], [68, 70, 74], [54, 56, 60]];
-  var SAND = [[226, 211, 166], [241, 228, 188], [205, 188, 143], [184, 166, 122]];
-  var SNOW = [[244, 248, 252], [255, 255, 255], [224, 234, 243], [206, 219, 232]];
-  var WATER = [[47, 111, 196], [73, 143, 222], [35, 87, 160], [26, 70, 134]];
+  // —— 调色板：2026-10-30 用 /tmp/mc-tex/measure.py 逐像素量原版《我的世界》1.20.4 的
+  //    block/*.png 得到的数（覆盖率、色数、色相、饱和、中间明度全在 DESIGN §9.24 记着）。
+  //    三条硬结论直接改了我们原来的画法：
+  //      1) 实心块 100% 覆盖，四边一个透明像素都不留（顶/底空行 0、左/右空列 0）；
+  //      2) 一格只用 3~7 个色（stone 4 色、dirt 7 色、cobblestone 6 色、snow 3 色），
+  //         而且是 2~4 像素的**连片色斑**，不是逐像素雪花——雪花就是"地面发花"的来源；
+  //      3) 每种材质有固定的色相与明度档：泥土 25.7°/54%/V121（橙褐，不是灰），
+  //         凝灰岩 60°/12%/V111，深层岩 V81，沙 48°/V218，雪 V254。
+  var GRASS = [[106, 158, 72], [127, 178, 88], [86, 131, 57], [69, 110, 46]];
+  var DIRT = [[121, 85, 58], [150, 108, 74], [185, 133, 92], [89, 61, 41]];
+  var STONE = [[133, 131, 123], [157, 155, 146], [110, 108, 99], [93, 91, 82]];
+  var DEEP = [[81, 81, 86], [101, 101, 106], [61, 61, 67], [47, 47, 55]];
+  var SAND = [[218, 207, 163], [227, 219, 176], [205, 190, 146], [185, 168, 124]];
+  var SNOW = [[247, 250, 253], [255, 255, 255], [228, 238, 247], [206, 219, 232]];
+  var WATER = [[41, 96, 148], [58, 118, 172], [31, 78, 124], [22, 62, 102]];
   var GOLD = [[246, 207, 91], [255, 233, 138], [209, 166, 46], [171, 132, 31]];
   var ORE_GOLD = [[245, 197, 66], [255, 231, 122], [198, 148, 26]];
   var ORE_IRON = [[216, 179, 150], [238, 205, 178], [168, 131, 104]];
@@ -50,64 +57,79 @@
     return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
   }
   function blank() { return new Uint8ClampedArray(LOG * LOG * 4); }
+  function fill(d, c) {
+    for (var i = 0; i < d.length; i += 4) { d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = 255; }
+    return d;
+  }
   function set(d, x, y, c, a) {
     if (x < 0 || y < 0 || x >= LOG || y >= LOG) return;
     var i = (y * LOG + x) * 4;
     d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = a == null ? 255 : a;
   }
-  /** 颗粒底：两层哈希混出"大小颗粒交错"的地面，不是电视雪花 */
-  function grain(pal, s) {
-    var d = blank();
-    for (var y = 0; y < LOG; y++) {
-      for (var x = 0; x < LOG; x++) {
-        var n = rnd(x, y, s) * 0.62 + rnd(x >> 1, y >> 1, s + 17) * 0.38;
-        set(d, x, y, n < 0.22 ? pal[1] : n < 0.78 ? pal[0] : n < 0.93 ? pal[2] : pal[3]);
+  /** 底色铺满 + 盖几片连片的斑：spec = [[占全格的百分比, 调色板序号, 宽, 高], …]。
+   *  先铺底再盖斑，所以覆盖永远是 100%——原版的实心块四边不留一个透明像素。
+   *  为什么按**目标占比**铺而不是按片数撒：按片数撒时后一档会盖掉前一档，
+   *  四档撒完实测底色还剩 63%，而原版 dirt 是 42/27/15/13——底色占七成就是"一片脏"，
+   *  不是石头。所以每一档只往还没被占过的像素上落，落够配额就停，
+   *  档位配比于是可以直接照抄原版量出来的那张表。
+   *  落点仍然走**网格 + 确定性洗牌**：纯随机撒会成团，网格摊得开又逐位可重现。 */
+  function blot(pal, s, spec) {
+    var d = fill(blank(), pal[0]);
+    var used = new Uint8Array(LOG * LOG);
+    for (var k = 0; k < spec.length; k++) {
+      var target = Math.round(LOG * LOG * spec[k][0] / 100);
+      var c = pal[spec[k][1]], pw = spec[k][2], ph = spec[k][3];
+      if (target <= 0) continue;
+      var gx = Math.ceil(LOG / pw), gy = Math.ceil(LOG / ph), slots = [];
+      for (var q = 0; q < gx * gy; q++) slots.push(q);
+      for (var i = slots.length - 1; i > 0; i--) {          // 确定性洗牌：同种子同图
+        var j = (rnd(i, k * 977 + s, 5) * (i + 1)) | 0, t = slots[i]; slots[i] = slots[j]; slots[j] = t;
+      }
+      var got = 0;
+      for (var n = 0; n < slots.length && got < target; n++) {
+        var ci = slots[n], x = (ci % gx) * pw, y = ((ci / gx) | 0) * ph;
+        x += (rnd(ci, s, k + 1) * 2) | 0; y += (rnd(ci + 5, s, k + 1) * 2) | 0;   // 落点抖一格，别露出网格
+        for (var yy = 0; yy < ph && got < target; yy++) for (var xx = 0; xx < pw; xx++) {
+          // 斑缺一两个角：整块矩形是"贴上去的花纸"，缺角才是"石头上的色斑"
+          if (pw > 1 && rnd(xx, yy, s + k * 31) < 0.10) continue;
+          var px = ((x + xx) % LOG + LOG) % LOG, py = ((y + yy) % LOG + LOG) % LOG;
+          if (used[py * LOG + px]) continue;                 // 已被前一档占过：让位，不盖
+          used[py * LOG + px] = 1; got++;
+          set(d, px, py, c);
+        }
       }
     }
     return d;
   }
 
   function grassTop() {
-    var d = grain(GRASS, 1);
-    for (var k = 0; k < 10; k++) {
-      var x = (rnd(k, 1, 3) * LOG) | 0, y = (rnd(k, 2, 3) * (LOG - 2)) | 0;
-      set(d, x, y, GRASS[1]);
-      if (rnd(k, 3, 3) > 0.4) set(d, x, y + 1, GRASS[1]);
-      if (rnd(k, 4, 3) > 0.7) set(d, x + 1, y, GRASS[2]);
-    }
-    return d;
+    // 原版草顶是灰阶 + 生物群系乘色；我们没有乘色图，直接把乘完的结果画进格子里。
+    // 档位照抄原版 grass_block_top 的实测分布（35/28/18/12），明度档压在 V112~195：
+    // 对比再大就成了"发花的地板"，不是草地。
+    return blot(GRASS, 1, [[30, 1, 3, 2], [22, 2, 2, 2], [13, 3, 3, 1]]);
   }
   function dirtTile() {
-    var d = grain(DIRT, 2);
-    for (var k = 0; k < 5; k++) {
-      var x = (rnd(k, 11, 5) * (LOG - 1)) | 0, y = (rnd(k, 12, 5) * (LOG - 1)) | 0;
-      set(d, x, y, DIRT[2]); set(d, x + 1, y, DIRT[2]);
-      if (rnd(k, 13, 5) > 0.5) set(d, x, y + 1, DIRT[3]);
-      if (rnd(k, 14, 5) > 0.7) set(d, x + 1, y + 1, DIRT[1]);
-    }
-    return d;
+    // 原版 dirt 实测 42/27/15/13，就按这张表铺：底色占七成不是泥，是"一块脏"
+    return blot(DIRT, 2, [[27, 1, 3, 2], [15, 2, 4, 3], [13, 3, 2, 2]]);
   }
-  /** 草方块侧面：上半截是草皮，下缘参差（3..5 像素），再往下才是土 */
+  /** 草方块侧面：草皮只在最上 3~5 像素，下缘参差并往下滴一两格；再往下全是土。
+   *  量原版 grass_block_side：草绿色只占 2%，其余 98% 是那块橙褐土。 */
   function grassSide() {
     var d = dirtTile();
     for (var x = 0; x < LOG; x++) {
       var dep = 3 + ((rnd(x, 21, 7) * 3) | 0);
       for (var y = 0; y < dep; y++) {
-        var c = (y === dep - 1) ? GRASS[2] : (rnd(x, y, 22) < 0.28 ? GRASS[1] : GRASS[0]);
+        var c = (y === dep - 1) ? GRASS[2] : (rnd(x, y, 22) < 0.3 ? GRASS[1] : GRASS[0]);
         set(d, x, y, c);
       }
-      if (rnd(x, 23, 7) > 0.7) set(d, x, dep, GRASS[2]);
+      if (rnd(x, 23, 7) > 0.62) set(d, x, dep, GRASS[2]);      // 草须往下滴一格
+      if (rnd(x, 24, 7) > 0.88) set(d, x, dep + 1, GRASS[3]);
     }
     return d;
   }
   function snowTop() {
-    var d = grain(SNOW, 8);
-    for (var k = 0; k < 8; k++) {
-      var x = (rnd(k, 31, 11) * LOG) | 0, y = (rnd(k, 32, 11) * LOG) | 0;
-      set(d, x, y, SNOW[1]);
-      if (rnd(k, 33, 11) > 0.6) set(d, x + 1, y, SNOW[2]);
-    }
-    return d;
+    // 原版 snow.png 三档 46/30/24，明度全挤在 247~255：雪面靠的是极小的明度差，不是花斑
+    return blot(SNOW, 8, [[30, 1, 4, 3], [24, 2, 3, 2]]);
   }
   function snowSide() {
     var d = dirtTile();
@@ -120,46 +142,33 @@
     return d;
   }
   function sandTile() {
-    var d = grain(SAND, 9);
-    for (var k = 0; k < 7; k++) {
-      var x = (rnd(k, 51, 17) * LOG) | 0, y = (rnd(k, 52, 17) * LOG) | 0;
-      set(d, x, y, SAND[2]);
-      if (rnd(k, 53, 17) > 0.5) set(d, x + 1, y, SAND[3]);
-    }
-    return d;
+    // 原版 sand 实测 42/26/23/4（四档），沙的"颗粒感"来自档数而不是对比
+    return blot(SAND, 9, [[23, 1, 3, 2], [26, 2, 2, 2], [5, 3, 2, 1]]);
   }
+  /** 石：4 个色、连片斑、几道裂纹。原版的 stone 整张只有 4 档，实测 46/28/20/7；
+   *  我们以前用纯灰 #7f7f7f 那组加逐像素噪声，山坡上就成了一片水泥味的灰。 */
   function stoneTile() {
-    var d = grain(STONE, 10);
-    for (var k = 0; k < 3; k++) {
-      var x = (rnd(k, 61, 19) * 13) | 0, y = (rnd(k, 62, 19) * 11) | 0;
+    var d = blot(STONE, 10, [[28, 2, 3, 2], [20, 1, 2, 2], [7, 3, 2, 1]]);
+    for (var k = 0; k < 3; k++) {                     // 裂纹：一条两到四格的暗色折线
+      var x = 1 + ((rnd(k, 61, 19) * (LOG - 4)) | 0), y = 1 + ((rnd(k, 62, 19) * (LOG - 5)) | 0);
       for (var i = 0; i < 4; i++) {
-        set(d, x, y, STONE[2]);
-        if (rnd(k, i, 63) > 0.6) set(d, x + 1, y, STONE[2]);
-        y += 1;
+        set(d, x, y, STONE[3]);
+        if (rnd(k, i, 63) > 0.5) set(d, x + 1, y, STONE[2]);
+        y += 1; if (rnd(k, i, 64) > 0.6) x += 1;
       }
     }
-    for (var k2 = 0; k2 < 4; k2++) set(d, (rnd(k2, 64, 19) * LOG) | 0, (rnd(k2, 65, 19) * LOG) | 0, STONE[1]);
     return d;
   }
   function deepTile() {
-    var d = grain(DEEP, 11);
-    for (var k = 0; k < 6; k++) set(d, (rnd(k, 71, 23) * LOG) | 0, (rnd(k, 72, 23) * LOG) | 0, DEEP[1]);
-    return d;
+    // 原版 deepslate 实测 30/27/23/10/9：底色是最亮的那档，暗档反而铺开——深岩是"压暗的花岗"，不是黑石头
+    return blot(DEEP, 11, [[27, 2, 3, 2], [32, 1, 2, 2], [10, 3, 2, 1]]);
   }
   function waterTile() {
-    var d = grain(WATER, 12);
-    for (var y = 0; y < LOG; y++) {
-      if (rnd(y, 81, 29) < 0.45) {
-        var x0 = (rnd(y, 82, 29) * 12) | 0, len = 3 + ((rnd(y, 83, 29) * 5) | 0);
-        for (var x = x0; x < x0 + len && x < LOG; x++) {
-          set(d, x, y, rnd(x, y, 84) < 0.5 ? WATER[1] : WATER[0]);
-        }
-      }
-      if (rnd(y, 85, 29) < 0.3) set(d, (rnd(y, 86, 29) * LOG) | 0, y, WATER[2]);
-    }
-    return d;
+    // 原版 water_still 四档 40/38/14：以前只撒了几条横波纹，量出来 88% 是一整块死蓝
+    // 6×1 的横条斑：既保住"水面是横着流动"的方向感，又把明暗摊到原版的配比
+    return blot(WATER, 12, [[38, 1, 6, 1], [14, 2, 3, 2]]);
   }
-  /** 矿石 = 石头底 + 几簇矿脉。矿脉只有外观意义：共识只认"这一带是矿"。 */
+  /** 矿石 = 石头底 + 几簇矿粒。矿粒只有外观意义：共识只认"这一带是矿"。 */
   function oreTile(ore, s, count) {
     var d = stoneTile();
     for (var k = 0; k < count; k++) {
@@ -173,17 +182,19 @@
     }
     return d;
   }
+  /** 圆石：4×4 的卵石 + 缝。量原版 cobblestone：6 个色，缝 [82,82,82]、面 [136,135,136]。
+   *  我们保留它的低饱和（石头家族饱和 ≤3%），但整块压暖一档，和 STONE 同一个岩性。 */
   function cobbleTile(mossy) {
-    var d = blank();
-    for (var i = 0; i < d.length; i += 4) { d[i] = 92; d[i + 1] = 92; d[i + 2] = 92; d[i + 3] = 255; }
+    var d = fill(blank(), [104, 102, 95]);
     for (var ry = 0; ry < 4; ry++) {
       for (var rx = 0; rx < 4; rx++) {
         var ox = rx * 4 + ((ry & 1) ? 2 : 0), oy = ry * 4;
-        var v = 108 + ((rnd(rx, ry, 101) * 40) | 0);
+        var v = 118 + ((rnd(rx, ry, 101) * 34) | 0);
         for (var y = 0; y < 4; y++) {
           for (var x = 0; x < 4; x++) {
             if ((x === 0 || x === 3) && (y === 0 || y === 3)) continue;
-            set(d, (ox + x) & 15, oy + y, y === 0 ? [v + 22, v + 22, v + 22] : y === 3 ? [v - 26, v - 26, v - 26] : [v, v, v]);
+            set(d, (ox + x) & 15, oy + y,
+              y === 0 ? [v + 20, v + 19, v + 16] : y === 3 ? [v - 22, v - 22, v - 25] : [v, v, v - 3]);
           }
         }
       }

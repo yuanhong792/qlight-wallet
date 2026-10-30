@@ -22,15 +22,24 @@ rel = re.compile(r'\b(?P<k>src|href)="(?P<v>(?!https?:|#|data:|\.\.)[^"]+)"')
 
 
 def to_ui(m):
-    return '%s="../ui/%s"' % (m.group("k"), m.group("v"))
+    v = m.group("v")
+    # 对拍页最大的假信号来自缓存：改了 ui/*.js、页面里那行 src 却没变，浏览器继续跑旧的那份，
+    # 看上去就像"改了没效果"。用文件 mtime 当版本号——改了必然变，没改就不会白重画。
+    stem, ext = os.path.splitext(v)
+    if ext in (".js", ".css"):
+        try:
+            v = "%s?v=%d" % (v, int(os.path.getmtime(os.path.join(UI, v))))
+        except OSError:
+            pass
+    return '%s="../ui/%s"' % (m.group("k"), v)
 
 
 src = open(os.path.join(UI, "index.html"), encoding="utf-8").read()
 page = rel.sub(to_ui, src)
 stub = '<script src="__stub.js?v=%d"></script>\n' % int(time.time())
-if "<script src=\"../ui/i18n.js\"></script>" in page:
-    page = page.replace("<script src=\"../ui/i18n.js\"></script>",
-                        stub + "<script src=\"../ui/i18n.js\"></script>", 1)
+i18n_tag = re.search(r'<script src="\.\./ui/i18n\.js[^"]*"></script>', page)
+if i18n_tag:
+    page = page[:i18n_tag.start()] + stub + i18n_tag.group(0) + page[i18n_tag.end():]
 else:
     raise SystemExit("没找到 i18n.js 的 script 标签，注入点变了——去 make-preview.py 里对齐 index.html")
 

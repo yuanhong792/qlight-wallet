@@ -138,8 +138,10 @@ let planetCtl = null, planetBooting = false;
 
 function planetShouldRun() {
   // 只看"第一人称世界开没开"：背景地球和它是两个 WebGL 上下文，同帧必掉。
+  // 俯冲进场的那 0.9 秒例外——世界正在淡入，背后还得是那颗还在转的球。
   // 窗口被遮住不在这儿判——那时 rAF 本来就不发帧，交给下面的 visibilitychange 重新起链。
-  return $("w3d").hidden;
+  const w = $("w3d");
+  return w.hidden || w.classList.contains("dive-in");
 }
 
 async function mountPlanetBackdrop() {
@@ -177,11 +179,98 @@ function syncPlanetBackdrop() {
   else planetCtl.stop();
 }
 
+// —— 进场俯冲：从轨道落到自己那块地上 ——
+// 「进入世界没有进入动画」：这一款游戏卖的是"你拥有一格真实存在的地"，
+// 第一眼却是一次 view→view 的切换，那块地有多小、在地球上多远，一概读不出来。
+// 所以进场改成三拍：太空里的球 → 俯冲到那一格的正上方 → 第一人称淡入。
+// 俯冲整段跑在背景地球这一层上，第一人称上下文要等它结束才创建（两个上下文同帧必掉）。
+const DIVE_SEC = 3.4;         // 再长就成了"等待动画"，再短读不出"从太空来"
+// 落点高度由贴图说话：随包的全球影像是 4096×2048 ≈ 9.7 公里/像素，
+// 再往下俯冲屏幕宽度只剩几个纹理像素，最后 1 秒会糊成一团灰绿（实测过 dist 1.0075 ≈ 48 公里：整屏 3 个纹理像素）。
+// 1.25 ≈ 1600 公里是这颗球的分辨率地板——那一帧还认得出山东半岛和渤海，落地交给第一人称淡入这一拍完成。
+const DIVE_DIST = 1.25;
+
+let diveRun = null;
+let worldOpenSeq = 0;   // 进场令牌的号：见 openWorld3D
+
+/** 一格 → 真实经纬度。HUD 的读数和俯冲的落点必须走同一个公式，
+ *  否则"镜头落在你站的那一格"和屏幕上念出来的坐标不是同一处。 */
+function cellLatLng(x, z) {
+  const E = window.QLEarth;
+  if (!E || !E.bbox) return null;
+  const [w, so, e, n] = E.bbox;
+  return {
+    lat: n - ((z + 0.5) / QLWorld.H) * (n - so),
+    lon: w + ((x + 0.5) / QLWorld.W) * (e - w),
+  };
+}
+
+/** 把背景地球的相机从当前轨道位推到目标那一格的正上方。
+ *  点击或按键当场落地：动画是加分，谁都不该被它挡住第二次进入。 */
+let diveKick = null;      // 窗口中途回到前台时，把断了的那条 rAF 链重新点着
+function worldDiveIn(to) {
+  const ctl = planetCtl;
+  if (!ctl || !to || document.hidden) return Promise.resolve(false);
+  if (diveRun) return diveRun;
+  document.body.classList.add("dive-run");   // 侧栏和面板让位，这一场只剩星球
+  diveRun = new Promise((done) => {
+    const from = { lat: ctl.view.lat, lon: ctl.view.lon, dist: ctl.view.dist, bias: ctl.biasX };
+    // 相机按 world 空间摆位，地球网格自己转着（earth.rotation.y），所以"对准东经 120.6"
+    // 要给 view.lon 加上这个转角，否则落点偏到赤道方向几十度外——自转在俯冲期间冻住，
+    // 所以这个偏移整段是常量。
+    const tgt = { lat: to.lat, lon: to.lon + ctl.earth.rotation.y * 180 / Math.PI };
+    // 经度走短弧：席位在地球背面时，把 104° 线性插值到 -170° 会一路向西跨过整个大西洋，
+    // 看着像镜头走反了。角度差折到 ±180 以内，永远朝近的那边转。
+    const dLon = ((tgt.lon - from.lon + 540) % 360) - 180;
+    const spin = ctl.spin;
+    ctl.spin = 0;     // 俯冲期间自转必须停：3 秒转 6° 多，落点就不是那一格，而是它东边几十公里
+    ctl.start();
+    const t0 = performance.now();
+    let skip = false, rafId = 0;
+    const off = () => { skip = true; };
+    addEventListener("pointerdown", off);
+    addEventListener("keydown", off);
+    const end = () => {
+      removeEventListener("pointerdown", off);
+      removeEventListener("keydown", off);
+      ctl.spin = spin;
+      ctl.cam.fov = 38;
+      ctl.cam.updateProjectionMatrix();
+      diveKick = null;
+      diveRun = null;
+      done(true);
+    };
+    const step = () => {
+      rafId = 0;
+      const k = skip ? 1 : Math.min(1, (performance.now() - t0) / (DIVE_SEC * 1000));
+      // 先慢后快、贴地再收住：线性插值只是"变焦"，读不出俯冲
+      const e = k < 0.62
+        ? Math.pow(k / 0.62, 1.9) * 0.62
+        : 0.62 + (1 - Math.pow(1 - (k - 0.62) / 0.38, 2)) * 0.38;
+      const l = (a, b) => a + (b - a) * e;
+      ctl.view.lat = l(from.lat, tgt.lat);
+      ctl.view.lon = from.lon + dLon * e;
+      ctl.view.dist = Math.max(DIVE_DIST, l(from.dist, DIVE_DIST));
+      ctl.biasX = l(from.bias, 0);      // 封面把球推到版面右侧留出文字，俯冲要回到画面正中
+      ctl.cam.fov = 38 + 26 * Math.sin(e * Math.PI);   // 中段张角最大 = 速度感
+      ctl.cam.updateProjectionMatrix();
+      if (k < 1) { tick(); return; }
+      end();
+    };
+    // 后台标签页不发帧：进度按 performance.now() 算，回到前台由 visibilitychange 重新点着这条链
+    const tick = () => { if (!rafId) rafId = requestAnimationFrame(step); };
+    diveKick = tick;
+    tick();
+  });
+  return diveRun;
+}
+
 document.addEventListener("visibilitychange", () => {
   // 隐藏时停的是"循环本身"：rAF 不发帧，那条 start() 里排下去的链就断了，
   // 光靠 running 标记回来时接不上，所以显式 stop → 再 visible 时 start 重新起链。
   if (document.hidden) { if (planetCtl) planetCtl.stop(); return; }
   syncPlanetBackdrop();
+  if (diveKick) diveKick();
 });
 
 // 外壳偏好（prefs.json）：欢迎页还要不要弹、引导走到哪一步。
@@ -616,6 +705,8 @@ let wSel = ""; // 选中实体 id（空 = 未选中）
 let wProof = { id: "", json: "" }; // 展开的可验证记录（2 秒轮询重渲染时不能丢）
 let w3 = null; // 第一人称体素编辑器（惰性创建）
 let w3VeilDone = false; // 封面已淡入真实画面（每次进世界重置）
+let w3Dived = false;    // 这一次进场走过太空俯冲：淡入的是世界这一层，不是题图封面
+let diveFade = 0;       // 淡入收尾的定时器：中途退出要能撤掉
 
 const worldActive = () => !$("page-world").classList.contains("hidden");
 // 旧世界账本是"解释"不是"故障"：写入被重放拒掉时不要甩一行红色原始报错，
@@ -1897,7 +1988,18 @@ function ensureWorld3D() {
         // 而不是"封面 → 同一片地方"。图集是本地现画的，一帧就是完整画面，不需要等纹理。
         if (!w3VeilDone) {
           w3VeilDone = true;
-          requestAnimationFrame(() => $("w3d-veil").classList.add("gone"));
+          const w = $("w3d");
+          if (w.classList.contains("dive-in")) {
+            // 俯冲刚演完，这一层要淡进来而不是啪一下：淡的过程中背后还是那颗球
+            w.classList.add("live");
+            diveFade = setTimeout(() => {
+              w.classList.remove("dive-in", "live");
+              document.body.classList.remove("dive-run");
+              syncPlanetBackdrop();
+            }, 950);
+          } else {
+            requestAnimationFrame(() => $("w3d-veil").classList.add("gone"));
+          }
         }
         const n = performance.now();
         if (n - w3HudAt > 120) { w3HudAt = n; renderW3Hud(s); stationWatch(s); }
@@ -2058,6 +2160,9 @@ async function w3Break(ent) {
 }
 
 async function openWorld3D() {
+  // 进场是有 3.4 秒的：这一串 await 里用户随时可能切页（俯冲期间壳层只是透明，照样点得着）。
+  // 每次开/关都换号，回到前台的那次进场发现自己号过期了就放弃——不然"退出世界"之后世界会自己弹回来。
+  const seq = ++worldOpenSeq;
   if (!worldSnap) {
     try {
       await loadWorld();
@@ -2066,21 +2171,38 @@ async function openWorld3D() {
       return;
     }
   }
+  // 俯冲的落点就是出生点：从太空落到"我马上要站上去的那一格"的正上方，
+  // 而不是落到一个抽象的球上。第二次进世界（人还在原地）不再演一遍。
+  let spawn = w3Spawned ? null : pickSpawn(Number($("ent-x").value) || 128, Number($("ent-z").value) || 128);
+  if (spawn) {
+    if (!planetCtl) await mountPlanetBackdrop();
+    w3Dived = await worldDiveIn(cellLatLng(spawn.x, spawn.z));
+    if (seq !== worldOpenSeq) { w3Dived = false; return; }   // 俯冲期间被关掉：这一趟作废，别再 unhide
+  } else {
+    w3Dived = false;
+  }
   $("w3d").hidden = false;
   document.body.classList.add("w3d-on");
   syncPlanetBackdrop();   // 第一人称自己就是一个 WebGL 上下文，背景地球让帧
-  // 每次进世界都从封面开始：封面是这片地的黄昏，淡入后落在同一个地方
-  $("w3d-veil").classList.remove("gone");
+  const veil = $("w3d-veil");
+  if (w3Dived) {
+    // 俯冲已经把"落地"这一下演完了，题图这一层再压上去就是第二道门：
+    // 改成第一人称整层淡入，背后那颗球在它淡到位之前继续转着。
+    veil.classList.add("gone");
+    $("w3d").classList.add("dive-in");
+  } else {
+    // 每次进世界都从封面开始：封面是这片地的黄昏，淡入后落在同一个地方
+    veil.classList.remove("gone");
+  }
   w3VeilDone = false;
   if (!ensureWorld3D()) { closeWorld3D(); return; }
   buildW3Hotbar();
   w3Hint();
-  if (!w3Spawned) {
-    const c = pickSpawn(Number($("ent-x").value) || 128, Number($("ent-z").value) || 128);
-    w3.jumpTo(c.x, c.z, c.layer == null ? null : c.layer);
+  if (spawn) {
+    w3.jumpTo(spawn.x, spawn.z, spawn.layer == null ? null : spawn.layer);
     // 面向这块地视野最开的方向：出生第一眼就要是"景"，不是一堵山壁
-    if (c.yaw != null) w3.setView(c.yaw, -0.05);
-    spawnAnchor = c;
+    if (spawn.yaw != null) w3.setView(spawn.yaw, -0.05);
+    spawnAnchor = spawn;
     w3Spawned = true;
   }
   syncWorld3D();
@@ -2092,11 +2214,18 @@ async function openWorld3D() {
 }
 
 function closeWorld3D() {
-  if ($("w3d").hidden && !w3) return;
+  // 俯冲还在跑的时候 #w3d 仍是 hidden、w3 还没建：这一趟也必须能关掉，
+  // 否则 dive-run 那层透明遮罩留在身上，整个壳就再也回不来了。
+  if ($("w3d").hidden && !w3 && !diveRun) return;
+  worldOpenSeq++;       // 作废一切还在 await 里等俯冲的进场
   shopClose();
   rainRun(false);
   if (w3) w3.close();
   $("w3d").hidden = true;
+  // 俯冲演到一半就退出：这三层透明/遮罩状态必须一次擦干净，否则壳会一直看不见
+  $("w3d").classList.remove("dive-in", "live");
+  document.body.classList.remove("dive-run");
+  clearTimeout(diveFade);
   document.body.classList.remove("w3d-on");
   syncPlanetBackdrop();   // 世界关了，背景地球重新满帧转起来
   $("w3d-pos").hidden = true;

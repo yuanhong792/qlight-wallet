@@ -216,6 +216,10 @@
       dugMap: {}, dugSig: '',
       bufG: gl.createBuffer(), nG: 0,
       bufE: gl.createBuffer(), nE: 0, bufH: gl.createBuffer(), nH: 0,      bufP: gl.createBuffer(), nP: 0, bufS: gl.createBuffer(), nS: 0, bufStar: gl.createBuffer(), nStar: 0,
+      // 第一人称的手：只在这条缓冲里写，坐标是**相机空间**（x 右 / y 上 / z 朝眼睛）
+      bufHand: gl.createBuffer(), nHand: 0, bufHandT: gl.createBuffer(), nHandT: 0,
+      arrHand: new Float32Array(60 * 36), arrHandT: new Float32Array(36),
+      punchSeen: -1, punchAt: -9,
       // 资源层单独一条缓冲：采伐后只重铺这一层，不动 16 种签名的实体网格
       bufR: gl.createBuffer(), nR: 0,
       // 铸块砖 + QLOR 数字雨：只有这一层自己的缓冲。出块的动画不该重铺 64×64 地形。
@@ -318,6 +322,21 @@
       }
       return deepTile(cx, cz, depth);
     }
+    /** 没挖过的坡面：草皮一行 → 土被数行 → 再往下才是露头岩基。
+     *  这一条只管**外观**。挖开的坑壁不套它——那里按账本的三带（1–3 土 / 4–9 石 / 10+ 矿）
+     *  如实长，玩家要看的就是"这一铲到了哪一层"。原版《我的世界》也是这个次序：
+     *  山的外面是土与草，石头只有往下挖才看得见；把石带贴到没动过的山坡上，
+     *  整片地就成了一片灰（「土地应该是土褐色，不是灰色」）。 */
+    var SOIL_LOOK = 4;                 // 视觉土被厚度（层＝米）：不参与任何判据
+    function flankTile(cx, cz, kind, depth) {
+      if (kind === 0) return TIL.WATER;
+      if (depth === 0) {
+        if (kind === 2) return TIL.SNOW_SIDE;
+        if (kind === 1 || kind === 4) return TIL.SAND;
+        return TIL.GRASS_SIDE;
+      }
+      return depth <= SOIL_LOOK ? TIL.DIRT : TIL.STONE;
+    }
 
     // —— 顶点写入（pos3 + color3 交错）；越界立即停笔，绝不越写缓冲区
     var vp = 0, arr = null;
@@ -346,8 +365,8 @@
       quad([x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0], c, 0.5, N_DOWN);    // 底
       quad([x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0], c, 0.8, N_N);       // 北 -z
       quad([x1, y0, z1, x0, y0, z1, x0, y1, z1, x1, y1, z1], c, 0.8, N_S);       // 南 +z
-      quad([x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0], c, 0.65, N_E);      // 东 +x
-      quad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], c, 0.65, N_W);      // 西 -x
+      quad([x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0], c, 0.6, N_E);      // 东 +x
+      quad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], c, 0.6, N_W);      // 西 -x
     }
 
     /** 一格某一面的四个角：k = 0 北 / 1 南 / 2 东 / 3 西，从 ya 到 yb。地形侧壁按"草皮 + 土壁"分两段画。 */
@@ -369,8 +388,38 @@
       var col = tile % COLS, row = (tile / COLS) | 0;
       return [(col + UV_E + u * (1 - 2 * UV_E)) / COLS, (row + UV_E + v * (1 - 2 * UV_E)) / ROWS];
     }
-    /** 贴图四边形：p 四点顺序与 uv 一一对应，绕向按几何法线自动翻（同 quad） */
-    function tquad(p, tile, shade, n) {
+    /** 这一格图集里**真正有画**的那块：物品图四周留透明边是画师的习惯（精灵不顶到格边），
+     *  但实心方块要把一整面贴满——整格铺过去，透明边被 alpha<0.5 discard，面上就空出
+     *  一条没有纹理的边（「石头的贴图还没有贴满」就是这个）。测一次包围盒，铺面时撑满。 */
+    var TBOX = false;
+    function measureBoxes() {
+      var src = global.QLSprites && global.QLSprites.atlas && global.QLSprites.atlas();
+      if (!src || typeof src.getContext !== 'function') return null;
+      var w = src.width, h = src.height, cell = w / COLS;
+      var d = src.getContext('2d').getImageData(0, 0, w, h).data, out = [];
+      for (var id = 0; id < COLS * ROWS; id++) {
+        var ox = (id % COLS) * cell, oy = ((id / COLS) | 0) * cell;
+        var x0 = -1, x1 = -1, y0 = -1, y1 = -1;
+        for (var y = 0; y < cell; y++) for (var x = 0; x < cell; x++) {
+          if (d[((oy + y) * w + ox + x) * 4 + 3] < 128) continue;
+          if (x0 < 0 || x < x0) x0 = x; if (x > x1) x1 = x;
+          if (y0 < 0 || y < y0) y0 = y; if (y > y1) y1 = y;
+        }
+        if (x0 < 0) continue;                     // 整格全空：不注册，照旧按整格铺
+        out[id] = [(ox + x0 - 0.5) / w, (oy + y0 - 0.5) / h,
+                   (ox + x1 + 1.5) / w, (oy + y1 + 1.5) / h];
+      }
+      return out;
+    }
+    function uvFit(tile, u, v) {
+      if (TBOX === false) TBOX = measureBoxes() || null;
+      var b = TBOX && TBOX[tile];
+      if (!b) return uvOf(tile, u, v);
+      return [b[0] + u * (b[2] - b[0]), b[1] + v * (b[3] - b[1])];
+    }
+    /** 贴图四边形：p 四点顺序与 uv 一一对应，绕向按几何法线自动翻（同 quad）；
+     *  fit = 按不透明包围盒铺满（实心方块），默认按整格（花/活物的十字面要留白） */
+    function tquad(p, tile, shade, n, fit) {
       if (tvp + 36 > tarr.length) return;
       var ax = p[3] - p[0], ay = p[4] - p[1], az = p[5] - p[2];
       var bx = p[6] - p[0], by = p[7] - p[1], bz = p[8] - p[2];
@@ -378,19 +427,19 @@
       var flip = dot < 0;
       var uv = [[0, 1], [1, 1], [1, 0], [0, 0]];
       function put(i) {
-        var q = uvOf(tile, uv[i][0], uv[i][1]);
+        var q = (fit ? uvFit : uvOf)(tile, uv[i][0], uv[i][1]);
         tvert(p[i * 3], p[i * 3 + 1], p[i * 3 + 2], q[0], q[1], shade);
       }
       var i1 = flip ? 3 : 1, i3 = flip ? 1 : 3;
       put(0); put(i1); put(2); put(0); put(2); put(i3);
     }
     function tcube(x0, y0, z0, x1, y1, z1, tile) {
-      tquad([x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1], tile, 1.0, N_UP);
-      tquad([x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0], tile, 0.5, N_DOWN);
-      tquad([x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0], tile, 0.8, N_N);
-      tquad([x1, y0, z1, x0, y0, z1, x0, y1, z1, x1, y1, z1], tile, 0.8, N_S);
-      tquad([x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0], tile, 0.65, N_E);
-      tquad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], tile, 0.65, N_W);
+      tquad([x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1], tile, 1.0, N_UP, 1);
+      tquad([x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0], tile, 0.5, N_DOWN, 1);
+      tquad([x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0], tile, 0.8, N_N, 1);
+      tquad([x1, y0, z1, x0, y0, z1, x0, y1, z1, x1, y1, z1], tile, 0.8, N_S, 1);
+      tquad([x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0], tile, 0.6, N_E, 1);
+      tquad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], tile, 0.6, N_W, 1);
     }
     /** 十字交叉面（花、活物）：两个互相垂直的竖面，任何角度都看得到 */
     function cross(cx, y0, cz, w, h, tile) {
@@ -401,6 +450,106 @@
 
     // 天然树的材质：与实体树共用图集里的树干/树叶两格（同一张画，不另起一套）
     var TRUNK_TILE = 16, LEAF_TILE = 17;
+
+    // —— 第一人称的双手 ——
+    // 手是相机自己的孩子：它的存在只说明一件事——屏幕后面站着一个 1.75 米的人。
+    // 所以顶点写在**相机空间**（x 右 / y 上 / z 朝眼睛），用一条没有平移的投影矩阵，
+    // 最后一遍画、关掉深度测试：手不参与世界的遮挡，也不吃距离雾。
+    // 摆幅只认实测速度 st.speed（站着不动不甩手），出拳 st.punch 一次挥 0.24 秒；
+    // 镜头一旦升到人的高度之上（俯瞰、拉远观察），手淡进天空并往下退出画面——
+    // 飘在三米高空的一双手不是"第一人称"，是穿帮。
+    var SKIN = [215, 180, 143], CUFF = [138, 95, 60], SLEEVE = [58, 69, 87];   // 袖子和旅人同一件斗篷
+    // 长方体的六个面：外法线 + 四个角的符号三元组（绕向由 quad 按法线自动翻）
+    var BOXF = [
+      [[1, 0, 0], [[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]]],
+      [[-1, 0, 0], [[-1, -1, 1], [-1, 1, 1], [-1, 1, -1], [-1, -1, -1]]],
+      [[0, 1, 0], [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]]],
+      [[0, -1, 0], [[-1, -1, 1], [1, -1, 1], [1, -1, -1], [-1, -1, -1]]],
+      [[0, 0, 1], [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]]],
+      [[0, 0, -1], [[1, -1, -1], [-1, -1, -1], [-1, 1, -1], [1, 1, -1]]],
+    ];
+    /** 依次绕 X、Y、Z 转（Z 最后：屏幕内的倾斜最直观） */
+    function rotv(rx, ry, rz, v) {
+      var cx = Math.cos(rx), sx = Math.sin(rx);
+      var y1 = v[1] * cx - v[2] * sx, z1 = v[1] * sx + v[2] * cx;
+      var cy = Math.cos(ry), sy = Math.sin(ry);
+      var x2 = v[0] * cy + z1 * sy, z2 = -v[0] * sy + z1 * cy;
+      var cz = Math.cos(rz), sz = Math.sin(rz);
+      return [x2 * cz - y1 * sz, x2 * sz + y1 * cz, z2];
+    }
+    /** 与地形同一套明度阶梯：顶亮、南北 0.8、东西 0.6、底 0.5
+     *  （0.8 / 0.6 是原版《我的世界》的面亮度比例，不是手感调参） */
+    function faceShade(n) {
+      if (n[1] > 0.5) return 1.0;
+      if (n[1] < -0.5) return 0.5;
+      return Math.abs(n[0]) > 0.5 ? 0.6 : 0.8;
+    }
+    /** 相机空间里一个转过的长方体：cube() 只会画轴对齐的，手要斜着伸向屏幕中线 */
+    function rbox(G, R, x, y, z, hx, hy, hz, c) {
+      for (var f = 0; f < 6; f++) {
+        var n = rotv(R[0], R[1], R[2], BOXF[f][0]), p = [], S = BOXF[f][1];
+        for (var i = 0; i < 4; i++) {
+          var s = S[i], v = rotv(R[0], R[1], R[2], [x + s[0] * hx, y + s[1] * hy, z + s[2] * hz]);
+          p.push(v[0] + G[0], v[1] + G[1], v[2] + G[2]);
+        }
+        quad(p, c, faceShade(n), n);
+      }
+    }
+    /** 眼睛离脚下那一列顶面几米：1.15 米起淡、3.2 米见底（与镜头抬离人身同步） */
+    function handVis() {
+      var cx = Math.max(0, Math.min(W - 1, st.x | 0)), cz = Math.max(0, Math.min(H - 1, st.z | 0));
+      var above = (st.y - EYE) - support(cx, cz);
+      return Math.max(0, Math.min(1, 1 - (Math.max(0, above - 1.15) / 2.05)));
+    }
+    function buildHands(now, ds) {
+      var vis = handVis();
+      st.nHand = 0; st.nHandT = 0;
+      if (vis <= 0.02) return;
+      var t = now / 1000;
+      if (st.punch !== st.punchSeen) { st.punchSeen = st.punch; st.punchAt = t; }
+      var sw = Math.sin((1 - Math.min(1, Math.max(0, (t - st.punchAt) / 0.24))) * Math.PI);
+      var amp = Math.min(0.17, st.speed * 0.055);
+      var idle = Math.sin(t * 1.1) * 0.012;                 // 静止时的一点呼吸起伏
+      var drop = (1 - vis) * 0.6;                            // 淡出时同时往下退出画面
+      // 白天系数自己乘进顶点色：这一遍不走 u_tint，才做得到"混进天空"而不是"混进黑色"
+      var lit = 0.55 + 0.45 * ds.day;
+      function col(c) {
+        var m = lit * vis;
+        return [c[0] * m + ds.sky[0] * 255 * (1 - vis),
+                c[1] * m + ds.sky[1] * 255 * (1 - vis),
+                c[2] * m + ds.sky[2] * 255 * (1 - vis)];
+      }
+      var G = [0.34, -0.44 + sw * 0.04 - drop, -0.46 - sw * 0.14];
+      var Rr = [0.16 + Math.sin(st.bobPhase) * amp + idle - sw * 0.62, 0.30,
+                -0.20 + Math.cos(st.bobPhase) * amp * 0.35];
+      var Rl = [0.16 - Math.sin(st.bobPhase) * amp - idle, -0.30,
+                0.20 - Math.cos(st.bobPhase) * amp * 0.35];
+      arr = st.arrHand; vp = 0;
+      var arms = [[G, Rr], [[-0.34, -0.44 - drop, -0.46], Rl]];
+      for (var a = 0; a < 2; a++) {
+        var g = arms[a][0], r = arms[a][1];
+        rbox(g, r, 0, 0.01, -0.10, 0.044, 0.044, 0.100, col(SLEEVE));    // 上臂
+        rbox(g, r, 0, 0.006, -0.212, 0.047, 0.047, 0.023, col(CUFF));    // 袖口
+        rbox(g, r, 0, -0.006, -0.282, 0.038, 0.041, 0.058, col(SKIN));   // 手掌
+      }
+      st.nHand = vp / 6;
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufHand);
+      gl.bufferData(gl.ARRAY_BUFFER, st.arrHand.subarray(0, vp), gl.DYNAMIC_DRAW);
+      // 手里拿的就是物品栏那一格：同一张图集，不为手感另画一份美术
+      var tilt = [-0.46, -0.34, 0.16 + sw * 0.45], hs = 0.10;
+      var CS = [[-1, -1], [1, -1], [1, 1], [-1, 1]], p = [];
+      for (var i = 0; i < 4; i++) {
+        var q = rotv(tilt[0], tilt[1], tilt[2], [CS[i][0] * hs, CS[i][1] * hs, 0]);
+        var w2 = rotv(Rr[0], Rr[1], Rr[2], [q[0] + 0.02, q[1] - 0.055, q[2] - 0.40]);
+        p.push(w2[0] + G[0], w2[1] + G[1], w2[2] + G[2]);
+      }
+      tarr = st.arrHandT; tvp = 0;
+      tquad(p, st.slot, 0.55 + 0.45 * ds.day,
+        rotv(Rr[0], Rr[1], Rr[2], rotv(tilt[0], tilt[1], tilt[2], [0, 0, 1])), 1);
+      st.nHandT = tvp / 6;
+      gl.bindBuffer(gl.ARRAY_BUFFER, st.bufHandT);
+      gl.bufferData(gl.ARRAY_BUFFER, st.arrHandT.subarray(0, tvp), gl.DYNAMIC_DRAW);
+    }
 
     /** 这一片区域要写多少个面：顶面 1 + 每个露出侧壁的层 + 天然树的 3 个盒子。
      *  先数后写，缓冲永远刚好装得下；深坑不会因为"预算用完"而缺半面墙。 */
@@ -448,11 +597,13 @@
             var nz = cz + (k === 0 ? -1 : k === 1 ? 1 : 0);
             var nl = level(nx, nz);
             if (nl >= lv) continue;
-            var sh = k < 2 ? 0.8 : 0.65;
+            var sh = k < 2 ? 0.8 : 0.6;
             var nrm = k === 0 ? N_N : k === 1 ? N_S : k === 2 ? N_E : N_W;
             for (var L = nl + 1; L <= lv; L++) {
+              // 挖过的列按账本三带贴坑壁；没挖过的坡按"土被盖岩基"贴——山的外面是土，不是石头
+              var fl = sv - L;
               tquad(sface(cx, cz, k, L, L + 1),
-                gold ? TIL.ERA_GOLD : sideTile(cx, cz, kind, sv - L), sh, nrm);
+                gold ? TIL.ERA_GOLD : (removed ? sideTile(cx, cz, kind, fl) : flankTile(cx, cz, kind, fl)), sh, nrm);
             }
           }
           // 天然树：与 2D 地图上同一个深色像点（同一趟分类，绝不两套判定）
@@ -970,6 +1121,37 @@
       gl.disable(gl.CULL_FACE);
       drawBuf(st.bufH, st.nH, gl.LINES);
       gl.enable(gl.CULL_FACE);
+
+      // 第一人称的双手：相机空间、最后一遍、关深度——手不参与世界的遮挡，也不吃雾。
+      buildHands(now, ds);
+      if (st.nHand) {
+        gl.disable(gl.DEPTH_TEST);
+        var mh = perspective(1.22, w / h, 0.02, 12);
+        gl.useProgram(prog);
+        gl.uniformMatrix4fv(U.vp, false, mh);
+        gl.uniform3f(U.eye, 0, 0, 0);
+        gl.uniform4f(U.tint, 1, 1, 1, 1);
+        gl.uniform3f(U.fog, ds.sky[0], ds.sky[1], ds.sky[2]);
+        gl.uniform2f(U.fogr, 100000, 100001);
+        drawBuf(st.bufHand, st.nHand, gl.TRIANGLES);
+        if (st.nHandT) {
+          gl.useProgram(progT);
+          gl.uniformMatrix4fv(UT.vp, false, mh);
+          gl.uniform3f(UT.eye, 0, 0, 0);
+          gl.uniform4f(UT.tint, 1, 1, 1, 1);
+          gl.uniform3f(UT.fog, ds.sky[0], ds.sky[1], ds.sky[2]);
+          gl.uniform2f(UT.fogr, 100000, 100001);
+          gl.uniform1i(UT.tex, 0);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+          gl.bindBuffer(gl.ARRAY_BUFFER, st.bufHandT);
+          gl.enableVertexAttribArray(AT_P); gl.vertexAttribPointer(AT_P, 3, gl.FLOAT, false, 24, 0);
+          gl.enableVertexAttribArray(AT_UV); gl.vertexAttribPointer(AT_UV, 2, gl.FLOAT, false, 24, 12);
+          gl.enableVertexAttribArray(AT_S); gl.vertexAttribPointer(AT_S, 1, gl.FLOAT, false, 24, 20);
+          gl.drawArrays(gl.TRIANGLES, 0, st.nHandT);
+        }
+        gl.enable(gl.DEPTH_TEST);
+      }
     }
 
 

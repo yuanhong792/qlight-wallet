@@ -473,6 +473,15 @@ body {
   transition: opacity 1.1s ease;
 }
 .w3d-veil.gone { opacity: 0; }
+/* 太空俯冲交接的那一层：世界这一层先整层透明，第一帧真的画出来以后再淡进来。
+   .w3d 自己的深色底跟着整层一起淡，所以淡的过程中露出来的是背后那颗还在转的地球，
+   不是"一块没上色的地"。 */
+.w3d.dive-in { opacity: 0; transition: opacity .9s ease; }
+.w3d.dive-in.live { opacity: 1; }
+/* 俯冲期间整个壳让位：半透明遮罩底下漏出的侧栏和面板会把这场戏压成一张网页截图，
+   "从太空进来"要干净到只剩那颗星球。 */
+.view.shell { transition: opacity .5s ease; }
+body.dive-run .view.shell { opacity: 0; }
 /* 电影感只加这一层：暗角收边 + 地平线以下压一点暖，画面就有"取景"而不是"截图" */
 .w3d-grade {
   position: absolute; inset: 0; z-index: 1; pointer-events: none;
