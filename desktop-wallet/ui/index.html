@@ -229,7 +229,27 @@
 
           <div class="panel-title sub">
             <span data-i18n="world.map">世界地图</span>
-            <span class="tag" data-i18n="world.map.tag">本地确定性渲染</span>
+            <span class="tag" data-i18n="world.map.tag">整颗地球 · 本地确定性渲染</span>
+          </div>
+          <div class="map-frame earth-frame">
+            <canvas id="earth-canvas" width="512" height="256" aria-label="earth"></canvas>
+            <span class="map-corner tl"></span><span class="map-corner tr"></span>
+            <span class="map-corner bl"></span><span class="map-corner br"></span>
+          </div>
+          <div class="earth-legend" id="earth-legend">—</div>
+          <div class="muted small" data-i18n="world.map.note"></div>
+          <div class="panel-title sub">
+            <span data-i18n="world.seat.parcel">席位那块地</span>
+            <span class="tag" data-i18n="world.seat.parcel.tag">8.96 公里 · 本地现算</span>
+          </div>
+          <div class="parcel-strip">
+            <canvas id="parcel-canvas" width="256" height="256" aria-label="parcel"></canvas>
+            <div class="parcel-facts" id="parcel-facts">—</div>
+          </div>
+
+          <div class="panel-title sub">
+            <span data-i18n="world.parcel">脚下这块地</span>
+            <span class="tag" data-i18n="world.parcel.tag">256×256 格 · 可放置</span>
           </div>
           <div class="map-frame">
             <canvas id="world-canvas" width="256" height="256" aria-label="world"></canvas>
@@ -237,7 +257,7 @@
             <span class="map-corner bl"></span><span class="map-corner br"></span>
           </div>
           <div class="world-cursor" id="world-cursor">X – · Z –</div>
-          <div class="muted small" data-i18n="world.map.note"></div>
+          <div class="muted small" data-i18n="world.walk.note"></div>
 
           <details class="mine-adv">
             <summary data-i18n="world.editor.adv">高级：按坐标放置</summary>

@@ -194,13 +194,13 @@
   </div>
   <div class="dl">
     <a class="btn primary" href="https://github.com/yuanhong792/qlight-wallet/releases/latest/download/QLight-Wallet.dmg">
-      ⬇ 下载 macOS 版 <small>.dmg · 18 MB · Apple Silicon</small>
+      ⬇ 下载 macOS 版 <small>.dmg · 21 MB · Apple Silicon</small>
     </a>
     <a class="btn" href="https://github.com/yuanhong792/qlight-wallet/releases/latest/download/QLight-Wallet-Windows.zip">
-      ⬇ 下载 Windows 版 <small>.zip · 9.9 MB · Win 10/11 x64</small>
+      ⬇ 下载 Windows 版 <small>.zip · 13 MB · Win 10/11 x64</small>
     </a>
   </div>
-  <p class="dl-note">免安装绿色版 · 数据本地加密存储 · 无需注册任何账号<br>包比上一版大 5 MB：崂山实测高程与全球高程／影像（2.9 MB）随包分发，地形不联网下载——离线也是同一片地。</p>
+  <p class="dl-note">免安装绿色版 · 数据本地加密存储 · 无需注册任何账号<br>实测高程窗口与全球高程／影像（2.9 MB）随包分发，地形不联网下载——离线也是同一片地。<b>v0.4.7 比上一版大 2.7 MB，原因不体面但要说清</b>：席位规则要在共识侧读那张 2 MiB 全球网格（<code>include_bytes!</code>），而前端画世界地图用的还是 <code>ui/</code> 里同一份文件——<b>同一张网格在包里存了两份</b>。功能上没影响，纯浪费；去重排在待办里（#59）。</p>
 </header>
 
 <section class="section wrap" id="shots">
@@ -287,7 +287,7 @@
       <div class="axiom">
         <span class="eq"><code>world = render(种子, 规则, 历史)</code></span>
         <p>它与区块链的状态转移 <code>state(n+1) = f(state(n), tx(n))</code> 是<b>同一个数学对象</b>，不是类比。
-        链就是世界的存档：<b>大地</b>是一次公开卫星测量（SRTM 30 米 / Copernicus GLO-30 在<b>崂山东麓 · 青岛 · 黄海之滨</b> 8.96 km 窗口上烘焙成的 65536 字节，1 格 = 35 米真实地面，主峰 1092 m），<b>地表</b>——湿度、植被、矿脉——才混入全部块 VRF，历史 = 你挖出的每一个块。
+        链就是世界的存档：<b>大地</b>是这颗地球本身——随包的 2 MiB 全球高程网格把它切成 <b>2,097,152</b> 份、每份约 19.6 公里，其中 <b>615,081</b> 份落在陆地上；本页渲染的这 8.96 km 窗口（SRTM 30 米 / Copernicus GLO-30 实测高程烘焙成 65536 字节，1 格 = 35 米真实地面，主峰 1092 m）只是其中<b>已经用实测数据烤过的一小片</b>——它比星球层的一格还小。<b>地表</b>——湿度、植被、矿脉——才混入全部块 VRF，历史 = 你挖出的每一个块。
         <b>山的位置永远不动，植被与地貌随链生长</b>——地面若每出一个块就漂移一次，
         <code>(x, z, layer)</code> 就不再是可验证的承诺，签了名的塔会被埋进地里。
         大地的 SHA-256 写进了规则串：换一片土地就是换一套世界规则。</p>
@@ -298,7 +298,7 @@
       </div>
       <div class="drop" id="drop">
         把你的 <b>blocks.jsonl</b> 拖进来 / 点击选择<br>
-        渲染出<b>你的链历史</b>专属的那片地表（山是真实的崂山，不会随你的链变） · 文件只在本地解析，不上传任何数据
+        渲染出<b>你的链历史</b>专属的那片地表（山是公开 DEM 实测出来的，不会随你的链变） · 文件只在本地解析，不上传任何数据
       </div>
       <input type="file" id="fileInput" accept=".jsonl,.json,.txt,.log" style="display:none">
       <div class="wstats" id="stats">种子 = 创世哈希 · 块 0</div>
@@ -310,10 +310,21 @@
       <div class="ico">🔗</div>
       <h3>币不是世界的燃料，币就是世界</h3>
       <p>转账不是在给某个外部游戏充能——<b>转账就是在改变地貌</b>。而且地貌的底座不是编的：山体是
-      <b>崂山东麓的真实高程</b>（公开 DEM 烘焙成 65536 字节的一张表，SHA-256 钉进规则串），
+      <b>公开卫星测量的真实高程</b>（SRTM 30 米 / Copernicus GLO-30 烘焙成 65536 字节的一张表，SHA-256 钉进规则串），
       植被与矿脉才是哈希算的。本页默认大陆指纹
       <b>5e6a108d9dfe62bb</b>，与仓库里 <b>Python</b> 参考实现逐位一致：两种完全不同的运行时，同一片大陆。
       确定性不是运气，是纪律（纯整数、只用 2 的幂、禁平台数学库）。</p>
+    </div>
+    <div class="card">
+      <div class="ico">🌐</div>
+      <h3>一枚币在地球上分到哪一格</h3>
+      <p>桌面钱包的<b>世界地图就是这颗地球</b>：星球层网格 2048 × 1024 把它切成 <b>2,097,152</b> 份席位，
+      其中 <b>615,081</b> 份在陆地上。你的席位由 <code>SHA-256("QL-SEAT-v1|" + 地址 + "|" + 创世哈希)</code>
+      折出一个行列，压在海上就顺着同一串哈希往下重掷，直到落在陆地——<b>这一格改不了也重掷不了</b>：只有换地址或换一条链才换一格。
+      席位那块地（8.96 公里 · 256 × 256 格）在你<b>本机现算</b>（<code>QL-EARTH-LOCAL-v1</code>）：已烤过的实测窗口一个字都不编，
+      否则取全球高程网格的陆地骨架（绝对海拔 + 海岸线），微地形由共识同一个种子推出——同一坐标谁算都逐字节相同。
+      <b>还没做到的说清楚</b>：哈希只保证<b>不可重掷</b>，保证不了<b>全球唯一</b>——约第 1000 个钱包起撞号概率就过半，
+      独占要靠链上记名（尚未做）；席位那块地也<b>还没接管</b>你脚下能挖能建的那块地——那一步动的是共识判据，不可逆，得先拍板。</p>
     </div>
     <div class="card">
       <div class="ico">👁</div>
@@ -436,7 +447,7 @@
       var total = QLWorld.W * QLWorld.H;
       var hfp = QLWorld.fingerprint(out.heights);
       document.getElementById('stats').innerHTML =
-        '大地 = 真实地球（崂山东麓 · 1 格 = 35 米 · 与历史无关）· 地表 = 创世哈希 ⊕ ' + vrfs.length + ' 个块 VRF · 块 <b>' + vrfs.length + '</b>' +
+        '大地 = 真实地球（公开 DEM 实测窗口 · 1 格 = 35 米 · 与历史无关）· 地表 = 创世哈希 ⊕ ' + vrfs.length + ' 个块 VRF · 块 <b>' + vrfs.length + '</b>' +
         ' · 金色地标 <b>' + out.era1 + '</b>/' + total +
         ' · 实体 <b>' + out.entities + '</b>' +
         ' · 大地指纹 <b>' + hfp + '</b> ' + (hfp === EXPECT.heights ? '✓' : '✗ 与基准分叉') +

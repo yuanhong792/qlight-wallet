@@ -1,6 +1,6 @@
 [package]
 name = "qlight-wallet"
-version = "0.4.6"
+version = "0.4.7"
 description = "QLight / QLX 抗量子桌面钱包（M1 PoC）"
 edition = "2021"
 rust-version = "1.82"
@@ -24,6 +24,9 @@ getrandom = "0.4"
 
 # —— 哈希 / 地址 ——
 sha3 = "0.10"
+# 席位规则 QL-SEAT-v1 用 SHA-256：浏览器 WebCrypto 只认它，SHAKE 在 JS 里没有原生实现。
+# 三方（Python hashlib / WebCrypto / 这一份）用同一个摘要，席位才算得出同一个格。
+sha2 = "0.10"
 bech32 = "0.11"
 hex = "0.4"
 

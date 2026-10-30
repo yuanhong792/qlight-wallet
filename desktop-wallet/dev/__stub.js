@@ -25,6 +25,16 @@ const SNAP = {
   craft: { built: 0, weight: 0, pace: 0 },
   balance: "0",
   report: { ok: true },
+  // 规则种子与席位：由 tools/world/seat.py（口径真身）拿这条演示地址 + 上面的创世哈希
+  // 算出来的，不是手填的漂亮数字。对拍页连席位都编的话，它只能证明页面会画，
+  // 不能证明画得对。
+  rules_id: "50d296e0",
+  seat: {
+    rule: "QL-SEAT-v1", cell: 292673, i: 1857, j: 142,
+    lat: 64.951171875, lon: 146.513671875, tries: 4,
+    parts: 2097152, land_parts: 615081, parcel_m: 8960,
+    walked_source: "derived",
+  },
 };
 const STUB = {
   app_version: "0.4.2-对拍",

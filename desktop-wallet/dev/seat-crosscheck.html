@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh">
+<meta charset="utf-8">
+<title>席位与局部大地 · JS 镜像对拍</title>
+<style>
+  body { background:#0b0f14; color:#cfe3ef; font:13px/1.6 ui-monospace,Menlo,monospace; padding:18px; }
+  h1 { font-size:15px; margin:0 0 6px; color:#ffd479; }
+  #verdict { font-size:15px; margin:10px 0; padding:8px 12px; border-radius:6px; }
+  .ok  { background:#123018; color:#8ff0a4; }
+  .bad { background:#3a1010; color:#ff9b9b; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { border-bottom:1px solid #1e2b38; padding:3px 8px; text-align:left; white-space:nowrap; }
+  th { color:#7fa9c4; font-weight:400; }
+  td.fp { color:#ffd479; }
+  td.diff { color:#ff9b9b; }
+  .mini { color:#6d8a9f; }
+</style>
+<h1>席位与局部大地 · JS 镜像对拍</h1>
+<div class="mini">夹具由 <code>tools/world/seat_crosscheck.py</code> 用 Python 参考实现生成。
+这一页只做一件事：浏览器那份 JS 必须烤出<b>同样的字节场</b>——指纹差一个字符就是共识分叉。</div>
+<div id="verdict">运行中…</div>
+<table id="tbl"></table>
+<script type="module">
+import { loadHeightGrid, seatOf, genBlock, fingerprint, N } from '../ui/earth-local.js';
+
+const el = (t, s) => { const e = document.createElement(t); if (s) e.textContent = s; return e; };
+const verdict = document.getElementById('verdict');
+const tbl = document.getElementById('tbl');
+
+function row(cells) {
+  const tr = el('tr');
+  for (const [txt, cls] of cells) { const td = el('td', txt); if (cls) td.className = cls; tr.append(td); }
+  return tr;
+}
+
+try {
+  const doc = await (await fetch('./seat-crosscheck.json')).json();
+  const H = await loadHeightGrid();
+  const head = row([['席位', ''], ['指纹 Python', ''], ['指纹 JS', ''], ['陆地格', ''],
+                   ['试轮', ''], ['抽样字节', ''], ['判定', '']]);
+  tbl.append(head);
+  let fail = 0;
+  for (const c of doc.cases) {
+    const seat = await seatOf(c.address, doc.genesis, H);
+    const okSeat = seat && seat.cell === c.seat.cell &&
+      Object.is(seat.lat, c.seat.lat) && Object.is(seat.lon, c.seat.lon) && seat.tries === c.seat.tries;
+    const { field, info } = genBlock(H, seat.lat, seat.lon, doc.seed);
+    const fp = fingerprint(field);
+    const spot = [[0, 0], [64, 192], [128, 128], [191, 37], [255, 255], [7, 240]]
+      .map(([y, x]) => field[y * N + x]);
+    const okSpot = spot.every((v, k) => v === c.spot[k]);
+    const okLand = info.land_cells === c.block.land_cells;
+    const good = okSeat && fp === c.heights_fingerprint && okSpot && okLand;
+    if (!good) fail++;
+    tbl.append(row([
+      [`${seat.lat.toFixed(3)}, ${seat.lon.toFixed(3)}`, okSeat ? '' : 'diff'],
+      [c.heights_fingerprint, 'fp'],
+      [fp, fp === c.heights_fingerprint ? 'fp' : 'diff'],
+      [`${info.land_cells}/${c.block.land_cells}`, okLand ? '' : 'diff'],
+      [`${seat.tries}/${c.seat.tries}`, okSeat ? '' : 'diff'],
+      [`${spot.join(',')} | ${c.spot.join(',')}`, okSpot ? '' : 'diff'],
+      [good ? '一致' : `不一致${okSeat ? '' : ' 席位'}${fp === c.heights_fingerprint ? '' : ' 指纹'}${okSpot ? '' : ' 抽样'}${okLand ? '' : ' 陆地格'}`,
+       good ? '' : 'diff'],
+    ]));
+  }
+  verdict.className = fail ? 'bad' : 'ok';
+  verdict.textContent = fail
+    ? `FAIL — ${fail}/${doc.cases.length} 例对不上：JS 与 Python 算出了不同的地`
+    : `PASS — ${doc.cases.length}/${doc.cases.length} 例逐字节一致（席位、指纹、抽样格、陆地格数）`;
+  document.title = verdict.textContent;
+} catch (e) {
+  verdict.className = 'bad';
+  verdict.textContent = 'ERROR — ' + (e && e.stack ? e.stack : e);
+}
+</script>

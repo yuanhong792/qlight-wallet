@@ -328,6 +328,28 @@ body {
 .map-corner.tr { top: 3px; right: 3px; border-left: 0; border-bottom: 0; }
 .map-corner.bl { bottom: 3px; left: 3px; border-right: 0; border-top: 0; }
 .map-corner.br { bottom: 3px; right: 3px; border-left: 0; border-top: 0; }
+/* 世界地图＝整颗地球：2:1 等经纬，席位格用金环标出，脚下这块用青框标出 */
+.earth-frame canvas {
+  width: 100%; aspect-ratio: 2 / 1; display: block; border-radius: 8px;
+  image-rendering: auto;
+}
+.earth-legend {
+  display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+  margin: 8px 2px 0; font-size: 12px; color: var(--muted, #9fb4c6);
+}
+.earth-legend b { color: #f0d69e; font-weight: 600; }
+.earth-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.parcel-strip {
+  display: grid; grid-template-columns: 96px 1fr; gap: 10px; align-items: center;
+  margin: 8px 2px 12px;
+}
+.parcel-strip canvas {
+  width: 96px; height: 96px; display: block; border-radius: 8px;
+  border: 1px solid rgba(233, 194, 115, .3); background: #06101e;
+}
+.parcel-facts { font-size: 12px; line-height: 1.5; color: var(--muted, #9fb4c6); }
+.parcel-facts b { color: #e8f1f7; font-weight: 600; }
+.parcel-facts .mono { font-family: ui-monospace, Menlo, monospace; color: #e9c273; }
 #world-canvas {
   width: 100%; aspect-ratio: 1 / 1; display: block;
   image-rendering: pixelated; /* 256×256 放大必须逐像素，绝不做插值模糊 */

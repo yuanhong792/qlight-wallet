@@ -699,6 +699,17 @@ pub struct WorldSnapshot {
     pub slot_count: u8,
     /// 可用高度层数（Minecraft 的 Y 上限；layer ∈ 0..max_layer）
     pub max_layer: u16,
+    /// 本机算的是哪一套世界规则（`QL-WORLD-RULES-v3` 的 32 位摘要）。
+    /// 前端原本把自己的种子写死成一个字面量、靠注释要求同步；现在由这里下发，
+    /// 「两份实现静默分叉」从"记得改"变成"改不动"。
+    pub rules_id: String,
+    /// —— 席位（QL-SEAT-v1）：这枚币在地球上占哪一格；见 `world::earth_local` ——
+    ///
+    /// 由 Rust 算，前端只显示。让 JS 自己哈希会造出"两张地图"：浏览器那份一旦和
+    /// 共识那份分叉，用户看见的地块和账本认的地块就不是同一块地，而且没人报错。
+    /// `None` 在数学上几乎不可能（陆地占 29%，4096 轮全落海的概率是 0），
+    /// 但命令里不许 panic：拿不到席位就照实说"没派到地"。
+    pub seat: Option<SeatInfo>,
     pub entities: Vec<world::Entity>,
     pub chunks: Vec<world::Chunk>,
     pub report: world::Report,
@@ -755,6 +766,30 @@ pub struct WorldSnapshot {
     /// （每条记录的高度都超过链尖）。界面据此给出「归档旧世界账本」的出口，
     /// 不把「一条坏行」和「换了条链」当成同一件事。
     pub ledger_foreign: bool,
+}
+
+/// 席位：一把地址在地球上占的那一格。
+///
+/// 「把地球随机分成若干份」这句产品口径的真身就是 `parts` / `land_parts`：
+/// 份数由随包的 2 MiB 等经纬高程网格定义（2048×1024），不是美术切图，也不是文案。
+#[derive(serde::Serialize)]
+pub struct SeatInfo {
+    pub rule: String,
+    /// 全球格序号（= j·2048 + i）
+    pub cell: usize,
+    pub i: usize,
+    pub j: usize,
+    /// 格中心经纬度（全精度，与 JS/Rust 镜像同一组 double）
+    pub lat: f64,
+    pub lon: f64,
+    /// 拒绝采样试了几轮才落到陆地
+    pub tries: u32,
+    pub parts: usize,
+    pub land_parts: usize,
+    /// 一块地的真实边长（米）：256 格 × 35 米 = 8.96 公里
+    pub parcel_m: f64,
+    /// 脚下这块地的来源：`measured` = 落在实测窗口内，`derived` = 按规则推导
+    pub walked_source: String,
 }
 
 /// 一列挖出来的坑：渲染器把顶面压到 `top`，坑壁按深度分带
@@ -827,6 +862,34 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
     let next_claim = state.chain.next_claim_height(&miner_addr);
     // 创造权重：世界状态 + 链头高度的纯函数。同一份账本，任何人算出同一个数。
     let craft = world::craft_of(&state_map, &address, height);
+    // 席位：地址 ⊕ 创世 → 地球上那一格。全精度经纬由 Rust 算，前端只显示——
+    // 两端各哈希一份迟早会各画出两张地图。未解锁（无地址）就没有席位，
+    // 也不拿空串去哈希：那会凭空造出一块"谁都不属于"的地。
+    let seat = if address.is_empty() {
+        None
+    } else {
+        world::earth_local::seat_of(
+            &address,
+            &simchain::genesis_hash_hex(),
+            world::earth_local::GLOBAL,
+        )
+        .map(|s| {
+            let (parts, land_parts) = world::earth_local::partition();
+            SeatInfo {
+                rule: world::earth_local::SEAT_RULE.into(),
+                cell: s.cell,
+                i: s.i,
+                j: s.j,
+                lat: s.lat,
+                lon: s.lon,
+                tries: s.tries,
+                parts,
+                land_parts,
+                parcel_m: world::earth_local::N as f64 * world::earth_local::CELL_M,
+                walked_source: world::earth_local::walked_source(s.lat, s.lon).into(),
+            }
+        })
+    };
     let dug: Vec<DugColumn> = w
         .dug
         .iter()
@@ -854,6 +917,8 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
         era1_end_height: world::ERA1_END_HEIGHT,
         slot_count: world::SLOT_COUNT,
         max_layer: world::MAX_LAYER,
+        rules_id: world::terrain::rules_id(),
+        seat,
         chunks: world::chunk_roots(&state_map),
         entities: state_map.into_values().collect(),
         report,

@@ -724,9 +724,10 @@ const worldOk = (m) => { $("err-world").textContent = ""; const o = $("ok-world"
 const entById = (id) => (worldSnap ? worldSnap.entities.find((e) => e.entity_id_hex === id) : null);
 const idShort = (id) => (id ? `${id.slice(0, 10)}…${id.slice(-8)}` : "—");
 
-/** 种子签名：创世哈希 + 历史长度 + 最后一个 VRF（任一变化地形就变） */
+/** 种子签名：创世哈希 + 历史长度 + 最后一个 VRF（任一变化地形就变）
+ *  rules_id 也在签名里：它变了就是共识规则变了，缓存的那张地形是上一套规则画的 */
 function terrainSig(s) {
-  return `${s.genesis_hash_hex}|${s.vrfs.length}|${s.vrfs[s.vrfs.length - 1] || ""}`;
+  return `${s.rules_id || ""}|${s.genesis_hash_hex}|${s.vrfs.length}|${s.vrfs[s.vrfs.length - 1] || ""}`;
 }
 
 /** 地形只算一次并缓存；链长一格才重算（每格 2 秒，重算约十几毫秒） */
@@ -1118,6 +1119,48 @@ function paintWorld() {
     wctx.strokeStyle = "#12161F";
     wctx.strokeRect(sel.x - 9.5, sel.y - 9.5, 19, 19);
   }
+  void paintEarthPanel();
+}
+
+/** 世界地图面板＝整颗地球。席位由 Rust 算（`snapshot.seat`），前端只画——
+ *  两边各哈希一次迟早各画出两张地图。地球底图与席位地块都算一次就缓存，
+ *  所以这里只判"席位换没换"，没换就只重描标记。 */
+let earthKey = "";
+async function paintEarthPanel() {
+  const s = worldSnap;
+  const cv = $("earth-canvas");
+  if (!s || !cv || !s.seat) return;
+  const E = window.QLEarth;
+  const seed = parseInt(s.rules_id, 16) >>> 0;
+  const walked = E && E.center ? { lat: E.center[0], lon: E.center[1] } : null;
+  const same = walked && Math.abs(walked.lat - s.seat.lat) < 1e-9 && Math.abs(walked.lon - s.seat.lon) < 1e-9;
+  const { paintEarth, parcelPreview } = await import("./earth-map.js");
+  await paintEarth(cv, s.seat, same ? null : walked, seed);
+  const fmt = (v) => Number(v).toLocaleString();
+  $("earth-legend").innerHTML =
+    `<div>${esc(t("world.earth.parts", { n: fmt(s.seat.parts), land: fmt(s.seat.land_parts) }))}</div>` +
+    `<div><span class="sw" style="background:#FFD479"></span>${esc(t("world.earth.mark.seat"))}` +
+    (same ? "" : ` · <span class="sw" style="background:#7FD7E8"></span>${esc(t("world.earth.mark.walked"))}`) +
+    `</div><div><b>${esc(t("world.earth.seat", {
+      cell: fmt(s.seat.cell), lat: s.seat.lat.toFixed(4), lon: s.seat.lon.toFixed(4),
+      tries: s.seat.tries }))}</b></div>`;
+
+  const key = `${s.seat.cell}|${s.rules_id}`;
+  if (key === earthKey) return;
+  earthKey = key;
+  const pv = await parcelPreview(s.seat.lat, s.seat.lon, seed);
+  const pc = $("parcel-canvas");
+  pc.width = pv.canvas.width; pc.height = pv.canvas.height;
+  const pctx = pc.getContext("2d");
+  pctx.clearRect(0, 0, pc.width, pc.height);
+  pctx.drawImage(pv.canvas, 0, 0);
+  $("parcel-facts").innerHTML =
+    `<div>${esc(t("world.parcel.facts", {
+      land: Number(pv.info.land_cells).toLocaleString(),
+      sigma: pv.info.sigma_m, cell: s.seat.cell }))}</div>` +
+    `<div>${esc(t(`world.parcel.source.${s.seat.walked_source}`))}</div>` +
+    `<div class="mono">${pv.fp}</div>` +
+    `<div class="muted">${esc(t("world.parcel.verify"))}</div>`;
 }
 
 function buildHotbar() {
@@ -1355,6 +1398,9 @@ $("btn-world-archive").addEventListener("click", async () => {
 
 async function loadWorld() {
   worldSnap = await invoke("world_snapshot");
+  // 规则种子只有一个真身：Rust 的 rules_id()。world.js 里那个 0x50d296e0 字面量是
+  // 兜底的默认值，不是第二份口径——快照一到就用它覆盖，否则改阈值时两边会静默分叉。
+  if (worldSnap.rules_id) QLWorld.setRulesSeed(parseInt(worldSnap.rules_id, 16) >>> 0);
   // 程序是活的：上一次按过「启动挖矿」，这次解锁之后它自己接上——不用人再守一遍
   if (!mineResumed && worldSnap.unlocked && prefsCache.mining_started) {
     mineResumed = true;
@@ -2064,17 +2110,23 @@ function w3Hint() {
   $("w3d-hint").textContent = t("world3d.hint");
 }
 
-/** 脚下这一格在真实地球上的位置。大地不是算出来的，是崂山东麓的一次卫星测量，
+/** 脚下这一格落在真实地球的哪个位置。大地不是算出来的，是一次卫星测量，
  *  所以 HUD 报得出经纬度——这一行也是"1 格 = 35 米"这条比例的唯一出处：
- *  方块内部仍然一米一格（人和树按米建模），对世界而言一格是 35 米地面。 */
+ *  方块内部仍然一米一格（人和树按米建模），对世界而言一格是 35 米地面。
+ *
+ *  这里不写地名（业主 2026-10-30：「不要具体在某地，这样显得地图很小」）。
+ *  报的是"这一块是量出来的窗口"这个事实，加上这枚币在地球上分到的那份席位——
+ *  世界地图面板画的是整颗地球和席位金环，这里就是它的数字版。 */
 function earthReadout(x, z) {
   const E = window.QLEarth;
   if (!E || !E.bbox) return "—";
   const w = E.bbox[0], so = E.bbox[1], e = E.bbox[2], n = E.bbox[3];
   const lon = w + ((x + 0.5) / QLWorld.W) * (e - w);
   const lat = n - ((z + 0.5) / QLWorld.H) * (n - so);
-  return `${E.place} · ${lat.toFixed(4)}°N ${lon.toFixed(4)}°E · ` +
-    t("world3d.f3.scale", { m: E.metersPerCell });
+  const seat = worldSnap && worldSnap.seat;
+  return `${t("world3d.f3.window")} ${lat.toFixed(4)}° ${lon.toFixed(4)}° · ` +
+    t("world3d.f3.scale", { m: E.metersPerCell }) +
+    (seat ? ` · ${t("world3d.f3.seat", { cell: seat.cell.toLocaleString() })}` : "");
 }
 
 function renderW3Hud(s) {

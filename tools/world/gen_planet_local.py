@@ -334,7 +334,11 @@ def gen(H, lat_c, lon_c, seed, measured=None):
             "land_cells": int(is_land.sum()), "source": src}
     if is_land.any():
         _ref, gain = land_basis(land)
-        info.update(amp_m=round(amp, 1), base_m=round(float(np.nanmean(h_eff[is_land])), 1),
+        # base_m 在 JS 与 Rust 那份镜像里都是"字节 SAND_FIELD 那一档的真实海拔"（基面），
+        # 不是均值。同名不同义是最坏的一种分叉：字段还在、对拍也过，读的人却各算各的。
+        # 均值另存 mean_m，报表要哪个说哪个。
+        info.update(amp_m=round(amp, 1), base_m=round(_ref, 1),
+                    mean_m=round(float(np.nanmean(h_eff[is_land])), 1),
                     relief_m=round(float(land.max() - land.min()), 1),
                     gain_m_per_byte=round(gain, 2),
                     exag=round((CELL_M / 8.0) / gain, 2))   # 显示垂直夸大倍数
@@ -509,7 +513,7 @@ def main():
         f, info = gen(H, lat, lon, a.seed, meas)
         g = lambda k, d="—": info.get(k, d)
         print(f"{lat:+8.3f},{lon:+9.3f}  {info['source']:8s} 陆地 {info['land_cells']:5d}/65536 "
-              f"海拔 {g('base_m'):>8} m 起伏 {g('relief_m'):>8} m σ={info['sigma_m']:7.1f}m "
+              f"基面 {g('base_m'):>8} m 均值 {g('mean_m'):>8} m 起伏 {g('relief_m'):>8} m σ={info['sigma_m']:7.1f}m "
               f"r={info['rugged']:.2f} 档距 {g('gain_m_per_byte'):>6} m/B 夸大 {g('exag'):>5}× "
               f"字节 {f.min():3d}..{f.max():3d} 用档 {info['land_bytes_used']:3d} "
               f"峰层 {int(f.max()) >> 3:2d}  指纹 {fingerprint(f.tobytes())}")

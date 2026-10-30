@@ -1,0 +1,558 @@
+{
+ "rule": "QL-SEAT-v1",
+ "generator": "QL-EARTH-LOCAL-v1",
+ "seed": 1355978464,
+ "seed_hex": "50d296e0",
+ "genesis": "5dc2205a8f0153a05f84e26ab94086009796bb68fdfddff439f97ebfd2aa3104",
+ "grid": [
+  256,
+  256
+ ],
+ "meters_per_cell": 35.0,
+ "cases": [
+  {
+   "address": "ql1qqqspfa0h8u73wp0lapt9pgy329w8yd3zup4mxedswqke6220nlqn4wgcl",
+   "seat": {
+    "i": 1832,
+    "j": 610,
+    "cell": 1251112,
+    "code": 145,
+    "lat": -17.314453125,
+    "lon": 142.119140625,
+    "tries": 1
+   },
+   "terrain": "平原",
+   "elev_m": 70.0,
+   "relief_sigma_m": 36.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 36.0,
+    "rugged": 0.045
+   },
+   "heights_fingerprint": "5b7753a689c7747c",
+   "spot": [
+    101,
+    103,
+    105,
+    102,
+    104,
+    102
+   ]
+  },
+  {
+   "address": "ql17f51fc4386e37408d3ec00bf707ea00a7eeac0aa7021c66b885977",
+   "seat": {
+    "i": 1120,
+    "j": 201,
+    "cell": 412768,
+    "code": 133,
+    "lat": 54.580078125,
+    "lon": 16.962890625,
+    "tries": 3
+   },
+   "terrain": "平原",
+   "elev_m": 22.0,
+   "relief_sigma_m": 52.0,
+   "coastal": true,
+   "sea_in_block": true,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 52.0,
+    "rugged": 0.065
+   },
+   "heights_fingerprint": "b80bb5fad75dd0f6",
+   "spot": [
+    102,
+    104,
+    103,
+    104,
+    110,
+    108
+   ]
+  },
+  {
+   "address": "ql167916306e7da5d782096e94058db971cd3b6f931e8dc12d0dd990f",
+   "seat": {
+    "i": 1904,
+    "j": 935,
+    "cell": 1916784,
+    "code": 149,
+    "lat": -74.443359375,
+    "lon": 154.775390625,
+    "tries": 1
+   },
+   "terrain": "平原",
+   "elev_m": 86.0,
+   "relief_sigma_m": 142.0,
+   "coastal": true,
+   "sea_in_block": true,
+   "block": {
+    "land_cells": 60254,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 142.0,
+    "rugged": 0.177
+   },
+   "heights_fingerprint": "43377383634582b7",
+   "spot": [
+    49,
+    113,
+    116,
+    126,
+    131,
+    117
+   ]
+  },
+  {
+   "address": "ql14d1c631c4b653f43983a3a1e5d7d20895e816f01e0ccf827d2020c",
+   "seat": {
+    "i": 138,
+    "j": 194,
+    "cell": 397450,
+    "code": 141,
+    "lat": 55.810546875,
+    "lon": -155.654296875,
+    "tries": 0
+   },
+   "terrain": "平原",
+   "elev_m": 54.0,
+   "relief_sigma_m": 0.0,
+   "coastal": true,
+   "sea_in_block": true,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 0.0,
+    "rugged": 0.0
+   },
+   "heights_fingerprint": "882138fc48ad57c6",
+   "spot": [
+    100,
+    101,
+    100,
+    99,
+    101,
+    100
+   ]
+  },
+  {
+   "address": "ql10a902a837da5ec566c6ce2d569822fe9b1bed9a4da469fe6838dda",
+   "seat": {
+    "i": 460,
+    "j": 275,
+    "cell": 563660,
+    "code": 197,
+    "lat": 41.572265625,
+    "lon": -99.052734375,
+    "tries": 1
+   },
+   "terrain": "平原",
+   "elev_m": 688.0,
+   "relief_sigma_m": 64.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 64.0,
+    "rugged": 0.08
+   },
+   "heights_fingerprint": "75512aa73d64919f",
+   "spot": [
+    111,
+    106,
+    107,
+    113,
+    101,
+    105
+   ]
+  },
+  {
+   "address": "ql1be4e66531665056be735c826e10f3ec6ef8176576fd2a6ebb29c87",
+   "seat": {
+    "i": 1878,
+    "j": 696,
+    "cell": 1427286,
+    "code": 184,
+    "lat": -32.431640625,
+    "lon": 150.205078125,
+    "tries": 3
+   },
+   "terrain": "丘陵",
+   "elev_m": 392.0,
+   "relief_sigma_m": 424.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 424.0,
+    "rugged": 0.53
+   },
+   "heights_fingerprint": "9981a055d49b4809",
+   "spot": [
+    156,
+    158,
+    178,
+    195,
+    200,
+    158
+   ]
+  },
+  {
+   "address": "ql1d4e2af0ff204be021e2e0dd319c27ac0df30a6ba0be0811c7d31af",
+   "seat": {
+    "i": 1000,
+    "j": 448,
+    "cell": 918504,
+    "code": 182,
+    "lat": 11.162109375,
+    "lon": -4.130859375,
+    "tries": 1
+   },
+   "terrain": "平原",
+   "elev_m": 360.0,
+   "relief_sigma_m": 112.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 112.0,
+    "rugged": 0.14
+   },
+   "heights_fingerprint": "78b41a896dcd1811",
+   "spot": [
+    115,
+    111,
+    115,
+    112,
+    108,
+    106
+   ]
+  },
+  {
+   "address": "ql12eafc5a06e497557bbcbd7411a1554a15d1653affd3d9b80bbd752",
+   "seat": {
+    "i": 1267,
+    "j": 491,
+    "cell": 1006835,
+    "code": 176,
+    "lat": 3.603515625,
+    "lon": 42.802734375,
+    "tries": 2
+   },
+   "terrain": "平原",
+   "elev_m": 264.0,
+   "relief_sigma_m": 132.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 132.0,
+    "rugged": 0.165
+   },
+   "heights_fingerprint": "be5570791b4c4d7f",
+   "spot": [
+    114,
+    124,
+    116,
+    115,
+    127,
+    121
+   ]
+  },
+  {
+   "address": "ql16c14add1820120002904fa4662aaedc14972fb9803365d80440a0b",
+   "seat": {
+    "i": 1607,
+    "j": 367,
+    "cell": 753223,
+    "code": 223,
+    "lat": 25.400390625,
+    "lon": 102.568359375,
+    "tries": 8
+   },
+   "terrain": "平原",
+   "elev_m": 2016.0,
+   "relief_sigma_m": 160.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 160.0,
+    "rugged": 0.2
+   },
+   "heights_fingerprint": "997634c51547d90d",
+   "spot": [
+    115,
+    122,
+    118,
+    123,
+    124,
+    123
+   ]
+  },
+  {
+   "address": "ql1a879db5600a0ded32c3f14d8362e76f1dcba9cf378213a8b90a97c",
+   "seat": {
+    "i": 381,
+    "j": 127,
+    "cell": 260477,
+    "code": 177,
+    "lat": 67.587890625,
+    "lon": -112.939453125,
+    "tries": 3
+   },
+   "terrain": "平原",
+   "elev_m": 280.0,
+   "relief_sigma_m": 140.0,
+   "coastal": true,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 140.0,
+    "rugged": 0.175
+   },
+   "heights_fingerprint": "37ee0cf21595f4b2",
+   "spot": [
+    126,
+    114,
+    112,
+    126,
+    126,
+    105
+   ]
+  },
+  {
+   "address": "ql1a8dbb8221cdee7e5c21fc701b6299bf4873835a958b3963529f0fb",
+   "seat": {
+    "i": 996,
+    "j": 346,
+    "cell": 709604,
+    "code": 192,
+    "lat": 29.091796875,
+    "lon": -4.833984375,
+    "tries": 0
+   },
+   "terrain": "平原",
+   "elev_m": 528.0,
+   "relief_sigma_m": 72.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 72.0,
+    "rugged": 0.09
+   },
+   "heights_fingerprint": "7fe4fb1eec872caa",
+   "spot": [
+    115,
+    109,
+    108,
+    109,
+    105,
+    112
+   ]
+  },
+  {
+   "address": "ql1c8bf5f06b92d349ce4ad4ac1e3cd959c6b6873d9e6622336d81408",
+   "seat": {
+    "i": 1694,
+    "j": 1021,
+    "cell": 2092702,
+    "code": 149,
+    "lat": -89.560546875,
+    "lon": 117.861328125,
+    "tries": 1
+   },
+   "terrain": "平原",
+   "elev_m": 86.0,
+   "relief_sigma_m": 20.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 20.0,
+    "rugged": 0.025
+   },
+   "heights_fingerprint": "13378f85be985163",
+   "spot": [
+    124,
+    103,
+    125,
+    140,
+    120,
+    118
+   ]
+  },
+  {
+   "address": "ql1be49cce93b23920e421a229ddf2b301d8a4c3b45a2319514703737",
+   "seat": {
+    "i": 1765,
+    "j": 986,
+    "cell": 2021093,
+    "code": 193,
+    "lat": -83.408203125,
+    "lon": 130.341796875,
+    "tries": 1
+   },
+   "terrain": "丘陵",
+   "elev_m": 560.0,
+   "relief_sigma_m": 396.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 396.0,
+    "rugged": 0.495
+   },
+   "heights_fingerprint": "5c4e12a7fcbc702b",
+   "spot": [
+    176,
+    220,
+    193,
+    168,
+    127,
+    212
+   ]
+  },
+  {
+   "address": "ql1261df4bcc414c327e6239614b25134d22347dab2749110d39d4a4d",
+   "seat": {
+    "i": 1513,
+    "j": 125,
+    "cell": 257513,
+    "code": 141,
+    "lat": 67.939453125,
+    "lon": 86.044921875,
+    "tries": 0
+   },
+   "terrain": "平原",
+   "elev_m": 54.0,
+   "relief_sigma_m": 68.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 68.0,
+    "rugged": 0.085
+   },
+   "heights_fingerprint": "49897d5e48af7134",
+   "spot": [
+    123,
+    109,
+    112,
+    118,
+    105,
+    103
+   ]
+  },
+  {
+   "address": "ql1db12cf82769bceb3f0dcbcaf6c21b4065939d16955576855bbc05b",
+   "seat": {
+    "i": 1774,
+    "j": 607,
+    "cell": 1244910,
+    "code": 175,
+    "lat": -16.787109375,
+    "lon": 131.923828125,
+    "tries": 0
+   },
+   "terrain": "平原",
+   "elev_m": 252.0,
+   "relief_sigma_m": 76.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 76.0,
+    "rugged": 0.095
+   },
+   "heights_fingerprint": "76979b15467a85e5",
+   "spot": [
+    105,
+    109,
+    107,
+    112,
+    115,
+    111
+   ]
+  },
+  {
+   "address": "ql16cc32f47cfe854badb6752fec7372fd8eebaad32425b78df51a613",
+   "seat": {
+    "i": 1032,
+    "j": 251,
+    "cell": 515080,
+    "code": 183,
+    "lat": 45.791015625,
+    "lon": 1.494140625,
+    "tries": 1
+   },
+   "terrain": "丘陵",
+   "elev_m": 376.0,
+   "relief_sigma_m": 200.0,
+   "coastal": false,
+   "sea_in_block": false,
+   "block": {
+    "land_cells": 65536,
+    "source": "derived",
+    "grid": 256,
+    "meters_per_cell": 35.0,
+    "sigma_m": 200.0,
+    "rugged": 0.25
+   },
+   "heights_fingerprint": "eed0487643ef58ac",
+   "spot": [
+    116,
+    133,
+    124,
+    116,
+    150,
+    135
+   ]
+  }
+ ]
+}

@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 /// 世界尺寸（与 tools/world 参考实现同一口径：256×256 格）
 pub mod dust;
+pub mod earth_local;
 pub mod ore;
 pub mod pool;
 pub mod resource;
