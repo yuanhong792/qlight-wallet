@@ -210,7 +210,7 @@
       ⬇ 下载 Windows 版 <small>.zip · 13 MB · Win 10/11 x64</small>
     </a>
   </div>
-  <p class="dl-note">免安装绿色版 · 数据本地加密存储 · 无需注册任何账号<br>实测高程窗口与全球高程／影像（2.9 MB）随包分发，地形不联网下载——离线也是同一片地。<b>v0.4.7 比上一版大 2.7 MB，原因不体面但要说清</b>：席位规则要在共识侧读那张 2 MiB 全球网格（<code>include_bytes!</code>），而前端画世界地图用的还是 <code>ui/</code> 里同一份文件——<b>同一张网格在包里存了两份</b>。功能上没影响，纯浪费；去重排在待办里（#59）。</p>
+  <p class="dl-note">免安装绿色版 · 数据本地加密存储 · 无需注册任何账号<br>实测高程窗口与全球高程／影像（2.9 MB）随包分发，地形不联网下载——离线也是同一片地。<b>v0.4.7 比上一版大 2.7 MB，原因不体面但要说清</b>：席位规则要在共识侧读那张 2 MiB 全球网格（<code>include_bytes!</code>），而前端画世界地图用的还是 <code>ui/</code> 里同一份文件——<b>同一张网格在包里存了两份</b>。功能上没影响，纯浪费；去重排在待办里（#59）。<b>这一页自己也带一份 2 MiB 网格</b>（<code>earth-global-h.bin</code>，与 <code>ui/</code> 那份逐字节相同，由对拍闸 <code>test_docs_parity.py</code> 钉住）——那份只进仓库、不进安装包。</p>
 </header>
 
 <section class="section wrap" id="shots">
