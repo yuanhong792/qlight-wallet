@@ -22,7 +22,8 @@ nav button:hover{background:#173049}
 import * as THREE from '../ui/vendor/three/three.module.js';
 // 星球层口径、球体、大气、星空全部来自 planet-view.js——封面与这一页必须是同一份代码，
 // 否则"对拍"对的是两个实现，改了这边忘了那边（海悬崖那个黑裂缝就是这么留下的）。
-import {createPlanet, dirOf, heightAt, unquantize, GW, GH, SEA_CODES, loadPlanetAssets} from '../ui/planet-view.js';
+import {createPlanet, dirOf, loadPlanetAssets} from '../ui/planet-view.js';
+import {heightAt, unquantize, GW, GH, SEA_CODES} from '../ui/earth-grid.js';
 
 const q = new URLSearchParams(location.search);
 const EX = +(q.get('ex') || 16);       // 星球视图的垂直夸张：真实比例下 8848 米只占半径 0.14%，看不见

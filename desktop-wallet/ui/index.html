@@ -247,6 +247,17 @@
             <div class="parcel-facts" id="parcel-facts">—</div>
           </div>
 
+          <!-- 可去之处（QL-ROAM-v1）：只读。它不是一块新的地契，也不是一条账本记录——
+               列表与地图上的圈是同一份清单算出来的，锁着的必须看得见、点上去要当场说清差几格。 -->
+          <div class="panel-title sub">
+            <span data-i18n="world.roam.title">可去之处</span>
+            <span class="tag" data-i18n="world.roam.tag">只读 · 不走进去不产生记录</span>
+          </div>
+          <div class="roam-progress" id="roam-progress">—</div>
+          <div class="roam-list" id="roam-list"></div>
+          <div class="roam-msg" id="roam-msg" hidden></div>
+          <div class="muted small" id="roam-note" data-i18n="world.roam.note"></div>
+
           <div class="panel-title sub">
             <span data-i18n="world.parcel">脚下这块地</span>
             <span class="tag" data-i18n="world.parcel.tag">256×256 格 · 可放置</span>
@@ -412,6 +423,13 @@
       <div class="hotbar w3d-hotbar" id="w3d-hotbar"></div>
       <div class="w3d-hint" id="w3d-hint"></div>
       <div class="w3d-toast" id="w3d-toast" hidden></div>
+      <!-- 只读漫游的横幅：站在别人那块地上（准确说：按规则算出来的另一格上）必须一眼看见
+           "这里写不进账本"，所以它是横幅不是提示行——挖/造/采的入口在这一趟全部关着。 -->
+      <div class="w3d-roam" id="w3d-roam" hidden>
+        <span class="roam-tag" id="roam-tag">–</span>
+        <button type="button" class="btn-ghost tiny" id="btn-roam-home" data-i18n="world.roam.home">回自己那块地 (H)</button>
+        <button type="button" class="btn-ghost tiny" id="btn-roam-next" data-i18n="world.roam.btn.next">下一处 (N)</button>
+      </div>
       <!-- 在场人数：共识外的展示信息（不进账本、不换收益），口径见 app.js applyPresence -->
       <div class="w3d-pos" id="w3d-pos" hidden>◦</div>
       <button type="button" id="w3d-shot" class="w3d-exit w3d-shot" data-i18n="world3d.shot">📷 截图</button>
@@ -527,6 +545,7 @@
 <script src="earth-height.js"></script>
 <script src="world.js"></script>
 <script src="world3d.js"></script>
+<script src="earth-roam.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -708,6 +708,14 @@ let w3VeilDone = false; // 封面已淡入真实画面（每次进世界重置�
 let w3Dived = false;    // 这一次进场走过太空俯冲：淡入的是世界这一层，不是题图封面
 let diveFade = 0;       // 淡入收尾的定时器：中途退出要能撤掉
 
+// —— 可去之处（QL-ROAM-v1，只读）：累计矿格数换来的"还能走进哪几块地"。
+// 这一层不写账本、不参与判据；roamAt 非空 = 画面里那块地不是脚下那一格，
+// 一切写入路径（挖/造/拆/采/在场/出块动画）当场关着，见 roamBlocked()。
+let roamList = null;    // QLEarthRoam.plan() 的结果
+let roamSig = "";       // 只在地址 / 创世 / 累计矿格数变了才重走席位链
+let roamAt = null;      // 正在只读漫游的那块地：{n, cell, lat, lon, heights, blocks, stats, fp}
+let roamBusy = false;
+
 const worldActive = () => !$("page-world").classList.contains("hidden");
 // 旧世界账本是"解释"不是"故障"：写入被重放拒掉时不要甩一行红色原始报错，
 // 直接把出口说清楚——红字会让人以为是新写坏了，其实账本一条都没动。
@@ -776,7 +784,7 @@ async function loadDust() {
     worldResSig = sig;
     worldRes = await invoke("world_resources", { x0: 0, y0: 0, x1: QLWorld.W, y1: QLWorld.H }).catch(() => []);
     paintWorld();
-    if (w3) w3.setResources(worldRes);
+    if (w3 && !roamAt) w3.setResources(worldRes);
   }
 }
 
@@ -1122,10 +1130,52 @@ function paintWorld() {
   void paintEarthPanel();
 }
 
+/** 席位链往后多取 64 项 = 可去之处清单（QL-ROAM-v1）。
+ *  重算一次是两百来轮 SHA-256，不该塞进每 2 秒的快照轮询里，所以按
+ *  地址 | 创世 | 累计矿格数 | 席位格 缓存：只有这四样真的变了才重走链。 */
+async function loadRoamPlan(s) {
+  const cells = Number(s.mine_claims_by_me) || 0;
+  const sig = `${s.address}|${s.genesis_hash_hex}|${cells}|${s.seat ? s.seat.cell : -1}`;
+  if (sig === roamSig && roamList) return roamList;
+  roamSig = sig;
+  const { loadHeightGrid, seatPath } = await import("./earth-local.js");
+  const H = await loadHeightGrid();
+  const path = await seatPath(s.address, s.genesis_hash_hex, H, 1 + QLEarthRoam.ROAM_MAX);
+  roamList = QLEarthRoam.plan(path, s.seat ? s.seat.cell : null, cells);
+  return roamList;
+}
+
+/** 清单面板：解锁的才给入口，锁着的只报"第几处、差几格"——
+ *  列 64 行"进不去"是噪声，但"还有 N 处锁着"必须留着：进度要看得见。 */
+function renderRoamPanel() {
+  const s = worldSnap, R = roamList;
+  const prog = $("roam-progress"), box = $("roam-list");
+  if (!s || !prog || !box || !R) return;
+  const cells = Number(s.mine_claims_by_me) || 0;
+  if (!R.ok) {
+    // 本机的席位链与 Rust 算的那一格对不上：不给入口，把这件事说破
+    prog.textContent = t("world.roam.mismatch");
+    box.innerHTML = "";
+    return;
+  }
+  prog.innerHTML = `<b>${esc(t("world.roam.progress", {
+    n: R.open, max: R.max, places: R.places, cells }))}</b>` +
+    (R.next ? `<div class="muted small">${esc(t("world.roam.next", { n: R.open + 1, need: R.next, cells }))}</div>` : "");
+  const here = (it) => !!(roamAt && roamAt.n === it.n);
+  const open = R.items.filter((it) => it.unlocked);
+  box.innerHTML = open.length
+    ? open.map((it) => `<button type="button" class="roam-row${here(it) ? " on" : ""}" data-n="${it.n}">`
+      + `<b class="roam-n">${it.n}</b>`
+      + `<span class="roam-co">${it.lat.toFixed(2)}°, ${it.lon.toFixed(2)}°</span>`
+      + `<span class="roam-go">${here(it) ? t("world.roam.here") : t("world.roam.enter")}</span></button>`).join("")
+    : `<div class="muted small">${esc(t("world.roam.none"))}</div>`;
+}
+
+let earthKey = "";
 /** 世界地图面板＝整颗地球。席位由 Rust 算（`snapshot.seat`），前端只画——
  *  两边各哈希一次迟早各画出两张地图。地球底图与席位地块都算一次就缓存，
- *  所以这里只判"席位换没换"，没换就只重描标记。 */
-let earthKey = "";
+ *  所以这里只判"席位换没换"，没换就只重描标记。可去之处的圈与清单必须同一份数据：
+ *  地图画 3 个、列表给 5 个入口，用户点到的就是不存在的地方。 */
 async function paintEarthPanel() {
   const s = worldSnap;
   const cv = $("earth-canvas");
@@ -1134,16 +1184,22 @@ async function paintEarthPanel() {
   const seed = parseInt(s.rules_id, 16) >>> 0;
   const walked = E && E.center ? { lat: E.center[0], lon: E.center[1] } : null;
   const same = walked && Math.abs(walked.lat - s.seat.lat) < 1e-9 && Math.abs(walked.lon - s.seat.lon) < 1e-9;
+  const R = await loadRoamPlan(s);
   const { paintEarth, parcelPreview } = await import("./earth-map.js");
-  await paintEarth(cv, s.seat, same ? null : walked, seed);
+  await paintEarth(cv, s.seat, same ? null : walked, seed, R.items);
   const fmt = (v) => Number(v).toLocaleString();
   $("earth-legend").innerHTML =
     `<div>${esc(t("world.earth.parts", { n: fmt(s.seat.parts), land: fmt(s.seat.land_parts) }))}</div>` +
     `<div><span class="sw" style="background:#FFD479"></span>${esc(t("world.earth.mark.seat"))}` +
     (same ? "" : ` · <span class="sw" style="background:#7FD7E8"></span>${esc(t("world.earth.mark.walked"))}`) +
+    ` · <span class="sw roam-sw">${R.open}</span>${esc(t("world.earth.mark.roam"))}` +
     `</div><div><b>${esc(t("world.earth.seat", {
       cell: fmt(s.seat.cell), lat: s.seat.lat.toFixed(4), lon: s.seat.lon.toFixed(4),
       tries: s.seat.tries }))}</b></div>`;
+  // 清单与进度每轮都要重画：累计矿格数变了但席位没变（earthKey 没变）的时候，
+  // 只有这一行会动——它就是"又解锁了一处"的唯一即时反馈。
+  renderRoamPanel();
+  if (!R.ok) return;
 
   const key = `${s.seat.cell}|${s.rules_id}`;
   if (key === earthKey) return;
@@ -1410,10 +1466,13 @@ async function loadWorld() {
   renderWorld();
   // 3D 视图开着时必须同步实体表：写完的方块只进了 2D 面板的话，玩家会看到
   // 「坐标回执 + 一击火花」但币面上什么都没有，要关了重开才显形。
-  if (w3) w3.setEntities(worldSnap.entities, worldSnap.address);
-  // 挖地账本（v5）与实体表同一条纪律：快照每 2 秒推一次，挖过的坑必须在币面上
-  // 当场变成坑，而不是等关了 3D 视图再开才看见。
-  if (w3) w3.setDug(worldSnap.dug || []);
+  // 只读漫游时不同步：这些坐标属于自家那张窗口，贴到别的地块上是假物件。
+  if (w3 && !roamAt) {
+    w3.setEntities(worldSnap.entities, worldSnap.address);
+    // 挖地账本（v5）与实体表同一条纪律：快照每 2 秒推一次，挖过的坑必须在币面上
+    // 当场变成坑，而不是等关了 3D 视图再开才看见。
+    w3.setDug(worldSnap.dug || []);
+  }
   renderGuide();
   await loadDust();
   await loadTrader();
@@ -1440,7 +1499,8 @@ let lastMinedCell = null;
 /** 挖到矿的现场反馈：矿格上方起一串 QLOR 符文，等下一个块把它铸成砖 */
 function noteMinedCell(p) {
   lastMinedCell = { cx: p.x, cz: p.y, layer: p.layer, at: Date.now() };
-  if (w3) w3.rainAt(p.x, p.y, p.layer, `QLOR|${p.x}|${p.y}|${p.layer}`);
+  // 只读漫游时不放进画面：符文要立在"那一格"上方，而那一格是自家窗口的坐标
+  if (w3 && !roamAt) w3.rainAt(p.x, p.y, p.layer, `QLOR|${p.x}|${p.y}|${p.layer}`);
 }
 
 // —— 交互：物品栏、地图、编辑器
@@ -1641,7 +1701,7 @@ async function mineTick() {
   try {
     const p = await invoke("world_mine_once", { kind: wSlot });
     QLSfx.claim();
-    if (w3) w3.burst(p.x, p.layer, p.y, wSlot);
+    if (w3 && !roamAt) w3.burst(p.x, p.layer, p.y, wSlot);
     noteMinedCell(p);
     mineSay(t("mine.line.hit", {
       h: worldSnap.height, x: p.x, z: p.y, y: p.layer, r: fmtAmt(p.reward), f: p.pace_next_floor,
@@ -1778,6 +1838,9 @@ function planStations(t, anchor) {
 }
 
 function refreshStations(t) {
+  // 只读漫游时柜台不追人：兑换池/光尘灯/摊位守的是共享窗口里那三个坐标，
+  // 站在另一块地上"走近三格"是凭空的距离。走近、按 E、开柜台回自家再照旧。
+  if (roamAt) { stations = []; nearType = ""; $("w3d-prompt").hidden = true; return; }
   const terrain = t || buildTerrain(worldSnap);
   if (!terrain || !terrain.blocks) return;
   stations = spawnAnchor ? planStations(terrain, spawnAnchor) : [];
@@ -1830,6 +1893,12 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (k === "e" && nearType) { e.stopPropagation(); e.preventDefault(); shopOpen(nearType); }
+  // 只读漫游时 E 没有柜台可开（站点属于自己那张世界），这两个键改给"回家 / 下一处"：
+  // 在一块陌生的地上，最要紧的两个动作就是离开它、以及走到下一处。
+  if (roamAt) {
+    if (k === "h") { e.stopPropagation(); e.preventDefault(); exitRoam(); }
+    else if (k === "n") { e.stopPropagation(); e.preventDefault(); goNextRoam(); }
+  }
 }, true);
 
 $("ent-list").addEventListener("click", (e) => {
@@ -1939,9 +2008,7 @@ function w3Name(slot, x, z, layer) {
  *  两米以上的断崖要在 22 格外，地形轮廓仰角要低于 4°，水要在 26~48 格之间当远景，
  *  16 格内的树干越少越好。旧目标只数"脚下 5 格"和"14 格那一点"，结果每次都赢在
  *  台地边缘：睁眼是一道九米的坎加一谷沼泽，正是"地上怎么还有蓝色"的那一帧。 */
-function pickSpawn(x, z) {
-  const t = buildTerrain(worldSnap);
-  if (!t.blocks || !t.heights) return { x: 128, z: 128 };
+function pickSpawnIn(t, x, z, built) {
   const W = QLWorld.W, H = QLWorld.H, seaLv = QLWorld.RULES.SEA >> 3;
   const lvl = (cx, cz) => t.heights[cz * W + cx] >> 3;
   const kindAt = (cx, cz) => t.blocks[cz * W + cx] & 7;
@@ -1951,13 +2018,13 @@ function pickSpawn(x, z) {
   const inside = (cx, cz) => cx > 7 && cz > 7 && cx < W - 8 && cz < H - 8;
   // 别人（或自己）盖过的格子一律避开：support() 取的是"地形顶与活方块的最大值"，
   // 出生在一座塔上，睁眼就是离地几十层的悬崖，HUD 的 Y 和地表层也对不上。
-  const built = new Set();
-  for (const e of worldSnap.entities || []) if (!e.released) built.add(`${Math.floor(e.x)}:${Math.floor(e.y)}`);
+  // 只读漫游的那块地上没有任何账本物件，所以传进来的是空集。
+  const used = built || new Set();
   let best = null, bestScore = -1e9, soft = null, softScore = -1e9;
   for (let dz = -46; dz <= 46; dz++) for (let dx = -46; dx <= 46; dx++) {
     const cx = x + dx, cz = z + dz;
     if (!inside(cx, cz) || water(cx, cz) || kindAt(cx, cz) === 2) continue; // 雪峰只长云杉、露出白石，出生在那种地方第一眼是堵墙
-    if (built.has(`${cx}:${cz}`)) continue;
+    if (used.has(`${cx}:${cz}`)) continue;
     const lv = lvl(cx, cz);
     if (lv < seaLv + 2) continue; // 水边低地只能看见一堵黑墙，站在岸上才看得下去
     // 脚下九格：一整块平地（span≤2、台阶≤34%）、不沾一滴水、三格内没有树干。
@@ -2012,6 +2079,135 @@ function pickSpawn(x, z) {
   return best || soft || { x: 128, z: 128, yaw: 0.6 };
 }
 
+/** 家里那块地的出生点（账本世界，256×256 共享窗口） */
+function pickSpawn(x, z) {
+  const t = buildTerrain(worldSnap);
+  if (!t.blocks || !t.heights) return { x: 128, z: 128 };
+  const built = new Set();
+  for (const e of worldSnap.entities || []) if (!e.released) built.add(`${Math.floor(e.x)}:${Math.floor(e.y)}`);
+  return pickSpawnIn(t, x, z, built);
+}
+
+// —— 只读漫游（QL-ROAM-v1）———————————————————————————————————————————————
+/** 把席位链算出的那一格现烤成一块地：形状来自 QL-EARTH-LOCAL-v1（与 Rust / Python 逐位
+ *  同构的那三份），地表分类来自与家里同一组档位（QLEarthRoam.visit → QLWorld.RULES）。
+ *  种子必须是共识的 rules_id：换种子就是换一片地貌，别的机器就复算不出同一块地。 */
+async function buildVisit(lat, lon) {
+  const { loadHeightGrid, genBlock, fingerprint, parcelCoords } = await import("./earth-local.js");
+  const H = await loadHeightGrid();
+  const words = QLWorld.seedWords(worldSnap.genesis_hash_hex, worldSnap.vrfs);
+  const { field, info } = genBlock(H, lat, lon, parseInt(worldSnap.rules_id, 16) >>> 0);
+  const v = QLEarthRoam.visit(field, QLWorld, words);
+  const c = parcelCoords(lat, lon);
+  return { heights: v.heights, blocks: v.blocks, stats: v.stats, info, lats: c.lats, lons: c.lons,
+           fp: fingerprint(field) };
+}
+
+/** 只读期间挡下一切"会写字"的入口，返回要怎么说（不在漫游就返回 null）。
+ *  为什么必须挡：world_dig / world_place / 采矿的 (x, z) 是**那一张共享窗口**里的坐标，
+ *  链上的判据（地表层 − 已挖）也只认那一张世界。画面里站着的是另一块地，
+ *  这条记录写下去会落在你根本不在的地方——那不叫"挖了一格"，那叫撒谎。
+ *  挖矿程序本身不在这里挡：它一直在你自己那块地上落格，关着世界也在落，
+ *  看见这块地不会让它多印一枚币，也不会少印一枚。 */
+function roamBlocked() {
+  if (!roamAt) return null;
+  return t("world.roam.err.readonly", { n: roamAt.n, cells: (worldSnap.mine_claims_by_me || 0) });
+}
+
+function roamSay(msg, bad) {
+  const el = $("roam-msg");
+  if (!el) return;
+  el.hidden = !msg;
+  el.textContent = msg || "";
+  el.classList.toggle("bad", !!bad);
+}
+
+function roamBanner() {
+  const on = !!roamAt;
+  $("w3d-roam").hidden = !on;
+  $("w3d-roam").classList.toggle("busy", roamBusy);
+  if (!on) return;
+  $("roam-tag").textContent = t("world.roam.visiting", {
+    n: roamAt.n, lat: roamAt.lat.toFixed(2), lon: roamAt.lon.toFixed(2),
+    cell: roamAt.cell.toLocaleString(),
+  });
+  const R = roamList;
+  $("btn-roam-next").hidden = !(R && R.open > 1);
+  renderRoamPanel();
+}
+
+async function enterRoam(item) {
+  if (roamBusy || !worldSnap || !worldSnap.seat || !item) return;
+  if (!item.unlocked) {
+    roamSay(t("world.roam.locked", {
+      n: item.n, need: item.need, cells: worldSnap.mine_claims_by_me || 0,
+      left: item.need - (worldSnap.mine_claims_by_me || 0),
+    }), true);
+    return;
+  }
+  roamBusy = true; roamBanner();
+  roamSay(t("world.roam.computing", { cell: item.cell.toLocaleString() }));
+  try {
+    const v = await buildVisit(item.lat, item.lon);
+    roamAt = Object.assign({ n: item.n, cell: item.cell, i: item.i, j: item.j,
+                             lat: item.lat, lon: item.lon }, v);
+    w3Spawned = false;                 // 换了一块地 = 重选出生点、重演一次俯冲
+    await openWorld3D({ roam: roamAt });
+    roamSay(t("world.roam.entered", {
+      n: item.n, land: v.stats.land.toLocaleString(), water: v.stats.water.toLocaleString(),
+      trees: v.stats.trees.toLocaleString(), fp: v.fp,
+    }));
+  } catch (e) {
+    roamAt = null;
+    roamSay(String(e), true);
+  }
+  roamBusy = false; roamBanner();
+}
+
+/** 回家：把只读那层撤掉，画面重新落到账本里的那张世界。
+ *  走的是与「进入世界」完全相同的一条路（同一份 terrain、同一个出生点打分），
+ *  不留一个"半只读"的中间态。 */
+function exitRoam() {
+  if (!roamAt) return;
+  roamAt = null;
+  w3Spawned = false;
+  roamSay("");
+  if ($("w3d").hidden) { syncWorld3D(); roamBanner(); return; }
+  openWorld3D();
+}
+
+function goNextRoam() {
+  const R = roamList;
+  if (!R || !R.open) return;
+  const cur = roamAt ? roamAt.n : 0;
+  const next = R.items.find((it) => it.unlocked && it.n > cur) || R.items.find((it) => it.unlocked);
+  if (next) enterRoam(next);
+}
+
+$("earth-canvas").addEventListener("click", async (ev) => {
+  if (!roamList || !roamList.ok) return;
+  const { earthHit } = await import("./earth-map.js");
+  const m = earthHit($("earth-canvas"), ev.clientX, ev.clientY);
+  if (!m) return;
+  if (m.kind === "home") {
+    if (roamAt) { exitRoam(); roamSay(t("world.roam.home")); }
+    else openWorld3D();
+    return;
+  }
+  const item = roamList.items.find((it) => it.n === m.n);
+  if (item) await enterRoam(item);
+});
+
+$("roam-list").addEventListener("click", async (ev) => {
+  const b = ev.target.closest(".roam-row");
+  if (!b || !roamList) return;
+  const item = roamList.items.find((it) => it.n === Number(b.dataset.n));
+  if (item) await enterRoam(item);
+});
+
+$("btn-roam-home").addEventListener("click", () => exitRoam());
+$("btn-roam-next").addEventListener("click", () => goNextRoam());
+
 function ensureWorld3D() {
   if (w3) return true;
   try {
@@ -2024,7 +2220,11 @@ function ensureWorld3D() {
       onDig: (x, z, layer) => w3Dig(x, z, layer),
       onDigBlocked: () => w3Toast(t("world3d.err.terrain"), true),
       // 左键对准资源 = 采（打树、撬石头、摘花），不拆地
-      onHarvest: (x, z) => harvestNode(x, z),
+      onHarvest: (x, z) => {
+        const blocked = roamBlocked();
+        if (blocked) { w3Toast(blocked, true); return; }
+        harvestNode(x, z);
+      },
       onBlocked: () => w3Toast(t("world3d.err.blocked"), true),
       onEmpty: () => w3Toast(t("world3d.err.notarget"), true),
       onSound: (on) => w3Toast(on ? t("world3d.sound.on") : t("world3d.sound.off")),
@@ -2065,18 +2265,30 @@ function ensureWorld3D() {
 
 function syncWorld3D() {
   if (!w3 || !worldSnap) return;
-  const t = buildTerrain(worldSnap);
-  w3.setWorld(t.heights, t.blocks);
+  if (roamAt) {
+    // 只读那一格：账本里的物件、挖过的坑、资源、别人的人一个都不能画上来——
+    // 它们属于共享窗口的 (x, z)，贴到这块地上就是"这块地上有你的塔"，而那是假的。
+    w3.setWorld(roamAt.heights, roamAt.blocks);
+    w3.setEntities([], worldSnap.address);
+    w3.setDug([]);
+    w3.setResources([]);
+    w3.setPeers([]);
+    stations = [];
+  } else {
+    const t = buildTerrain(worldSnap);
+    w3.setWorld(t.heights, t.blocks);
+    w3.setEntities(worldSnap.entities, worldSnap.address);
+    w3.setDug(worldSnap.dug || []);
+    w3.setResources(worldRes);
+    refreshStations(t);
+  }
   w3.setMaxLayer(worldSnap.max_layer || QLWorld3D.MAX_LAYER);
   w3.setColors(KIND_COLORS);
-  w3.setEntities(worldSnap.entities, worldSnap.address);
-  w3.setDug(worldSnap.dug || []);
-  w3.setResources(worldRes);
   w3.setSlots(worldSnap.slot_count || 16);
   w3.setTime(worldSnap.height || 0);
   w3.setSlot(wSlot);
-  refreshStations(t);
   renderHeld();
+  roamBanner();
 }
 
 /** 一件物件的造价（土/石/矿）：物品栏角标用它，挖地之前先知道要攒什么 */
@@ -2107,7 +2319,7 @@ function buildW3Hotbar() {
 }
 
 function w3Hint() {
-  $("w3d-hint").textContent = t("world3d.hint");
+  $("w3d-hint").textContent = roamAt ? t("world3d.hint.roam") : t("world3d.hint");
 }
 
 /** 脚下这一格落在真实地球的哪个位置。大地不是算出来的，是一次卫星测量，
@@ -2118,6 +2330,15 @@ function w3Hint() {
  *  报的是"这一块是量出来的窗口"这个事实，加上这枚币在地球上分到的那份席位——
  *  世界地图面板画的是整颗地球和席位金环，这里就是它的数字版。 */
 function earthReadout(x, z) {
+  // 只读漫游时脚下这块地不在账本那张窗口里：拿家里的 bbox 去换算 (x, z) 会报出一个
+  // 根本不存在的经纬度。用的是烤出这块地那同一套 gridCoords（buildVisit 里顺手带回来的）。
+  if (roamAt) {
+    const lim = QLWorld.W - 1;
+    const k = Math.min(lim, Math.max(0, z | 0)), q = Math.min(lim, Math.max(0, x | 0));
+    return t("world3d.f3.roam.earth", {
+      n: roamAt.n, lat: roamAt.lats[k].toFixed(4), lon: roamAt.lons[q].toFixed(4),
+    });
+  }
   const E = window.QLEarth;
   if (!E || !E.bbox) return "—";
   const w = E.bbox[0], so = E.bbox[1], e = E.bbox[2], n = E.bbox[3];
@@ -2153,13 +2374,35 @@ function renderW3Hud(s) {
   const tod = s.day > 0.72 ? t("world3d.time.day") : s.dusk > 0.4 ? t("world3d.time.dusk") : t("world3d.time.night");
   const time = row(t("world3d.f3.time"), `${tod} · #${s.height}`);
   const chn = row(t("world3d.f3.chunk"), ch ? `${ch.count} · ${ch.root_hex.slice(0, 8)}…` : "0");
-  const fp = row(t("world3d.f3.fp"), `<span class="mono gold">${terrain.fp}</span>`);
+  const fp = row(t("world3d.f3.fp"), `<span class="mono gold">${roamAt ? roamAt.fp : terrain.fp}</span>`);
   const fps = row("FPS", `${s.fps}${s.locked ? "" : " · " + t("world3d.f3.unlocked")}`);
-  $("w3d-f3").innerHTML = [pos, earth, surf, matRow, tgt, plc, slot, time, chn, fp, fps].join("");
+  const rows = [pos, earth];
+  if (roamAt) {
+    // 只读时「挖第几层」「分块根」「能放哪」三行说的都是账本那张窗口的事，
+    // 摆在这块不属于它的地上就是假信息。换成这一格自己烤出来的地形指纹。
+    rows.push(row(t("world3d.f3.roam.place"),
+      t("world3d.roam.parcel", { cell: roamAt.cell.toLocaleString(), i: roamAt.i, j: roamAt.j }), "gold"));
+    rows.push(row(t("world3d.f3.surface"),
+      `${s.surface} · ${t(`world3d.biome.${s.block & 7}`)} · ${t("world3d.f3.roam.stats", {
+        land: roamAt.stats.land.toLocaleString(), water: roamAt.stats.water.toLocaleString(),
+        trees: roamAt.stats.trees.toLocaleString() })}`));
+    rows.push(fp, slot, time);
+  } else {
+    rows.push(surf, matRow, tgt, plc, slot, time, chn, fp);
+  }
+  if (roamList && roamList.ok) {
+    rows.push(row(t("world3d.f3.roam.progress"),
+      t("world3d.f3.roam.count", { n: roamList.open, max: roamList.max, places: roamList.places,
+        cells: (s0.mine_claims_by_me || 0).toLocaleString() }), "gold"));
+  }
+  rows.push(fps);
+  $("w3d-f3").innerHTML = rows.join("");
 }
 
 async function w3Place(x, z, layer, slot) {
   if (w3Busy) return;
+  const blocked = roamBlocked();
+  if (blocked) { w3Toast(blocked, true); return; }
   if (!worldSnap || !worldSnap.unlocked) { w3Toast(t("world.err.locked"), true); return; }
   w3Busy = true;
   try {
@@ -2178,6 +2421,8 @@ async function w3Place(x, z, layer, slot) {
 
 async function w3Dig(x, z, layer) {
   if (w3Busy) return;
+  const blocked = roamBlocked();
+  if (blocked) { w3Toast(blocked, true); return; }
   if (!worldSnap || !worldSnap.unlocked) { w3Toast(t("world.err.locked"), true); return; }
   w3Busy = true;
   try {
@@ -2197,6 +2442,8 @@ async function w3Dig(x, z, layer) {
 
 async function w3Break(ent) {
   if (!ent) { w3Toast(t("world3d.err.terrain"), true); return; }
+  const blocked = roamBlocked();
+  if (blocked) { w3Toast(blocked, true); return; }
   if (!worldSnap || !worldSnap.unlocked) { w3Toast(t("world.err.locked"), true); return; }
   if (ent.owner !== worldSnap.address) { w3Toast(t("world3d.err.notown"), true); return; }
   if (!confirm(t("world.confirm.release", { name: ent.name }))) return;
@@ -2211,10 +2458,14 @@ async function w3Break(ent) {
   }
 }
 
-async function openWorld3D() {
+/** 走进世界。`opts.roam` = 只读漫游的那块地（QLEarthRoam 清单里的一项，已经烤好高度场）；
+ *  不带参数就是回自己那块地——「启动挖矿 · 进入世界」那一个按钮永远回自己家。 */
+async function openWorld3D(opts) {
   // 进场是有 3.4 秒的：这一串 await 里用户随时可能切页（俯冲期间壳层只是透明，照样点得着）。
   // 每次开/关都换号，回到前台的那次进场发现自己号过期了就放弃——不然"退出世界"之后世界会自己弹回来。
   const seq = ++worldOpenSeq;
+  const dest = (opts && opts.roam) || null;
+  if (!dest) roamAt = null;
   if (!worldSnap) {
     try {
       await loadWorld();
@@ -2225,11 +2476,22 @@ async function openWorld3D() {
   }
   // 俯冲的落点就是出生点：从太空落到"我马上要站上去的那一格"的正上方，
   // 而不是落到一个抽象的球上。第二次进世界（人还在原地）不再演一遍。
-  let spawn = w3Spawned ? null : pickSpawn(Number($("ent-x").value) || 128, Number($("ent-z").value) || 128);
+  // 漫游的那块地每次进场都重演：换一块地 = 换一片地方，那一下"落下去"正是它在换地方。
+  let spawn = null;
+  if (dest) {
+    spawn = pickSpawnIn({ heights: dest.heights, blocks: dest.blocks }, 128, 128, new Set());
+  } else if (!w3Spawned) {
+    spawn = pickSpawn(Number($("ent-x").value) || 128, Number($("ent-z").value) || 128);
+  }
   if (spawn) {
     if (!planetCtl) await mountPlanetBackdrop();
-    w3Dived = await worldDiveIn(cellLatLng(spawn.x, spawn.z));
-    if (seq !== worldOpenSeq) { w3Dived = false; return; }   // 俯冲期间被关掉：这一趟作废，别再 unhide
+    // 落点与 HUD 的经纬度同一个公式：家里用 cellLatLng(格)，漫游用那一格的中心（同一格地=8.96 公里）
+    w3Dived = await worldDiveIn(dest ? { lat: dest.lat, lon: dest.lon } : cellLatLng(spawn.x, spawn.z));
+    if (seq !== worldOpenSeq) {
+      w3Dived = false;
+      if (dest && roamAt === dest) roamAt = null;   // 这一趟作废：不许留下"半只读"的状态
+      return;                                       // 俯冲期间被关掉：别再 unhide
+    }
   } else {
     w3Dived = false;
   }
@@ -2237,11 +2499,12 @@ async function openWorld3D() {
   document.body.classList.add("w3d-on");
   syncPlanetBackdrop();   // 第一人称自己就是一个 WebGL 上下文，背景地球让帧
   const veil = $("w3d-veil");
-  if (w3Dived) {
+  if (w3Dived || dest) {
     // 俯冲已经把"落地"这一下演完了，题图这一层再压上去就是第二道门：
     // 改成第一人称整层淡入，背后那颗球在它淡到位之前继续转着。
+    // 漫游时一律走这一支：那张封面是**自己那块地**的黄昏，压在一块别的地方上就是骗人。
     veil.classList.add("gone");
-    $("w3d").classList.add("dive-in");
+    if (w3Dived) $("w3d").classList.add("dive-in");
   } else {
     // 每次进世界都从封面开始：封面是这片地的黄昏，淡入后落在同一个地方
     veil.classList.remove("gone");
@@ -2254,12 +2517,14 @@ async function openWorld3D() {
     w3.jumpTo(spawn.x, spawn.z, spawn.layer == null ? null : spawn.layer);
     // 面向这块地视野最开的方向：出生第一眼就要是"景"，不是一堵山壁
     if (spawn.yaw != null) w3.setView(spawn.yaw, -0.05);
-    spawnAnchor = spawn;
+    if (!dest) spawnAnchor = spawn;   // 柜台按家里的出生点摆位，漫游不能把它换掉
     w3Spawned = true;
   }
   syncWorld3D();
   rainRun(true);
   w3.open();
+  // 只读那一格：把视角锁解开，横幅上那两个按钮（回自己那块地 / 下一处）当场点得着
+  if (dest && document.pointerLockElement) document.exitPointerLock();
   // 第 1 步是导航事实：进过世界就记下来（不改账本）
   if (!prefsCache.opened_world) setPref("opened_world", true).then(renderGuide);
   renderFeedback();
@@ -2282,6 +2547,13 @@ function closeWorld3D() {
   syncPlanetBackdrop();   // 世界关了，背景地球重新满帧转起来
   $("w3d-pos").hidden = true;
   $("w3d-share").hidden = true;
+  // 出了世界就没有"正在看别人的地"这回事：只读标记留在清单上，地图会把一个
+  // 已经不存在的窗口标成"此处"。而且人还站在那块地的坐标上——留在家里那一格的
+  // 出生记录里就是"不用再演俯冲、也不用重选落点"，下一次进场会把人直接扔进自家窗口的
+  // 某一格陌生坐标。所以只有从漫游退出时才作废出生点，从家里退出仍然不重演俯冲。
+  if (roamAt) w3Spawned = false;
+  roamAt = null;
+  roamBanner();
   renderFeedback();
 }
 
@@ -2299,6 +2571,9 @@ $("w3d-hotbar").addEventListener("click", (e) => {
 // 位置按 POS_PUBLISH_MIN_MS 的速率地板节流；没解锁时后端会拒，静默即可。
 let posAt = 0;
 function presenceTick(s) {
+  // 只读漫游时不广播位置：报出去的 (x, z) 是自家窗口的坐标，
+  // 人在另一块地上却告诉别人"我在 128,128"，那是把展示信息做成了假话。
+  if (roamAt) return;
   const now = Date.now();
   if (now - posAt < 1500) return;
   posAt = now;
@@ -2310,9 +2585,12 @@ setInterval(async () => {
   if (!w3 || !$("w3d") || $("w3d").hidden) return;
   try {
     const r = await invoke("world_presence");
-    if (w3) w3.setPeers(r.peers || []);
+    if (w3 && !roamAt) w3.setPeers(r.peers || []);
     const n = r.count || 0;
     const el = $("w3d-pos");
+    // 在场人数数的是**自己那张窗口**里的人。在漫游时把它挂在画面上，
+    // 等于宣称"这块地上有 N 个人"——那是假的，所以只读期间整块收起来。
+    if (roamAt) { el.hidden = true; return; }
     el.hidden = false;
     el.textContent = n > 0 ? t("presence.tag", { n }) : t("presence.none");
     el.title = t("presence.note");
@@ -2321,6 +2599,20 @@ setInterval(async () => {
 
 // —— 作品分享：截图必须在这一帧里抓（缓冲不保留），抓不到就明说，不给一张透明图
 let shareShot = null;
+
+/** 一张截图的"在哪儿"。账本窗口里的坐标只对家里那张世界有意义：在漫游时写出
+ *  X/Z + 层，别人照这个坐标走进共享窗口会什么都看不见。所以只读那一格改报
+ *  地球经纬度＋第几处——它可复算（QL-SEAT-v1 链的第 n 项），但不是一句挖过的话。 */
+function shareGeo(s) {
+  if (!roamAt) {
+    return { meta: t("share.meta", { x: s.px.toFixed(1), y: s.py.toFixed(1), z: s.pz.toFixed(1), layer: s.layer }),
+             caption: t("share.caption", { x: Math.floor(s.px), z: Math.floor(s.pz), layer: s.layer, h: s.height }) };
+  }
+  const k = Math.min(QLWorld.W - 1, Math.max(0, Math.floor(s.pz)));
+  const q = Math.min(QLWorld.W - 1, Math.max(0, Math.floor(s.px)));
+  const where = t("world.roam.share", { n: roamAt.n, lat: roamAt.lats[k].toFixed(4), lon: roamAt.lons[q].toFixed(4) });
+  return { meta: where, caption: `${where} · #${s.height}` };
+}
 function currentShot() {
   return new Promise((resolve) => {
     if (!w3 || $("w3d").hidden) return resolve(null);
@@ -2334,23 +2626,19 @@ $("w3d-shot").addEventListener("click", async () => {
   const url = await currentShot();
   if (!url) { w3Toast(t("share.need"), true); return; }
   const s = w3.state();
-  shareShot = { url, s };
+  // 坐标在这一帧就定稿：存下来的是文字，之后换了一块地也不会把这张图的出处改掉
+  const geo = shareGeo(s);
+  shareShot = { url, s, geo };
   $("w3d-share-img").src = url;
-  $("w3d-share-meta").textContent = t("share.meta", {
-    x: s.px.toFixed(1), y: s.py.toFixed(1), z: s.pz.toFixed(1), layer: s.layer,
-  });
+  $("w3d-share-meta").textContent = geo.meta;
   $("share-out").textContent = "";
   $("w3d-share").hidden = false;
 });
 
 $("btn-share-save").addEventListener("click", async () => {
   if (!shareShot) return;
-  const s = shareShot.s;
-  const caption = t("share.caption", {
-    x: Math.floor(s.px), z: Math.floor(s.pz), layer: s.layer, h: s.height,
-  });
   try {
-    const p = await invoke("export_share", { imageDataUrl: shareShot.url, caption });
+    const p = await invoke("export_share", { imageDataUrl: shareShot.url, caption: shareShot.geo.caption });
     $("share-out").textContent = p ? t("share.saved", { path: p }) : t("share.cancel");
   } catch (e) {
     $("share-out").textContent = String(e);
@@ -2359,12 +2647,8 @@ $("btn-share-save").addEventListener("click", async () => {
 
 $("btn-share-copy").addEventListener("click", async () => {
   if (!shareShot) return;
-  const s = shareShot.s;
-  const line = t("share.meta", {
-    x: Math.floor(s.px), y: Math.floor(s.py), z: Math.floor(s.pz), layer: s.layer,
-  });
   try {
-    await navigator.clipboard.writeText(line);
+    await navigator.clipboard.writeText(shareShot.geo.meta);
     $("share-out").textContent = t("share.copied");
   } catch (e) {
     $("share-out").textContent = String(e);
@@ -2403,7 +2687,7 @@ listen("chain_block", (ev) => {
   }
 
   // 新块 = 新的历史 = 世界真的会变（种子含全部 VRF 折叠）
-  if (w3) {
+  if (w3 && !roamAt) {
     // 只在"这一块真的发了币"且"本机刚挖过矿"时铸金砖：
     // 没发行的块不落砖，避免每 2 秒在脚下凭空掉一块、让人误以为一直在挖到矿。
     const mintedHere = Number(e.minted || 0);

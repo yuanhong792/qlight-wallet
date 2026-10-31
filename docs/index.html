@@ -107,6 +107,16 @@
     .genesis .note b { color: var(--gold-dk); }
 
     /* —— 确定性世界 —— */
+    .world-earth { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+      padding: 16px; margin-bottom: 24px; }
+    .world-earth canvas { width: 100%; height: auto; aspect-ratio: 2 / 1; display: block; border-radius: 10px; }
+    .world-earth .cap { text-align: center; color: var(--muted); font-size: 12px; margin-top: 10px; }
+    .world-earth .cap b { color: var(--ink); }
+    .world-earth code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: var(--gold-dk); }
+    .world-earth .run { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+      color: var(--muted); margin-top: 8px; text-align: center; }
+    .world-earth .run b { color: var(--gold-dk); }
+    .world-earth .run.bad { color: #D93025; }
     .world-grid { display: grid; grid-template-columns: 320px 1fr; gap: 24px; align-items: start; }
     @media (max-width: 780px) { .world-grid { grid-template-columns: 1fr; } }
     .world-map { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
@@ -275,10 +285,16 @@
   <h2>世界是算出来的</h2>
   <p class="lead">「世界是被数学算出来、被数据渲染出来的」——这句话在这里不是文案，是可运行、可对拍、可证伪的实验。</p>
 
+  <div class="world-earth">
+    <canvas id="earthCanvas" width="1024" height="512"></canvas>
+    <div class="cap">这颗地球被切成 <b>2048 × 1024 = 2,097,152</b> 格，1 格 ≈ 19.6 公里，其中 <b>615,081</b> 格落在陆地上</div>
+    <div class="run" id="earthRun">正在本机现算：随包的 2 MiB 全球高程网格 → 高程色阶 + 西北向山体阴影</div>
+  </div>
+
   <div class="world-grid">
     <div class="world-map">
       <canvas id="worldCanvas" width="256" height="256"></canvas>
-      <div class="cap">256 × 256 · 每个像素由链历史算出，没有任何一张贴图</div>
+      <div class="cap">金环那一格内部的 8.96 公里 · 256 × 256 · 每个像素由链历史算出，没有任何一张贴图</div>
       <div class="fp"><span>本机像素指纹</span><b id="fpNow">—</b></div>
       <div class="fp"><span>基准（Python 独立实现）</span><span><b id="fpExp">—</b> <span id="fpVerdict"></span></span></div>
     </div>
@@ -327,6 +343,20 @@
       独占要靠链上记名（尚未做）；席位那块地也<b>还没接管</b>你脚下能挖能建的那块地——那一步动的是共识判据，不可逆，得先拍板。</p>
     </div>
     <div class="card">
+      <div class="ico">🧭</div>
+      <h3>可去之处：世界越大，走得进去看的地方越多</h3>
+      <p>「初始地不能永远都在一个国家」——席位本来就是全球任意一格；「能不能凭挖到的币解锁全球的地方」——这一轮做成了<b>只读漫游</b>（<code>QL-ROAM-v1</code>）。
+      它<b>不是第二套分配算法</b>：就是同一条席位链往后多取的 64 项，第 0 项必须等于链上那一格，对不上就不给入口。
+      解锁按<b>累计矿格数</b>：第 k 处要 k² 格（1、4、9…4096）。为什么不用币数——币会被转账和兑换池改，矿格数只有一层含义，
+      而且它<b>本来就是发行节奏那把梯子（50→10）的自变量</b>：「走得更远」和「挖得更熟」是同一件事，不是两个各刷各的进度条。
+      目的地的地貌在你本机现烤（<code>QL-EARTH-LOCAL-v1</code> + 共识种子），地表分类与家里同一组档位，不新增第二种地貌语言。
+      <b>只读是硬边界，不是客气</b>：账本只有<b>一张</b> 256×256 坐标窗口，一条记录只带 <code>(x, z, layer)</code>——站在第 7 块地签一条"我挖了一格"，
+      落点是你根本不在的地方，那不叫挖矿，<b>叫撒谎</b>。所以挖/放/拆/采四扇门在只读期全部先过闸门，而挖矿程序<b>不被挡</b>：
+      它一直在你自己那块地上落格，<b>看风景不该掉收益</b>。也别说得比实际更大：这道闸门挡的是<b>界面</b>，挡不住改过的客户端——
+      真要执法得把地块绑进坐标语义、席位链上记名（待办 #46），那是不可逆的共识改动。这一层<b>没碰钱也没碰判据</b>，而且是可查的：
+      Rust 与 Python 参考实现全文搜 <code>roam</code> = <b>0 处</b>，大陆指纹 <b>5e6a108d9dfe62bb</b> 一个字节没动，回归闸 <b>434</b> 项断言全绿。</p>
+    </div>
+    <div class="card">
       <div class="ico">👁</div>
       <h3>彼此看见 · 彼此证明自己存在</h3>
       <p>链上没有查询者，只有交易。所以"看见"被写成一条永久记账的<b>指认</b>：A 声明"我在块高 H 见过 B"，
@@ -348,7 +378,7 @@
     <b>60280b6d8d158dc3</b>，而 Python 与本页<b>同时</b>跳——但山还是那座山：高度场指纹不动。
     这就是规则集必须版本化、并与创世绑定的原因。
     而且这不只是网页演示：桌面钱包的 <b>🌍 世界</b>页就是编辑器——16 种像素物件（石头/橡树/花丛/木屋/木桥/灯塔/篝火/篱笆/鹿/鸟/鱼/蝴蝶/兔/绵羊/旅人/狼）
-    贯穿俯视图、物品栏、手持与第一人称世界；600 块一昼夜，有日月星、雾、放置粒子与脚步音效。第一人称<b>只由一台 WebGL1 渲染器画完</b>（<code>world3d.js</code>，零依赖、逐格铺贴图）——0.4.2 曾在它上面叠一层 Three.js 只做美术，0.4.5 整层撤掉了：同一块地上叠层在远处把每格顶面画成一片灰白斑点，基础层用同一份高度场反而读得清楚。这一进一退都不产出一条账本记录、不参与任何判据，玩法与收益一分没动——<b>渲染器不是共识的一部分</b>，这句话在这里是代码，不是口号。进世界<b>先从太空俯冲进来</b>（3.4 秒）：星空里的地球 → 落到<b>你那一格的正上方</b> → 第一人称整层淡入，落点与 HUD 的经纬度同一个公式算出来，自转会冻住、经度走短弧，所以落下的就是念出的那一格；终点高度 1600 公里是随包卫星影像的分辨率地板，再低就糊成一团灰绿。第二次进世界不再演，点一下当场落地。不走俯冲时先铺这张黄昏封面，第一帧真的画出来再淡出，出生点按"近处有落差、远处有景、看得到水面、不站树里不贴墙"打分挑出来：<b>第一眼就是封面里的那片地</b>。
+    贯穿俯视图、物品栏、手持与第一人称世界；600 块一昼夜，有日月星、雾、放置粒子与脚步音效。第一人称<b>只由一台 WebGL1 渲染器画完</b>（<code>world3d.js</code>，零依赖、逐格铺贴图）——0.4.2 曾在它上面叠一层 Three.js 只做美术，0.4.5 整层撤掉了：同一块地上叠层在远处把每格顶面画成一片灰白斑点，基础层用同一份高度场反而读得清楚。这一进一退都不产出一条账本记录、不参与任何判据，玩法与收益一分没动——<b>渲染器不是共识的一部分</b>，这句话在这里是代码，不是口号。配色也按「人在里面待几个小时不累」重定过一轮：大地并到一条<b>暖类比色轴</b>（草 H88 / 土 H32，不再近互补对打）、<b>彩度按面积分配</b>（大面积 ≤0.35，艳只留给矿粒与准星）、<b>格内明度带按面积收</b>（草 0.129 / 土 0.141，原来 0.216 / 0.288 读成迷彩），天空从一整片饱和蓝压到 S.42、黄昏从着火橙红改成灰紫玫瑰。同一机位抓帧对拍：整幅平均彩度 0.492→0.367、地面带局部明度梯度 4.25→2.73，平均明度 0.421→0.437 不动——<b>降的是吵，不是亮度</b>。而像素指纹 <b>5e6a108d9dfe62bb</b> 一个字节没动：<b>配色碰不到共识</b>。没抹平的一条写在这：俯视地图那六个色锁在共识指纹里（四份副本 + Rust 逐位对拍），所以地图与脚下<b>现在是两套配色</b>，改它要连规则版本一起动，挂在待办 #61。进世界<b>先从太空俯冲进来</b>（3.4 秒）：星空里的地球 → 落到<b>你那一格的正上方</b> → 第一人称整层淡入，落点与 HUD 的经纬度同一个公式算出来，自转会冻住、经度走短弧，所以落下的就是念出的那一格；终点高度 1600 公里是随包卫星影像的分辨率地板，再低就糊成一团灰绿。第二次进世界不再演，点一下当场落地。不走俯冲时先铺这张黄昏封面，第一帧真的画出来再淡出，出生点按"近处有落差、远处有景、看得到水面、不站树里不贴墙"打分挑出来：<b>第一眼就是封面里的那片地</b>。
     建造<b>不收费，但要材料</b>：签名即落账、不付币、不等确认，材料从世界里挖。
     地形<b>能挖</b>：对准露出来的顶面按左键就剥掉一层，泥土 / 石头 / 矿按深度分层进材料账——挖是一条 <b>op=dig</b> 记录，哪一层由「地表层 − 已挖层数」算出，客户端说了不算，跳层、水面与岩床下挖都会被拒。
     想拿币就去世界里<b>挖矿</b>：在矿脉里落一格并提交凭据，下一个块收下才发行新币。发行按<b>节奏档</b>结算——每笔最多结清一个当前档位（新钥匙 50 块，随本地址矿格数降到 10 块），<b>空块不补发</b>，等得再久也不会把中间空档一次性印出来——币是挖出来的，不是计时器印的。
@@ -502,6 +532,41 @@
 
     draw();
   })();
+</script>
+<script type="module">
+  /* 整颗地球用的是钱包那一份代码，不是截图、也不是给官网另写的一套渲染器：
+     docs/earth-grid.js / earth-local.js / earth-map.js 与 desktop-wallet/ui/ 里的原件
+     **逐字节相同**，docs/earth-global-h.bin 也是同一份 2 MiB 网格（对拍闸
+     tools/world/test_docs_parity.py 管这件事）。所以这页画的和钱包世界页画的是同一颗星球，
+     口径漂了会当场红，而不是"官网看起来还挺对"。 */
+  const MEASURED = { lat: 36.1527, lon: 120.6652 };   // 本页那块 8.96 km 实测窗口的中心
+  const run = document.getElementById('earthRun');
+
+  function fail(msg) {
+    run.className = 'run bad';
+    run.textContent = '这颗星球没画出来：' + msg + '（这一页不给你看备用图，画不出就是画不出）';
+  }
+
+  try {
+    const grid = await import('./earth-grid.js');
+    const map = await import('./earth-map.js');
+    const [i, j] = grid.cellOf(MEASURED.lat, MEASURED.lon);
+    const t0 = performance.now();
+    await map.paintEarth(document.getElementById('earthCanvas'), { i, j }, null, null, null);
+    const ms = Math.round(performance.now() - t0);
+    /* 615,081 是文档里写死的陆地格数。把它当基准而不是引文：现算一遍对得上就念 ✓，
+       对不上就当场翻红——数字是随包那份网格的属性，网格换一版这句话必须重算。 */
+    const H = await (await import('./earth-local.js')).loadHeightGrid();
+    let land = 0;
+    for (let k = 0; k < H.length; k++) if (H[k] >= grid.SEA_CODES) land++;
+    const EXP_LAND = 615081;
+    run.innerHTML =
+      `金环那一格 = 第 <b>${j.toLocaleString()}</b> 行 × 第 <b>${i.toLocaleString()}</b> 列 · 线性格号 <b>${(j * grid.GW + i).toLocaleString()}</b>` +
+      ` · 陆地格数现算 <b>${land.toLocaleString()}</b> ${land === EXP_LAND ? '✓ 与文档一致' : '✗ 与文档的 ' + EXP_LAND.toLocaleString() + ' 不一致'}` +
+      ` · 本机现算 ${ms} ms`;
+  } catch (e) {
+    fail(String(e && e.message || e));
+  }
 </script>
 
 </body>

@@ -224,7 +224,10 @@
     oreQuota: oreQuota, oreSeed: oreSeed, isOre: isOre,
     oreLayer: oreLayer, oreCells: oreCells, ORE_RULE_VERSION: 'QL-ORE-v1',
     ORE_SEED_SPACE: ORE_SEED_SPACE, ORE_SCAN_CAP: ORE_SCAN_CAP,
-    RULES: { SEA: SEA, SAND: SAND, SNOW: SNOW }
+    // 与 desktop-wallet/ui/world.js 同一组档位原样交出去：只读漫游（QL-ROAM-v1）
+    // 复用家里的地表分类，不在别处再抄一遍数字。
+    RULES: { SEA: SEA, SAND: SAND, SNOW: SNOW, M_FOREST: M_FOREST, M_DESERT: M_DESERT,
+             DENS_FOREST: DENS_FOREST, DENS_DESERT: DENS_DESERT, DENS_GRASS: DENS_GRASS }
   };
 
   /* Node CLI：与 world.py 对拍 */

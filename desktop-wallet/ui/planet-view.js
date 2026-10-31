@@ -1,40 +1,12 @@
 // 星球渲染：真实地球（自转）+ 星空。封面背景、星球选择页、太空俯冲进场共用这一份。
 //
-// 为什么单独成文件：星球层的字节口径（1 字节高程网格 ↔ 米）只要抄错一次，
-// 封面、席位、俯冲动画就会各说各话。三处引同一份，对拍才有意义。
-// 口径真身：tools/world/fetch_earth_planet.py，桌面端 Rust 另有一份，必须算出同一个格。
+// 为什么单独成文件：这一层只管**画**球。字节口径（1 字节高程网格 ↔ 米）搬到
+// earth-grid.js 了——那份不能只住在这里，否则 2D 世界地图和席位地块生成都得为了几个常量
+// 去依赖 three.js。口径仍然只有一份，只是不再和渲染绑在一起。
 import * as THREE from './vendor/three/three.module.js';
+import { GW, unquantize, cellOf } from './earth-grid.js';
 
-export const GW = 2048, GH = 1024;      // 等经纬高程网格：1 格 ≈ 19.6 公里
-export const SEA_CODES = 128;           // <128 海，>=128 陆，0 = 无数据
-export const OCEAN_STEP = 48.0;
-export const LAND_BUCKETS = [[0, 4, 32], [128, 8, 16], [256, 16, 16], [512, 32, 16],
-                             [1024, 64, 16], [2048, 128, 16], [4096, 256, 16]];
 const R_EARTH_M = 6371000;
-
-/** 星球层 1 字节 → 米。0 是"这里没有数据"，返回 NaN：补 0 会把缺数据烤成一片海，
- *  而一片海看上去并不荒谬，所以错得很安静。 */
-export function unquantize(b) {
-  if (b === 0) return NaN;
-  if (b < SEA_CODES) return -((SEA_CODES - 1 - b) + 0.5) * OCEAN_STEP;
-  let base = SEA_CODES;
-  for (const [start, step, count] of LAND_BUCKETS) {
-    if (b < base + count) return start + (b - base + 0.5) * step;
-    base += count;
-  }
-  return 8192;
-}
-
-/** 经纬度 → 网格索引：等经纬就是两次乘加，没有墨卡托在极地的面积爆炸。 */
-export function cellOf(lat, lon) {
-  return [Math.min(GW - 1, Math.max(0, Math.floor((lon + 180) / 360 * GW))),
-          Math.min(GH - 1, Math.max(0, Math.floor((90 - lat) / 180 * GH)))];
-}
-
-export function heightAt(H, lat, lon) {
-  const [i, j] = cellOf(lat, lon);
-  return unquantize(H[j * GW + i]);
-}
 
 /** 经纬度 → 球面方向（与 three.js SphereGeometry 的 UV 同一定义）：
  *  u = (lon+180)/360，v = (90-lat)/180。 */

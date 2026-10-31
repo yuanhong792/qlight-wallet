@@ -339,6 +339,53 @@ body {
 }
 .earth-legend b { color: #f0d69e; font-weight: 600; }
 .earth-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+/* 可去之处的图例：圈里写的是"已解锁几处"，与清单同一个数——两处不一样就是数据源分了家 */
+.earth-legend .sw.roam-sw {
+  width: 15px; height: 15px; border-radius: 50%; vertical-align: -2px;
+  background: rgba(240, 214, 158, .16); border: 1px solid rgba(240, 214, 158, .65);
+  color: #f0d69e; font: 700 9px/13px ui-monospace, Menlo, monospace; text-align: center;
+}
+
+/* 可去之处（QL-ROAM-v1）：全部只读。清单里每一行都要说清"第几处、在哪、进得进不去"，
+   锁着的行压根不出现，但"还锁着多少"得写在进度那行里——看不见进度就等于没做。 */
+.roam-progress { margin: 6px 2px 8px; font-size: 12.5px; line-height: 1.5; color: #cfe0d8; }
+.roam-progress b { color: #f0d69e; font-weight: 600; }
+.roam-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 2px 8px; }
+.roam-row {
+  display: flex; align-items: center; gap: 7px; cursor: pointer;
+  padding: 5px 9px; border-radius: 9px; text-align: left;
+  font: 12px/1.2 inherit;
+  background: rgba(8, 20, 38, .72); border: 1px solid rgba(127, 215, 232, .28);
+  color: #cfe0d8;
+}
+.roam-row:hover { background: rgba(12, 28, 52, .92); border-color: rgba(240, 214, 158, .6); }
+.roam-row.on { background: rgba(46, 36, 14, .8); border-color: #e9c273; }
+.roam-n { min-width: 1.5em; color: #f0d69e; font-weight: 700; }
+.roam-co { font-family: ui-monospace, Menlo, monospace; color: #9fb4c6; }
+.roam-go { color: #7fd7e8; letter-spacing: .04em; }
+.roam-row.on .roam-go { color: #ffe9b0; }
+.roam-msg {
+  margin: 0 2px 8px; padding: 7px 10px; border-radius: 9px;
+  font-size: 12px; line-height: 1.5; word-break: break-word;
+  background: rgba(12, 34, 26, .8); border: 1px solid rgba(126, 214, 168, .4); color: #d7f2e2;
+}
+.roam-msg.bad { background: rgba(48, 16, 18, .8); border-color: rgba(229, 72, 77, .5); color: #ffd9d9; }
+.roam-msg[hidden] { display: none; }
+
+/* 世界里的只读横幅：站在别人的地上，第一件事是知道自己站的不是自己那块地 */
+.w3d-roam {
+  position: absolute; left: 50%; top: 14px; transform: translateX(-50%); z-index: 5;
+  display: flex; align-items: center; gap: 8px; max-width: calc(100vw - 40px);
+  padding: 7px 10px; border-radius: 999px;
+  background: rgba(6, 14, 26, .86); border: 1px solid rgba(127, 215, 232, .45);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, .45);
+}
+.w3d-roam[hidden] { display: none; }
+.w3d-roam.busy { opacity: .55; pointer-events: none; }
+.roam-tag {
+  font-size: 12.5px; color: #d6ecf4; letter-spacing: .04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .parcel-strip {
   display: grid; grid-template-columns: 96px 1fr; gap: 10px; align-items: center;
   margin: 8px 2px 12px;

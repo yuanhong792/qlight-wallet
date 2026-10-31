@@ -92,7 +92,7 @@ fn h32(x: u32, y: u32, seed: u32) -> u32 {
     h ^ (h >> 16)
 }
 
-/// 陆地码 128..255 → 米（档中值）。与 `ui/planet-view.js` 那份逐字同义。
+/// 陆地码 128..255 → 米（档中值）。与 `ui/earth-grid.js` 那份逐字同义。
 /// 逐档推进：进不了本档的把档宽扣掉再看下一档，落进本档的当场定值。
 pub fn land_meters(code: u8) -> f64 {
     let mut c = code as i32 - SEA_CODES as i32; // 0..127

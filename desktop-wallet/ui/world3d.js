@@ -35,17 +35,29 @@
   // 这个数和 world3d-three.js 的 WATER_Y 必须是同一个，否则眼睛里的水和画出来的水不是一层。
   // 雾：区域只有 REGION 格，边界外是真空。用距离雾在边界之前把地形融进天空，
   // 否则走两步就看见"世界在 32 格外被整齐切断"——确定性世界的边缘不该是穿帮。
-  var SKY = [0.55, 0.72, 0.92];
+  var SKY = [0.631, 0.733, 0.851];
   var FOG_NEAR = 12, FOG_FAR = REGION / 2 + 1;
 
   // 《我的世界》最值钱的东西不是方块，是"世界活着"：太阳会落、天会黑、雾会变。
   // 这里用一个块 = 2 秒的真实节奏做昼夜：600 块 = 20 分钟一天（与 MC 同量级）。
   var DAY_BLOCKS = 600;
-  var SKY_DAY = [0.55, 0.72, 0.92], SKY_DUSK = [0.96, 0.53, 0.32], SKY_NIGHT = [0.03, 0.05, 0.14];
-  var TINT_DAY = [1, 1, 1], TINT_DUSK = [1.0, 0.82, 0.68], TINT_NIGHT = [0.46, 0.56, 0.82];
+  // —— 配色整改（2026-10-31，业主：「色彩搭配要合理、美观、人在里面待着不累」）——
+  //   下面每个数都是 HSL 的 S，用 rgb→hsl 反算可核；不写定义就会像上一版注释那样，
+  //   把 HSV 的 .44 和 HSL 的 .50 当成同一个数在传。
+  //   天空是画面里最大的一块亮部：旧 SKY_DAY H212/S.70 是一整片饱和蓝，与暖色地面
+  //   构成大面积互补——最累眼的一种配法。压到 S.42，蓝天仍然蓝，但不再和大地对打。
+  //   黄昏从旧 SKY_DUSK H20/S.89 的橙红改成 H347/S.23 的灰紫玫瑰：黄昏要的是"光在退"，
+  //   不是屏幕上着火。夜里改的是**打在物体上的光**（TINT_NIGHT）而不是天色：S.44→S.30，
+  //   夜里该是低彩度，不是泡在蓝水里；天色本身仍是那层近黑的深蓝（L 0.09 没动）。
+  var SKY_DAY = [0.631, 0.733, 0.851], SKY_DUSK = [0.700, 0.520, 0.560], SKY_NIGHT = [0.040, 0.060, 0.130];
+  var TINT_DAY = [1, 1, 1], TINT_DUSK = [1.00, 0.90, 0.84], TINT_NIGHT = [0.52, 0.58, 0.74];
 
 
   // 与 world.js 的像素分类一一对应（blk 低 3 位）——俯视图的像素与走进去的方块不可能对不上
+  // ⚠ 本轮配色整改只动了**三维这一侧**（terrain-tex.js 的 16 格地形 + 光照色温）。
+  //    这六个色仍然是 world.js 的那一份，因为它的像素指纹 `5e6a108d9dfe62bb` 是
+  //    四份渲染器副本（CPython / 三份 JS）对拍的公开基准，动它要连规则版本一起动。
+  //    所以现在地图与脚下确实是两套配色，这条不一致记在待办 #61，没有偷偷抹平。
   var PAL = [
     [18, 54, 118],   // 0 水
     [196, 176, 122], // 1 沙
@@ -86,11 +98,21 @@
   var VS2 = 'attribute vec3 a_p;attribute vec2 a_uv;attribute float a_s;uniform mat4 u_vp;uniform vec3 u_eye;' +
     'varying vec2 v_uv;varying float v_s;varying float v_d;' +
     'void main(){v_uv=a_uv;v_s=a_s;v_d=distance(a_p,u_eye);gl_Position=u_vp*vec4(a_p,1.0);}';
+  // 光照不是"同一个颜色乘一个数"。真实户外朝上的面同时接太阳与整片天空，
+  // 朝下的竖面只接天空——所以它比顶面**更暗、也更冷、更偏蓝**。以前只乘一个标量，
+  // 山坡的阴面就是"同一块土调暗一点"，看着像蒙了灰；现在按明度档顺带把色温推过去：
+  // 亮档偏暖（1.02/1.00/0.97）、暗档偏冷（0.86/0.90/1.06）。这一步是"久看不累"里
+  // 最值钱的一半——人眼对色温的层次比对亮度敏感得多。
+  // 冷档第一版是 (0.78/0.87/1.12)，抓帧量出来阴面的浮土 (129,109,86) 被推成了
+  // (70,66,67)——一个不偏不倚的中性灰：土在阴面变成石头，比蒙灰更糟。
+  // 现在这条是"只推色温、不抽饱和"的量，同一格阴面落在 (81,70,62)，仍然读得出是土。
   var FS2 = 'precision mediump float;uniform sampler2D u_tex;uniform vec4 u_tint;uniform vec3 u_fog;uniform vec2 u_fog_r;' +
     'varying vec2 v_uv;varying float v_s;varying float v_d;' +
     'void main(){vec4 t=texture2D(u_tex,v_uv);if(t.a<0.5)discard;' +
+    'float k=clamp((1.0-v_s)*2.6,0.0,1.0);' +
+    'vec3 sh=v_s*mix(vec3(1.02,1.00,0.97),vec3(0.86,0.90,1.06),k);' +
     'float f=clamp((v_d-u_fog_r.x)/(u_fog_r.y-u_fog_r.x),0.0,1.0);f*=f;' +
-    'gl_FragColor=vec4(mix(t.rgb*v_s*u_tint.rgb,u_fog,f),1.0);}';
+    'gl_FragColor=vec4(mix(t.rgb*sh*u_tint.rgb,u_fog,f),1.0);}';
 
 
   function perspective(fovy, aspect, near, far) {
@@ -406,8 +428,13 @@
           if (y0 < 0 || y < y0) y0 = y; if (y > y1) y1 = y;
         }
         if (x0 < 0) continue;                     // 整格全空：不注册，照旧按整格铺
-        out[id] = [(ox + x0 - 0.5) / w, (oy + y0 - 0.5) / h,
-                   (ox + x1 + 1.5) / w, (oy + y1 + 1.5) / h];
+        // 铺到**不透明像素自己的边界**，往外只让出 1/20 个纹素。
+        // 原来这里写的是 x0-0.5 / x1+1.5，也就是朝格子外扩半个纹素：100% 覆盖的实心格
+        // （树干、树叶）于是各有一半伸进邻格，树干右沿就吸到邻格的树叶绿——
+        // 截图里树干上那道竖着的绿线是这么来的。图集是 8×8 硬边像素格，
+        // 外扩永远会吃到邻居，只有内缩才是安全的。
+        out[id] = [(ox + x0 + 0.05) / w, (oy + y0 + 0.05) / h,
+                   (ox + x1 + 0.95) / w, (oy + y1 + 0.95) / h];
       }
       return out;
     }
@@ -435,11 +462,11 @@
     }
     function tcube(x0, y0, z0, x1, y1, z1, tile) {
       tquad([x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1], tile, 1.0, N_UP, 1);
-      tquad([x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0], tile, 0.5, N_DOWN, 1);
-      tquad([x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0], tile, 0.8, N_N, 1);
-      tquad([x1, y0, z1, x0, y0, z1, x0, y1, z1, x1, y1, z1], tile, 0.8, N_S, 1);
-      tquad([x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0], tile, 0.6, N_E, 1);
-      tquad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], tile, 0.6, N_W, 1);
+      tquad([x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0], tile, 0.55, N_DOWN, 1);
+      tquad([x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0], tile, 0.84, N_N, 1);
+      tquad([x1, y0, z1, x0, y0, z1, x0, y1, z1, x1, y1, z1], tile, 0.84, N_S, 1);
+      tquad([x1, y0, z0, x1, y0, z1, x1, y1, z1, x1, y1, z0], tile, 0.70, N_E, 1);
+      tquad([x0, y0, z1, x0, y0, z0, x0, y1, z0, x0, y1, z1], tile, 0.70, N_W, 1);
     }
     /** 十字交叉面（花、活物）：两个互相垂直的竖面，任何角度都看得到 */
     function cross(cx, y0, cz, w, h, tile) {
@@ -597,7 +624,7 @@
             var nz = cz + (k === 0 ? -1 : k === 1 ? 1 : 0);
             var nl = level(nx, nz);
             if (nl >= lv) continue;
-            var sh = k < 2 ? 0.8 : 0.6;
+            var sh = k < 2 ? 0.84 : 0.70;
             var nrm = k === 0 ? N_N : k === 1 ? N_S : k === 2 ? N_E : N_W;
             for (var L = nl + 1; L <= lv; L++) {
               // 挖过的列按账本三带贴坑壁；没挖过的坡按"土被盖岩基"贴——山的外面是土，不是石头

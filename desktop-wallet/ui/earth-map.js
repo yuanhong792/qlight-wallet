@@ -12,12 +12,13 @@
 //
 // 全程 2D canvas：地图是"看一眼我在地球哪儿"，不是第二个 3D 视图，
 // 为它再开一个 WebGL 上下文不值当（封面与俯冲已经各有一份）。
-import { GW, GH, SEA_CODES, unquantize } from './planet-view.js';
+import { GW, GH, SEA_CODES, unquantize, cellOf } from './earth-grid.js';
 import { loadHeightGrid, genBlock, fingerprint, N, CELL_M,
          SEA_FIELD, SAND_FIELD, BEACH_M, SHELF_MAX_M } from './earth-local.js';
 
 const CELL_KM = 19.57;          // 赤道处 40075 km ÷ 2048
 const M_PER_ROW = 111.32 * (180 / GH) * 1000;   // 一行跨的南北距离（米）
+const SHADE_SPAN_M = 20000;   // 山体阴影采坡的地面跨度：约等于赤道处的一格
 
 /** 高程 → 颜色：海按深度分蓝，陆按高度走 绿→黄绿→褐→灰→雪线白。
  *  配色不是审美选择，是"读得出山在哪"：海陆用色相分，高度用明度分。 */
@@ -56,6 +57,11 @@ async function buildBase() {
   for (let j = 0; j < GH; j++) {
     const lat = 90 - (j + 0.5) / GH * 180;
     const mPerCol = M_PER_ROW * Math.max(Math.abs(Math.cos(lat * Math.PI / 180)), 0.02);
+    // 东西向梯度按**固定地面距离**取样，不是固定格数。等经纬网格的经线在极地收敛：
+    // 赤道一格 19.6 公里，−85° 只剩 1.4 公里，跨 1 格采坡把冰壁算成 0.9 的坡度
+    // （约 42°）——南端那条黑白条纹带就是这么来的。|纬度| < 70° 时这一档仍然取 1 格，
+    // 与改之前逐位相同；再往两极才摊开，因为那里"一格"已经不是同一个物理长度了。
+    const S = Math.max(1, Math.round(SHADE_SPAN_M / (2 * mPerCol)));
     for (let i = 0; i < GW; i++) {
       const k = j * GW + i, m = el[k];
       const land = m >= 0;
@@ -63,7 +69,8 @@ async function buildBase() {
       if (land) {
         // 山体阴影：光从西北来，朝西北升的坡亮、朝东南降的坡暗。
         // 没有这一层，喜马拉雅和一块田都是同一团褐色——地图就读不出"山在哪"。
-        const gx = (el[k + (i + 1 < GW ? 1 : 0)] - el[k - (i > 0 ? 1 : 0)]) / (2 * mPerCol);
+        const ir = Math.min(GW - 1, i + S), il = Math.max(0, i - S);
+        const gx = (el[j * GW + ir] - el[j * GW + il]) / ((ir - il) * mPerCol);
         const gy = (el[k + (j + 1 < GH ? GW : 0)] - el[k - (j > 0 ? GW : 0)]) / (2 * M_PER_ROW);
         const sh = 0.74 + 0.42 * Math.tanh((gx + gy) * 0.5 * 2600);
         r *= sh; g *= sh; b *= sh;
@@ -137,14 +144,13 @@ async function buildParcel(lat, lon, seed) {
   return parcelCache.cv;
 }
 
-const cellOf = (lat, lon) => [
-  Math.min(GW - 1, Math.max(0, Math.floor((lon + 180) / 360 * GW))),
-  Math.min(GH - 1, Math.max(0, Math.floor((90 - lat) / 180 * GH))),
-];
-
-/** 画整颗地球：底图 + 席位金环 + 脚下青框 + 经纬网格线（本初子午线与赤道）。
- *  `walked` 是当前真正在走的窗口中心；席位与它不同才需要两个标记。 */
-export async function paintEarth(canvas, seat, walked, seed) {
+/** 画整颗地球：底图 + 席位金环 + 脚下青框 + 可去之处 + 经纬网格线（本初子午线与赤道）。
+ *  `walked` 是当前真正在走的窗口中心；席位与它不同才需要两个标记。
+ *  `roam` 是 QL-ROAM-v1 的目的地清单：解锁的用实圈加编号，没解锁的用空心灰圈——
+ *  「锁着」必须看得见，点上去还要当场说清差几格，不许做成"点了没反应"。
+ *  标记的屏幕位置同时写进 `lastMarkers`，供 earthHit() 做命中判定（同一套坐标，不各算一遍）。 */
+let lastMarkers = [];
+export async function paintEarth(canvas, seat, walked, seed, roam) {
   const base = await buildBase();
   const ctx = canvas.getContext('2d');
   const { width: w, height: h } = canvas;
@@ -185,7 +191,46 @@ export async function paintEarth(canvas, seat, walked, seed) {
     ctx.moveTo(x, y + 12); ctx.lineTo(x, y + 16);
     ctx.lineWidth = 1.5; ctx.stroke();
   }
+
+  // 可去之处：编号点。配色遵守 §9.27 的"彩度按面积分配"——地图是整颗地球，
+  // 点位是小面积点缀，所以这里容得下金；未解锁的用低彩度灰蓝空心圈，读得出"有，但还进不去"。
+  lastMarkers = [];
+  const list = roam || [];
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = '700 8px ui-monospace, monospace';
+  for (const r of list) {
+    const x = (r.i + 0.5) / GW * w, y = (r.j + 0.5) / GH * h;
+    lastMarkers.push({ kind: 'roam', n: r.n, unlocked: !!r.unlocked, x, y, cell: r.cell });
+    if (r.unlocked) {
+      ctx.fillStyle = 'rgba(18,22,31,.72)';
+      ctx.beginPath(); ctx.arc(x, y, 6.5, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#F0D69E'; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.arc(x, y, 6.5, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = '#F0D69E';
+      ctx.fillText(String(r.n), x, y + 0.5);
+    } else {
+      ctx.strokeStyle = 'rgba(170,182,198,.62)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x - 2.4, y + 2.4); ctx.lineTo(x + 2.4, y - 2.4); ctx.stroke();
+    }
+  }
+  if (seat) lastMarkers.push({ kind: 'home', x: (seat.i + 0.5) / GW * w, y: (seat.j + 0.5) / GH * h });
   return base;
+}
+
+/** 地图点击 → 命中的标记（9 像素内最近的一个），没有就 null。
+ *  地球在 512×256 的面板上画 209 万格，一格只有 0.25 像素，所以命中判定只能按标记的
+ *  屏幕半径来——按经纬度反查格子会点出一串"谁都没画在那里"的坐标。 */
+export function earthHit(canvas, clientX, clientY, radius = 9) {
+  const r = canvas.getBoundingClientRect();
+  const x = (clientX - r.left) * (canvas.width / r.width);
+  const y = (clientY - r.top) * (canvas.height / r.height);
+  let best = null, bd = radius;
+  for (const m of lastMarkers) {
+    const d = Math.hypot(x - m.x, y - m.y);
+    if (d < bd) { bd = d; best = m; }
+  }
+  return best;
 }
 
 /** 席位地块的缩略图（画进地球图右下角的方形凹槽里，与金环是同一块地） */

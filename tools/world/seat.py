@@ -39,15 +39,23 @@ from gen_planet_local import (GW, GH, SEA_CODES, N, CELL_M, RULE, LAND_BYTES,
 
 SEAT_RULE = "QL-SEAT-v1"
 TRIES_MAX = 4096
+# 漫游清单的上限：与 desktop-wallet/ui/earth-roam.js 的 ROAM_MAX 同一个数。
+# 它是**界面**决定（列表要数得过来），不是判据，所以改它不需要共识版本。
+ROAM_MAX = 64
 # 共识规则种子（QL-WORLD-RULES-v3 的 32 位摘要）：微地形的种子必须是它，
 # 换种子 = 换一片地貌 = 换世界，所以这里不留 CLI 旋钮，只从真身取。
 RULES_SEED = 0x50D296E0
 
 
-def seat_of(address, genesis_hex, H):
-    """地址 + 创世哈希 → 席位。返回 None 表示 4096 轮没命中陆地（调用方必须炸，不许兜底）。"""
+def seat_path(address, genesis_hex, H, max_cells):
+    """席位链：canon → SHA-256 → 一路 sha256(h) 往下走，收前 `max_cells` 个**不重复**的陆地格。
+
+    第 0 项就是 `seat_of` 的那一格——「可去之处」（QL-ROAM-v1）不是第二套分配算法，
+    是同一条链往后多取几项。所以家园那一格与漫游清单第 0 项永远同源：
+    两份各走各的链，迟早给出两个"你的席位"。"""
     canon = f"{SEAT_RULE}|{address.strip().lower()}|{genesis_hex.strip().lower()}"
     h = hashlib.sha256(canon.encode("utf-8")).digest()
+    out, seen = [], set()
     for tries in range(TRIES_MAX):
         if tries:
             h = hashlib.sha256(h).digest()
@@ -55,11 +63,23 @@ def seat_of(address, genesis_hex, H):
         j = int.from_bytes(h[4:8], "big") % GH
         code = int(H[j, i])       # H 是 (GH, GW) 二维视图；JS/Rust 那份是平铺的 [j*GW+i]
         if code >= SEA_CODES:                     # 0 码（无数据）也走这里被拒
+            cell = j * GW + i
+            if cell in seen:
+                continue
+            seen.add(cell)
             lon = -180.0 + (i + 0.5) / GW * 360.0
             lat = 90.0 - (j + 0.5) / GH * 180.0
-            return {"i": i, "j": j, "cell": j * GW + i, "code": code,
-                    "lat": lat, "lon": lon, "tries": tries, "canon": canon}
-    return None
+            out.append({"i": i, "j": j, "cell": cell, "code": code,
+                        "lat": lat, "lon": lon, "tries": tries, "canon": canon})
+            if len(out) >= max_cells:
+                break
+    return out
+
+
+def seat_of(address, genesis_hex, H):
+    """地址 + 创世哈希 → 席位。返回 None 表示 4096 轮没命中陆地（调用方必须炸，不许兜底）。"""
+    p = seat_path(address, genesis_hex, H, 1)
+    return p[0] if p else None
 
 
 def describe(seat, H):
@@ -111,6 +131,20 @@ def selftest():
     # 换创世 = 换席位：世界跟着币走，而不是跟着地址走
     s3 = seat_of(a, hashlib.sha256(b"other genesis").hexdigest(), H)
     assert s3 != s1, "换了创世哈希席位没动——地形就没有跟着链条变"
+
+    # 可去之处（QL-ROAM-v1）：清单必须是同一条链的延续，不是第二个分配器。
+    # 这一份只证明"链能往后取、取出来都是陆地、不重复、第 0 项就是家"；
+    # 解锁曲线（k²）属于纯客户端的展示层，写在这里只为了对账，不进任何判据。
+    path = seat_path(a, g, H, 1 + ROAM_MAX)
+    assert path[0] == s1, "漫游清单第 0 项与席位不是同一格——两条链迟早各指一处"
+    assert len(path) == 1 + ROAM_MAX, f"席位链只取到 {len(path)} 项，凑不满 1+{ROAM_MAX}"
+    assert len({p["cell"] for p in path}) == len(path), "漫游清单里有重复的格"
+    assert all(p["code"] >= SEA_CODES for p in path), "清单里出现了非陆地格"
+    assert all(abs(p["lat"]) <= 90.0 and abs(p["lon"]) <= 180.0 for p in path)
+    need = [k * k for k in range(1, ROAM_MAX + 1)]
+    assert need[0] == 1 and need[-1] == ROAM_MAX * ROAM_MAX
+    print(f"可去之处      同一条链往后取 {ROAM_MAX} 项 · 第 1 处要 {need[0]} 格、"
+          f"第 {ROAM_MAX} 处要 {need[-1]:,} 格（k²，纯客户端门槛）")
 
     # 席位必须能烤出一块地（这才是"能在地球上找到"的意思）
     m = load_measured()

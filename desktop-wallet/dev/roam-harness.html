@@ -1,0 +1,117 @@
+<!doctype html><meta charset="utf-8"><title>可去之处对拍</title>
+<!-- 只读漫游（QL-ROAM-v1）的抓帧页，DESIGN §9.28 引的帧就是这里出的。
+     名字不叫 `__xxx.html` 是刻意的：`.gitignore` 挡的是**带假 `__TAURI__` 桩**的那批页
+     （一份能伪造整条链状态的外壳不该进仓库，更不该进包），这一页一个桩都不用——
+     它只调 ui/ 里那批真函数。不入库的对拍页等于没人能复算 §9.28 里那些数。
+     用法：`python3 desktop-wallet/dev/serve.py 8791 --sink /tmp/ql-frames`（服务根落在 desktop-wallet/），
+     然后 `…/dev/roam-harness.html?mode=map` 看整颗地球，`?mode=fp&n=K&cells=25` 走进第 K 处。
+     抓帧调 `window.__cap('名字.png')`，POST 到同一进程的 8812 口，PNG 落进 `--sink` 那个目录。 -->
+<style>
+  html, body { margin: 0; background: #06080d; overflow: hidden; }
+  canvas { display: block; }
+  canvas[hidden] { display: none; }   /* 作者样式会盖掉 hidden 属性：不写这条，
+                                         另一块画布仍然占满视口，截图就是一片黑 */
+  #c { width: 100vw; height: 100vh; }
+  #map { margin: 0 auto; width: min(100vw, 1024px); height: auto; }
+  #note { position: fixed; left: 8px; bottom: 8px; right: 8px; color: #d9e2f2;
+          font: 12px ui-monospace, monospace; background: rgba(6,8,13,.7); padding: 6px 8px; }
+</style>
+<canvas id="c" width="1120" height="740"></canvas>
+<canvas id="map" width="1024" height="512" hidden></canvas>
+<div id="note">…</div>
+<script>
+// 同 __fp.html：后台标签页不发 rAF，截图回调就永远不回来，所以先把 rAF 换成 setTimeout。
+window.requestAnimationFrame = function (cb) {
+  return setTimeout(function () { cb(performance.now()); }, 16);
+};
+window.cancelAnimationFrame = function (id) { clearTimeout(id); };
+</script>
+<script src="../ui/earth-height.js"></script>
+<script src="../ui/sprites.js"></script>
+<script src="../ui/qlight-hd-sprites.js"></script>
+<script src="../ui/terrain-tex.js"></script>
+<script src="../ui/world.js"></script>
+<script src="../ui/world3d.js"></script>
+<script src="../ui/earth-roam.js"></script>
+<script type="module">
+/* 只读漫游的对拍页：席位链、地块烤制、地表分类、地图标记全部走 app.js 用的同一批函数，
+ * 这一页不复算第二套规则——它对拍的是"画面画出来了没有"，不是"规则对不对"（规则由
+ * tools/world/test_roam_v1.js 与 seat.py --selftest 管）。
+ * 快照里除了 address / genesis / rules_id / 累计矿格数之外没有别的输入，所以伪造一个
+ * mine_claims_by_me 就等于"在这个进度上截一张图"。 */
+const q = new URLSearchParams(location.search);
+const ADDR = q.get('addr') || 'ql1qqqspfa0h8u73wp0lapt9pgy329w8yd3zup4mxedswqke6220nlqn4wgcl';
+const GEN = q.get('genesis') || '5dc2205a8f0153a05f84e26ab94086009796bb68fdfddff439f97ebfd2aa3104';
+const SEED = 0x50D296E0;                    // 共识 rules_id，不是本页的旋钮
+const CELLS = +(q.get('cells') || 25);      // 累计矿格数 → 解锁 sqrt(25)=5 处
+const mode = q.get('mode') || 'map';
+const note = (s) => { document.getElementById('note').textContent = s; };
+
+const { loadHeightGrid, seatPath, genBlock, fingerprint } = await import('../ui/earth-local.js');
+const { paintEarth } = await import('../ui/earth-map.js');
+const H = await loadHeightGrid();
+const path = await seatPath(ADDR, GEN, H, 1 + window.QLEarthRoam.ROAM_MAX);
+const seat = path[0];
+const R = window.QLEarthRoam.plan(path, seat.cell, CELLS);
+window.__roam = { seat, R, path };
+if (!R.ok) note(`席位链与快照格对不上：path[0]=${seat.cell}`);
+
+if (mode === 'map') {
+  document.getElementById('c').hidden = true;
+  const cv = document.getElementById('map');
+  cv.hidden = false;
+  await paintEarth(cv, seat, null, SEED, R.items);
+  note(`席位 ${seat.cell}（${seat.lat.toFixed(3)}°, ${seat.lon.toFixed(3)}°）· 解锁 ${R.open}/${R.max} · `
+    + `累计 ${CELLS} 格 · 清单 ${R.items.length} 项`);
+  document.title = 'roam-map';
+} else {
+  const n = Math.max(1, Math.min(R.open, +(q.get('n') || 1)));
+  const it = R.items[n - 1];
+  const words = window.QLWorld.seedWords(GEN, []);
+  const { field, info } = genBlock(H, it.lat, it.lon, SEED);
+  const v = window.QLEarthRoam.visit(field, window.QLWorld, words);
+  window.__visit = v;
+  // 中心点未必站得住：这一页只挑"陆地 + 没树 + 四周同高"的一格当出生点。
+  // 钱包里走的是 app.js 的 pickSpawnIn（还要避开别人的块），这里不复用它——
+  // 这一页证明的是"别处的那块地烤得出来、画得出来"，构图好坏归 #42。
+  const N = Math.round(Math.sqrt(v.blocks.length));
+  let sx = -1, sz = -1;
+  outer: for (let z = 4; z < N - 4; z += 2) {
+    for (let x = 4; x < N - 4; x += 2) {
+      const k = z * N + x, b = v.blocks[k];
+      if (b % 8 === 0 || (b & 8)) continue;                  // 水 / 有树
+      const h = v.heights[k];
+      let flat = true;
+      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]])
+        if (v.heights[(z + dz) * N + x + dx] !== h) { flat = false; break; }
+      if (flat) { sx = x; sz = z; break outer; }
+    }
+  }
+  if (sx < 0) { sx = N >> 1; sz = N >> 1; }                  // 整块地都是陡坡：照原样站中心
+  const w3 = window.QLWorld3D.create(document.getElementById('c'), {});
+  w3.setWorld(v.heights, v.blocks);
+  w3.setEntities([], '');
+  w3.setResources([]);
+  w3.setDug([]);
+  w3.setSlots(16);
+  w3.setSlot(4);
+  w3.setMaxLayer(window.QLWorld.MAX_LAYER);
+  w3.setTime(+(q.get('time') || 1230));
+  w3.spawn(sx, sz);
+  w3.setView(+(q.get('yaw') || 2.2), +(q.get('pitch') || -0.1));
+  w3.open();
+  window.__w3 = w3;
+  const yaw = +(q.get('yaw') || 2.2), pitch = +(q.get('pitch') || -0.1);
+  setInterval(() => w3.setView(yaw, pitch), 40);   // 机位钉死，理由同 __fp.html
+  window.__cap = (name) => new Promise((resolve) => {
+    w3.snapshot((url) => {
+      fetch('http://127.0.0.1:8812/' + name, { method: 'POST', body: url }).
+        then((r) => r.text()).then(resolve);
+    });
+  });
+  note(`第 ${n} 处 · 地球格 ${it.cell}（${it.lat.toFixed(3)}°, ${it.lon.toFixed(3)}°）· ${info.rule} σ=${info.sigma_m}m `
+    + `基面=${info.base_m}m 夸大=${info.exag}× · `
+    + `陆地 ${v.stats.land} 水 ${v.stats.water} 树 ${v.stats.trees} · 指纹 ${fingerprint(field)} · 出生 (${sx},${sz})`);
+  document.title = 'roam-fp';
+}
+</script>

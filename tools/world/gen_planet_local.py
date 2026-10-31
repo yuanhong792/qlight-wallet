@@ -46,7 +46,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 DATA = os.path.join(REPO, "desktop-wallet", "data")
 UI = os.path.join(REPO, "desktop-wallet", "ui")
 
-# —— 星球层（与 fetch_earth_planet.py / ui/planet-view.js 同口径）——
+# —— 星球层（与 fetch_earth_planet.py / ui/earth-grid.js 同口径）——
 GW, GH = 2048, 1024
 SEA_CODES = 128
 OCEAN_STEP = 48.0
@@ -94,7 +94,7 @@ MEASURED = {
 # ---------------------------------------------------------------- 星球层反量化
 
 def land_meters(code):
-    """陆地码 128..255 → 米（档中值），向量化。与 ui/planet-view.js 里那份逐字同义。
+    """陆地码 128..255 → 米（档中值），向量化。与 ui/earth-grid.js 里那份逐字同义。
 
     逐档推进：进不了本档的把档宽扣掉再看下一档，落进本档的当场定值。"""
     c = np.asarray(code, dtype=np.int64) - SEA_CODES

@@ -11,7 +11,7 @@
 //   2. RELIEF_FOLD 与 MIN_COS_LAT 含 pow/cos，跨 libm 可能差 1 ULP。
 //      这两个数是常量，写成参考实现打印出的全精度字面量，运行时不再算超越函数。
 //      运行时唯一的超越函数是 cos(radians(lat))（算经度跨度用），对拍覆盖多席位验过。
-import { GW, GH, SEA_CODES, unquantize } from './planet-view.js';
+import { GW, GH, SEA_CODES, unquantize } from './earth-grid.js';
 
 export const N = 256;
 export const CELL_M = 35.0;
@@ -76,13 +76,16 @@ async function sha256(bytes) {
 
 const enc = new TextEncoder();
 
-/** 席位：地址 ⊕ 创世 → SHA-256 链 → 全球陆地格拒绝采样。
- *  与 seat.py::seat_of 逐字同构——大端取 4 字节、先取格再判陆、陆地码 ≥128。
- *  同地址同创世永远同一个格（不可重掷）；但哈希不保证全球唯一，唯一要上链记名。 */
-export async function seatOf(address, genesisHex, H) {
+/** 席位链的前 `max` 个陆地格——**这条链只写这一遍**。
+ *  `seatOf` 取第 1 个，漫游清单（QL-ROAM-v1）取前 1+64 个：如果两处各抄一份循环，
+ *  「家园那一格」和「漫游列表第 0 项」迟早对不上，而那正是"我到底站在哪"的凭据。
+ *  去重按格号：4096 轮在 209 万格里有放回地抽，重复抽到同一格是正常事件；
+ *  在席位里无所谓（第一个就是它），在清单里会变成"两个目的地长在同一处"，那是噪声。 */
+export async function seatPath(address, genesisHex, H, max) {
   const canon = `${SEAT_RULE}|${address.trim().toLowerCase()}|${genesisHex.trim().toLowerCase()}`;
   let h = await sha256(enc.encode(canon));
-  for (let tries = 0; tries < TRIES_MAX; tries++) {
+  const out = [], seen = new Set();
+  for (let tries = 0; tries < TRIES_MAX && out.length < max; tries++) {
     if (tries) h = await sha256(h);
     // 每轮都要重挂 DataView：sha256() 换了 buffer，旧视图会一直读第一次的摘要
     const view = new DataView(h.buffer);
@@ -90,13 +93,31 @@ export async function seatOf(address, genesisHex, H) {
     const j = view.getUint32(4, false) % GH;
     const code = H[j * GW + i];                // JS 这份是平铺的，Python 那份是 [j, i]
     if (code >= SEA_CODES) {
-      return { i, j, cell: j * GW + i, code,
-               lat: 90.0 - (j + 0.5) / GH * 180.0,
-               lon: -180.0 + (i + 0.5) / GW * 360.0,
-               tries, canon };
+      const cell = j * GW + i;
+      if (seen.has(cell)) continue;
+      seen.add(cell);
+      out.push({ i, j, cell, code,
+                 lat: 90.0 - (j + 0.5) / GH * 180.0,
+                 lon: -180.0 + (i + 0.5) / GW * 360.0,
+                 tries, canon });
     }
   }
-  return null;                                  // 4096 轮全是海：不可能，调用方要报错
+  return out;
+}
+
+/** 席位：地址 ⊕ 创世 → SHA-256 链 → 全球陆地格拒绝采样。
+ *  与 seat.py::seat_of 逐字同构——大端取 4 字节、先取格再判陆、陆地码 ≥128。
+ *  同地址同创世永远同一个格（不可重掷）；但哈希不保证全球唯一，唯一要上链记名。 */
+export async function seatOf(address, genesisHex, H) {
+  const p = await seatPath(address, genesisHex, H, 1);
+  return p.length ? p[0] : null;              // 4096 轮全是海：不可能，调用方要报错
+}
+
+/** 一块 256×256 窗口的每一行/每一列落在地球哪条经纬线上。
+ *  与 genBlock 用同一个 gridCoords，不另立公式：HUD 报的坐标必须和烤出这块地的
+ *  那套算法逐字一致，否则"你站在北纬 X 度"这句话在屏幕上就是编的。 */
+export function parcelCoords(latC, lonC) {
+  return gridCoords(latC, lonC);
 }
 
 // ── 骨架 ────────────────────────────────────────────────────────────────────

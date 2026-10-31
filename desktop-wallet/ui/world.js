@@ -189,6 +189,10 @@
     W: W, H: H, GENESIS_HASH: GENESIS_HASH, RULES_VERSION: RULES_VERSION,
     setRulesSeed: setRulesSeed, seedWords: seedWords, render: render,
     fingerprint: fingerprint, hash2: hash2, fbm: fbm, earth: global.QLEarth,
-    RULES: { SEA: SEA, SAND: SAND, SNOW: SNOW }, paint: paint
+    // RULES 把 render() 里那组地表档位原样交出去（不是第二套判定，是同一组常量的名字）：
+    // 只读漫游的那块地要用**与家里同一套**外观规则，各抄一遍数字迟早抄差一档。
+    RULES: { SEA: SEA, SAND: SAND, SNOW: SNOW, M_FOREST: M_FOREST, M_DESERT: M_DESERT,
+             DENS_FOREST: DENS_FOREST, DENS_DESERT: DENS_DESERT, DENS_GRASS: DENS_GRASS },
+    paint: paint
   };
 })(window);
