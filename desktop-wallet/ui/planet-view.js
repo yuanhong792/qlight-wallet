@@ -118,8 +118,13 @@ export async function createPlanet(canvas, opts = {}) {
   const ctl = {
     renderer, scene, cam, earth, atmo, view, spin: opts.spin ?? 0.05,
     biasX: opts.biasX ?? 0, biasY: opts.biasY ?? 0, running: false,
+    // 性能闸门：背景球是**装饰**，没理由占满 60fps。
+    // lowEnd 时进一步压 dpr（像素量按平方降）和顶点数由调用方传 segs 控制。
+    lowEnd: !!opts.lowEnd,
+    maxFps: opts.maxFps ?? 30,
+    maxDpr: opts.maxDpr ?? 1.5,
     place(w = innerWidth, h = innerHeight) {
-      const dpr = Math.min(2, devicePixelRatio || 1);
+      const dpr = Math.min(ctl.maxDpr, devicePixelRatio || 1);
       renderer.setPixelRatio(dpr);
       renderer.setSize(w, h, false);
       cam.aspect = w / h;
@@ -134,22 +139,26 @@ export async function createPlanet(canvas, opts = {}) {
       cam.up.set(0, 1, 0);
       cam.lookAt(0, 0, 0);
     },
-    frame(dt, w, h) {
+    // 只画，不量尺寸：尺寸由 place() 在启动和 resize 时设。
+    // 原来每帧都调 place()，等于每帧 setPixelRatio + setSize + setViewOffset + updateProjectionMatrix
+    // 四次 GL/矩阵状态重设，白烧 CPU。
+    frame(dt) {
       earth.rotation.y += ctl.spin * dt;           // 自转轴 = 地理北极，视觉上就是"地球在转"
       atmo.rotation.y = earth.rotation.y;
-      ctl.place(w, h);
       renderer.render(scene, cam);
     },
     start() {
       if (ctl.running) return;
       ctl.running = true;
-      let last = performance.now();
-      const loop = () => {
+      let last = performance.now(), lastDraw = 0;
+      const loop = (now) => {
         if (!ctl.running) return;
-        const now = performance.now();
+        requestAnimationFrame(loop);
+        // 限帧：装饰球 30fps 与 60fps 肉眼无差，但核显的 GPU 占用差一倍。
+        if (now - lastDraw < 1000 / ctl.maxFps) return;
+        lastDraw = now;
         ctl.frame(Math.min(0.05, (now - last) / 1000));
         last = now;
-        requestAnimationFrame(loop);
       };
       requestAnimationFrame(loop);
     },
@@ -158,6 +167,12 @@ export async function createPlanet(canvas, opts = {}) {
   };
   ctl.place();      // 先按视口量好画布：rAF 一帧不走的场合（面板被遮住）也不能停在 300×150
   ctl.buildMs = Math.round(performance.now() - t0);   // 封面是第一次打开就要看见的东西，成本得能被量出来
-  addEventListener('resize', () => { if (!ctl.running) ctl.place(); });
+  // frame() 不再逐帧量尺寸，所以 resize 时必须重新 place（运行中也要）。
+  // 用 rAF 合帧：拖窗口边缘时 resize 一秒能发几十次，每次都 setSize 会抖。
+  let resizeRaf = 0;
+  addEventListener('resize', () => {
+    if (resizeRaf) return;
+    resizeRaf = requestAnimationFrame(() => { resizeRaf = 0; ctl.place(); });
+  });
   return ctl;
 }

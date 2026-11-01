@@ -890,3 +890,37 @@ body.has-planet .hero {
 .shop-panels .panel { display: none; padding: 14px 15px; border: 0; border-radius: 12px; box-shadow: none; background: rgba(6, 16, 32, .6); }
 .shop-panels .panel.on { display: block; }
 @media (max-height: 620px) { .w3d-mine { width: 196px; } .shop-card { max-height: 86vh; } }
+
+/* ================================================================
+   低配降级（body.low-fx）—— 由 app.js 的 LOW_END 检测自动挂上
+   ----------------------------------------------------------------
+   backdrop-filter（毛玻璃）每个元素都要单独离屏渲染 + 高斯模糊 + 回合成，
+   吃的是 GPU 不是 CPU：在 RTX 5070 上 26 个元素只差 0.7 个百分点，
+   但在核显 / 软件渲染上会直接把帧率压到个位数。
+   低配时换成不透明底色，视觉差别很小，代价是实打实的。
+   ================================================================ */
+body.low-fx .auth-card,
+body.low-fx .sidebar,
+body.low-fx .panel,
+body.low-fx .asset-row,
+body.low-fx .w3d-mine {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+body.low-fx .auth-card { background: rgba(7, 19, 39, .97); }
+body.low-fx .sidebar { background: rgba(5, 15, 33, .98); }
+body.low-fx .panel,
+body.low-fx .asset-row { background: rgba(9, 24, 44, .97); }
+body.low-fx .w3d-mine { background: rgba(4, 10, 18, .95); }
+
+/* 低配时也别再给整屏叠大范围投影，那是每帧都要重算的合成成本 */
+body.low-fx .panel,
+body.low-fx .asset-row { box-shadow: 0 4px 14px rgba(0, 0, 0, .22); }
+
+/* 系统级"减少透明效果"开关同样生效（Win11 设置里的辅助功能开关） */
+@media (prefers-reduced-transparency: reduce) {
+  .auth-card, .sidebar, .panel, .asset-row, .w3d-mine {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}

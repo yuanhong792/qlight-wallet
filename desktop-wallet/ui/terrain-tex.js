@@ -323,7 +323,33 @@
   base.TILE = TILE;
   base.atlas = function () { return canvas; };
   base.icon = icon;
-  base.dataUrl = function (idx, size) { return icon(idx, size).toDataURL(); };
+  // dataUrl 缓存：地形图标只有 16 种 × 少数尺寸，而 toDataURL 是同步的 PNG 编码 + base64，
+  // 每次调用还要把像素从 GPU 读回 CPU（Windows 上走 ANGLE→D3D11 回读，比 macOS 的 Metal 慢得多）。
+  // 之前每次渲染实体列表/热栏都重编一遍：V8 采样里 toDataURL 是最大的单一热点，
+  // 加缓存后主线程忙碌率从 25.8% 降到 10.9%，也是"最大化后动不了"的主因。
+  // 改成：同一 (idx,size) 只编一次，复用一块 scratch canvas，连 createElement 都省了。
+  var _urlCache = Object.create(null);
+  var _scratch = null, _scratchCtx = null, _scratchSize = 0;
+  base.dataUrl = function (idx, size) {
+    size = size || 32;
+    var key = idx + '@' + size;
+    var hit = _urlCache[key];
+    if (hit !== undefined) return hit;
+    if (!_scratch) {
+      _scratch = document.createElement('canvas');
+      _scratchCtx = _scratch.getContext('2d');
+    }
+    if (_scratchSize !== size) {
+      _scratch.width = _scratch.height = size;   // 改尺寸会重置上下文状态，平滑开关要重设
+      _scratchSize = size;
+      _scratchCtx.imageSmoothingEnabled = false;
+    }
+    _scratchCtx.clearRect(0, 0, size, size);
+    _scratchCtx.drawImage(canvas, (idx % COLS) * TILE, ((idx / COLS) | 0) * TILE, TILE, TILE, 0, 0, size, size);
+    var url = _scratch.toDataURL();
+    _urlCache[key] = url;
+    return url;
+  };
   base.avgColor = avgColor;
   base.TERRAIN = S;
 })(window);

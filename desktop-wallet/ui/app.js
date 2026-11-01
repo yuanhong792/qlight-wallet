@@ -4,6 +4,26 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- 性能档位
+// 目标：任何一台普通 Windows 电脑都要像 Mac 一样流畅。
+// 判低配只认三件事，宁可误判成低配（少点特效，肉眼几乎无感），也不要漏判（卡到不能用）。
+const LOW_END = (() => {
+  if (typeof window.__qlLowFx === "boolean") return window.__qlLowFx;   // 用户手动覆盖优先
+  let renderer = "";
+  try {
+    const gl = document.createElement("canvas").getContext("webgl");
+    const dbg = gl && gl.getExtension("WEBGL_debug_renderer_info");
+    if (dbg) renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "";
+  } catch (e) { /* 拿不到型号就靠下面两项判 */ }
+  // 软件渲染 / 老核显 / 移动端 GPU：全屏 PBR 球 + 毛玻璃会直接把帧率压到个位数
+  const weakGpu = /SwiftShader|llvmpipe|Microsoft Basic|Basic Render|Intel.*(HD|UHD) Graphics|Mali|Adreno\s?\d{3}\b|PowerVR/i.test(renderer);
+  const weakCpu = (navigator.hardwareConcurrency || 8) <= 4;
+  const weakMem = (navigator.deviceMemory || 8) <= 4;
+  return weakGpu || weakCpu || weakMem;
+})();
+if (LOW_END) document.body.classList.add("low-fx");
+
 const fmtQlx = (units) => {
   const s = BigInt(units || 0).toString().padStart(10, "0");
   const int = s.slice(0, -9), frac = s.slice(-9);
@@ -154,7 +174,11 @@ async function mountPlanetBackdrop() {
       biasX: 0.26, biasY: 0,          // 球心落在版面 76% 处、微微出血：地球从右边探进来，左边整块留给文字
       dist: 3.4,                      // 1120×740 里球冠半径 ≈ 316 px ≈ 屏高 85%
       exaggeration: 10,               // 陆抬起 10 倍：真实比例下 8848 米只占半径 0.14%，看不见；再大就在边缘造悬崖
-      segs: [512, 256],               // 封面用 13 万顶点：1024×512 的 52 万顶点是给"贴着看"的星球页用的，封面只是背景
+      segs: LOW_END ? [128, 64] : [512, 256],   // 13 万顶点 → 8 千顶点：背景装饰球，降了看不出来
+      stars: LOW_END ? 600 : 2600,
+      maxFps: LOW_END ? 24 : 30,                // 装饰球不需要 60fps
+      maxDpr: LOW_END ? 1 : 1.5,                // 像素量按平方降
+      lowEnd: LOW_END,
       lat: 24, lon: 104,              // 默认看得见亚洲——第一次打开就该认得出这是地球
       sunLat: 30, sunLon: 122,        // 太阳跟着相机这一侧偏 30°：球转到哪一面都是"半月"式的立体，不会处处正午
       sunIntensity: 6.2, ambient: 1.15,
@@ -223,7 +247,9 @@ function worldDiveIn(to) {
     // 看着像镜头走反了。角度差折到 ±180 以内，永远朝近的那边转。
     const dLon = ((tgt.lon - from.lon + 540) % 360) - 180;
     const spin = ctl.spin;
+    const fps0 = ctl.maxFps;
     ctl.spin = 0;     // 俯冲期间自转必须停：3 秒转 6° 多，落点就不是那一格，而是它东边几十公里
+    ctl.maxFps = 60;  // 俯冲是镜头动画，掉到 30fps 一眼就看出来；落回封面再降回去
     ctl.start();
     const t0 = performance.now();
     let skip = false, rafId = 0;
@@ -234,6 +260,7 @@ function worldDiveIn(to) {
       removeEventListener("pointerdown", off);
       removeEventListener("keydown", off);
       ctl.spin = spin;
+      ctl.maxFps = fps0;
       ctl.cam.fov = 38;
       ctl.cam.updateProjectionMatrix();
       diveKick = null;
