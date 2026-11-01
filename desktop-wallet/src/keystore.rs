@@ -358,7 +358,7 @@ mod tests {
         let bytes = std::fs::read(&dat_path).unwrap();
         assert_eq!(&bytes[..8], BACKUP_MAGIC);
 
-        // 解析还原（模拟换一台机器）
+        // 解析还原（当作换了一台机器）
         let ks2 = parse_backup(&bytes).unwrap();
         let core = decrypt_core(&ks2, "test-pass-1234").unwrap();
         assert_eq!(core0.address, core.address);

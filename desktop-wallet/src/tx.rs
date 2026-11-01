@@ -33,7 +33,7 @@
 
 use crate::crypto;
 
-/// 模拟链 chain_id（"QL" 的 ASCII，作为 regtest 标识）
+/// chain_id（"QL" 的 ASCII）
 pub const CHAIN_ID: u64 = 0x0051_4C;
 
 /// 交易信封版本（canonical CBOR 顶层第一字段）
@@ -100,7 +100,7 @@ pub struct TxEnvelope {
     /// 首笔账户绑定（pk_hash = SHA-256 of ML-DSA-65 公钥）；后续交易为空
     pub pk_hash: Option<[u8; 32]>,
     pub nonce: u64,
-    /// 过期块高（模拟链：当前高度 + 50）
+    /// 过期块高（当前高度 + 50）
     pub expiry: u64,
     pub fee_cap: u64,
     pub actions: Vec<TransferAction>,

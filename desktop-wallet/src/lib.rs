@@ -5,7 +5,7 @@
 //! - 哈希：SHAKE-256（FIPS 202）
 //! - 地址：ql1（bech32，DESIGN.md §6.1）
 //! - 交易：QL-TX-v1 canonical CBOR（§14.2）
-//! - 链：内置持久化账本 regtest（A 档）+ libp2p 联邦网络（B 档：mDNS 发现 +
+//! - 链：内置持久化账本（A 档）+ libp2p 联邦网络（B 档：mDNS 发现 +
 //!   gossipsub 中继交易/块 + 门票选举出块人 + 整链对账）
 
 pub mod commands;
@@ -36,7 +36,7 @@ pub fn run() {
                 .expect("获取应用数据目录失败");
             std::fs::create_dir_all(&base_dir).ok();
 
-            // B 档本地联邦演示：同机多开钱包实例时，第二/第三个实例自动落到
+            // B 档本地联邦组网：同机多开钱包实例时，第二/第三个实例自动落到
             // node-1/node-2 子目录（文件锁判互斥），账本与密钥互不掺和。
             let data_dir = claim_instance_dir(&base_dir);
             eprintln!("[QLight] 本实例数据目录：{}", data_dir.display());

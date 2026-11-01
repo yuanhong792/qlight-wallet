@@ -1509,7 +1509,7 @@ mod tests {
             .unwrap()
     }
 
-    /// 绕过落盘前预检强写一条：模拟坏邻居 / 被手改过的旧文件
+    /// 绕过落盘前预检强写一条：冒充坏邻居 / 被手改过的旧文件
     fn force_write(
         ledger: &EntityLedger,
         c: &crate::keystore::WalletCore,
@@ -1690,7 +1690,7 @@ mod tests {
                 x: 9, y: 9, layer: 0, kind: 0, height: 4, ts: 1,
             },
         );
-        // Bob 自己签字，想挪走 Alice 的树——强写进账本（模拟坏邻居）
+        // Bob 自己签字，想挪走 Alice 的树——强写进账本（冒充坏邻居）
         force_write(
             &ledger,
             &bob,

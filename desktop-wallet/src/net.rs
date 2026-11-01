@@ -33,7 +33,7 @@
 //! 2. 门票签名 = ML-DSA-65(「QL-TICKET-V1」‖ height ‖ prev)，注册表公钥可验；
 //! 3. vrf' = SHAKE-256("QL-TICKET-V1" ‖ 票消息 ‖ sig)；窗口结束时 vrf' 最小者
 //!    （并列比地址）出块，其余节点等待该块；
-//! 4. 败选等 2.6s 仍无块 → 自愈兜底出块（演示网 liveness 保证）。
+//! 4. 败选等 2.6s 仍无块 → 自愈兜底出块（本地网 liveness 保证）。
 //!
 //! 对账自愈（公告机制，处理启动错拍/网络闪断留下的分叉）：
 //! - 每 5s 公告自己的 (height, tip_hash)；看到「更高」或「同高但 tip 字典序更小」的
@@ -60,10 +60,10 @@
 //! - 分歧集合变化才打日志、才推 `net_versions`；邻居断开或连续三个公告周期没再
 //!   公告就退出普查，chip 跟着撤警。
 //!
-//! 诚实边界（M2.1 演示口径，代码里不装假）：
+//! 诚实边界（M2.1，代码里不装假）：
 //! - 联邦块接受依赖注册表公钥；快照整链只验哈希链（哈希链自洽即可采用），
 //!   正式公测需「门票 VRF 证明 + 注册链锚定 + 罚没」闭环（M2.2+）；
-//! - 演示规模（同机/局域网 2–3 节点）下按上述规则处理时间分叉；
+//! - 当前规模（同机/局域网 2–3 节点）下按上述规则处理时间分叉；
 //! - 世界追赶只在**至少一个在线邻居持有那份集合**时才补得回来；
 //! - 版本普查只比对邻居**声明**出来的规则指纹（块域 / 实体记录 / 光尘记录）。
 //!   同一规则家族内部改判据（如本轮把光尘轮次改成只认进块块高）不会让指纹变化，
@@ -100,7 +100,7 @@ pub const ANNOUNCE_EVERY_MS: u64 = 5000;
 /// 版本普查条目时效：连着三个周期没再听到这台邻居的公告，就不再算它的分歧
 /// （对端进程被杀掉时未必来得及发出 ConnectionClosed）
 const VERSION_TTL_MS: u64 = 3 * ANNOUNCE_EVERY_MS;
-/// 追账快照上限（演示规模；指 gzip 压缩后的网络负载，gossipsub 单条消息同此上限）
+/// 追账快照上限（当前规模；指 gzip 压缩后的网络负载，gossipsub 单条消息同此上限）
 pub const SYNC_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// 引导注册表周期（写入自己 + 互读直连）
 pub const BOOT_EVERY_MS: u64 = 4000;
@@ -112,7 +112,7 @@ const BOOT_MAX_ENTRIES: usize = 64;
 const BOOT_RETRY_MS: u64 = 4000;
 /// 世界指纹公告周期（缺口检测；比链公告慢一档——补的是记录，不阻塞出块）
 const ENT_HEAD_EVERY_MS: u64 = 9000;
-/// 实体快照的条数上限（演示规模；也是给对端的 CPU/磁盘放大器设的闸门）
+/// 实体快照的条数上限（当前规模；也是给对端的 CPU/磁盘放大器设的闸门）
 const ENT_SNAP_MAX_LINES: usize = 65_536;
 /// 光尘指纹公告周期（比实体慢一档：光尘记录多，补齐也更贵）
 const DUST_HEAD_EVERY_MS: u64 = 13_000;
@@ -128,7 +128,7 @@ const POS_TTL_MS: u64 = 3 * POS_HEARTBEAT_MS;
 const POS_PUBLISH_MIN_MS: u64 = 500;
 /// 签名时间戳窗口：超出即丢。在场不进共识，但也不许被人拿陈旧包灌出一串历史位置
 const POS_MAX_AGE_SECS: u64 = 120;
-/// 在场名单容量上限（演示规模，同时是内存放大器闸门）
+/// 在场名单容量上限（当前规模，同时是内存放大器闸门）
 const POS_ROSTER_MAX: usize = 256;
 /// 坐标定点化倍率：世界坐标是浮点，签名里的字节必须是确定的整数
 const POS_SCALE: f64 = 64.0;
@@ -628,7 +628,7 @@ fn short_addr(addr: &str) -> String {
     }
 }
 
-/// 邻居地址的可达范围 —— 「本地世界 / 局域网演示 / 公网多人」三态的唯一数据源。
+/// 邻居地址的可达范围 —— 「本地世界 / 局域网 / 公网多人」三态的唯一数据源。
 ///
 /// 现在这张网只有 mDNS + 同机引导注册表 + TCP 直连：没有中继、没有公网种子节点，
 /// 所以 `"public"` 在这里**应当永远是 0**。把它单列出来不是凑数——真接上公网的那天，
@@ -1062,7 +1062,7 @@ impl Net {
         });
     }
 
-    /// 注册表读-改-写（独占锁；演示容错：任何 IO/解析失败都静默跳过）
+    /// 注册表读-改-写（独占锁；宽松容错：任何 IO/解析失败都静默跳过）
     fn boot_update(&self, f: impl FnOnce(&mut BootFile)) {
         let Ok(mut fh) = std::fs::OpenOptions::new()
             .read(true)
@@ -1860,7 +1860,7 @@ impl Net {
                 ms.beat_next = now + BEAT_MS;
             }
             Phase::Waiting { height, until_ms } if now >= *until_ms => {
-                // 自愈兜底：胜者一直没出块（掉线/作恶），本机接手（演示网 liveness）
+                // 自愈兜底：胜者一直没出块（掉线/作恶），本机接手（本地网 liveness）
                 eprintln!("[QLight] 高度 {height} 胜者超时未出块，本机兜底出块");
                 if let Some((event, header, wires, dusts)) = chain.mine_block(&core) {
                     pub_block(swarm, &topics.block, &header, &wires, &dusts);
@@ -2031,7 +2031,7 @@ fn build_swarm() -> Result<libp2p::Swarm<QlBehaviour>, Box<dyn std::error::Error
             let gossipsub = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gs_cfg)?;
             let mdns = libp2p::mdns::tokio::Behaviour::new(
                 {
-                    // 演示网：10s 重查一次（默认 5 分钟太久，丢包/防火墙场景恢复慢）
+                    // 本地网：10s 重查一次（默认 5 分钟太久，丢包/防火墙场景恢复慢）
                     let mut c = libp2p::mdns::Config::default();
                     c.query_interval = Duration::from_secs(10);
                     c
@@ -2388,7 +2388,7 @@ mod tests {
         assert!(!pos_msg_bytes(&w).starts_with(TICKET_PREFIX));
     }
 
-    /// 联机三态的分类：同机演示绝不该被说成"局域网"，局域网更不该被说成"公网"
+    /// 联机三态的分类：同机联机绝不该被说成"局域网"，局域网更不该被说成"公网"
     #[test]
     fn addresses_are_classified_into_local_lan_or_public() {
         let case = |s: &str| addr_scope(&s.parse::<Multiaddr>().unwrap());

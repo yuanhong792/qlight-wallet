@@ -31,9 +31,9 @@
 - **挖矿心跳（§3.3 轻节点）**：每块出示 VRF = SHAKE-256("QL-VRF-v1" ‖ seed ‖ height ‖ prev_hash)；
   M1 为本地哨兵，主网换真实 VRF 与存活挑战。
 
-## 3. 模拟链（regtest）
+## 3. 内置账本链
 
-M1 采用**内置单机模拟链**，协议口径与主网一致，仅为让收发/挖矿端到端可演示：
+M1 采用**内置单机账本链**，协议口径与设计文档一致，让收发/挖矿端到端真的跑起来：
 
 - 出块 2s，奖励 = `3.33 QLX / 块`，每 31.5M 块（≈2 年）减半，硬顶 2.1 亿 QLX；
 - 挖矿收益直接给钱包节点（主网对应"钱包节点 15% 份额"）；
@@ -63,7 +63,7 @@ desktop-wallet/
 │   ├── crypto.rs                 # ML-DSA-65 + SHAKE-256 + ql1 地址
 │   ├── keystore.rs               # Argon2id + AES-256-GCM 密钥库
 │   ├── tx.rs                     # QL-TX-v1 canonical CBOR + digest
-│   ├── simchain.rs               # 内置模拟链 + VRF 心跳
+│   ├── simchain.rs               # 内置账本链 + VRF 心跳
 │   └── commands.rs               # Tauri 命令层
 └── ui/                           # index.html / style.css / app.js（品牌深空蓝+金）
 ```

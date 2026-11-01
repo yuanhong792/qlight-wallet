@@ -93,8 +93,8 @@
       <button class="sb-item" data-page="about" data-i18n="nav.about">ⓘ 关于</button>
     </nav>
     <div class="sb-bottom">
-      <button id="btn-main-gate" class="btn-ghost small">⌂ 返回开场</button>
-      <span class="badge" data-i18n="nav.badge">模拟链 regtest</span>
+      <button id="btn-main-gate" class="btn-ghost small" data-i18n="nav.gate">⌂ 返回开场</button>
+      <span class="badge" data-i18n="nav.badge">本地链 · 未接公网</span>
       <select id="lang-select" class="lang-select" aria-label="Language"></select>
       <button id="btn-backup" class="btn-ghost small" data-i18n="backup.export">💾 备份钱包</button>
       <button id="btn-lock" class="btn-ghost small" data-i18n="nav.lock">🔒 锁定钱包</button>
@@ -105,9 +105,9 @@
   <main class="content">
     <!-- 网络条 -->
     <div class="netbar">
-      <span class="chip"><i class="dot"></i><span data-i18n="net.chain">QLight regtest</span></span>
+      <span class="chip"><i class="dot"></i><span data-i18n="net.chain">QLight 链</span></span>
       <span class="chip"><span data-i18n="net.height">块高</span> <b id="stat-height">–</b></span>
-      <span class="chip" id="net-chip">◦ 单机演示</span>
+      <span class="chip" id="net-chip">◦ 单机运行</span>
       <span class="addr-mini" id="addr-mini">ql1…</span>
     </div>
 
@@ -115,7 +115,7 @@
     <section class="page" id="page-asset">
       <div class="hero">
         <div class="hero-balance">
-          <div class="hero-label"><span data-i18n="hero.label">总余额</span> <span class="muted small" data-i18n="hero.unit">QLX 权益（模拟链演示）</span></div>
+          <div class="hero-label"><span data-i18n="hero.label">总余额</span> <span class="muted small" data-i18n="hero.unit">QLX 权益</span></div>
           <div class="hero-num" id="bal-int-big">0</div>
           <div class="hero-frac" id="bal-frac-big">.000000000</div>
         </div>
@@ -347,7 +347,7 @@
           <img src="assets/coin-face-reverse.png" width="52" height="52" alt="">
           <div>
             <b>QLight Wallet</b>
-            <div class="muted small" data-i18n="about.ver">QLight 本地演示网络（regtest）</div>
+            <div class="muted small" data-i18n="about.ver">QLight 本地链（同机 / 局域网组网）</div>
           </div>
         </div>
         <p class="muted small" data-i18n="about.intro"></p>
@@ -356,8 +356,8 @@
           <span class="tag">SHAKE-256 · FIPS 202</span>
           <span class="tag">Argon2id + AES-256-GCM</span>
           <span class="tag">QL-TX-v1 canonical CBOR</span>
-          <span class="tag">VRF 心跳挖矿</span>
-          <span class="tag">确定性世界 · 本地渲染</span>
+          <span class="tag" data-i18n="about.tag.vrf">VRF 心跳挖矿</span>
+          <span class="tag" data-i18n="about.tag.world">确定性世界 · 本地渲染</span>
         </div>
       </div>
 

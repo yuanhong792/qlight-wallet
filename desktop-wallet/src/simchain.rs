@@ -78,7 +78,7 @@ pub const BLOCK_V_MINER: u8 = 4;
 /// 第一次变成全网一致的状态，陌生人之间才谈得上兑换。
 pub const BLOCK_V_POOL: u8 = 5;
 pub const BLOCK_V: u8 = BLOCK_V_POOL;
-/// v5 激活高度：此高度之后**只认 v5**。现有演示链在 141 左右，
+/// v5 激活高度：此高度之后**只认 v5**。现有本地链在 141 左右，
 /// 200 给两台机器留出升级窗口，之后光尘开始逐块进块。
 ///
 /// 没有激活高度，攻击者可以在任意高度造 v0 块，绕过矿签与冷却无条件领
@@ -950,10 +950,10 @@ impl SimChain {
 
         chain.ensure_genesis_line();
         if !chain.validate_blocks_jsonl() {
-            // regtest 演示口径：旧格式（无 miner/nonce 字段的 v1 块）或损坏文件 →
+            // 旧格式兜底口径：（无 miner/nonce 字段的 v1 块）或损坏文件 →
             // 归档为 .bak-epoch 后从新创世继续；数据不丢，仅链重置。
             eprintln!(
-                "[QLight] 提醒：blocks.jsonl 哈希链校验未通过（可能为旧格式或文件被改动），已归档并重启演示链"
+                "[QLight] 提醒：blocks.jsonl 哈希链校验未通过（可能为旧格式或文件被改动），已归档并重启本地链"
             );
             let tag = chain.archive_and_reset();
             chain.ensure_genesis_line();
