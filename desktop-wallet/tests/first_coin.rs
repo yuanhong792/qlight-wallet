@@ -9,7 +9,7 @@
 //! 这个闸管的是判据与账本：干净环境能不能凭空长出第一个币、换一台机器能不能原样重放、
 //! 改文件能不能多拿币。
 
-use qlight_wallet_lib::{crypto, keystore, simchain, tx, world};
+use qlight_wallet_lib::{crypto, keystore, node, simchain, tx, world};
 use std::path::PathBuf;
 
 const PW: &str = "第一个币-2026-QLight";
@@ -85,13 +85,20 @@ fn first_coin_from_a_clean_machine() {
     let minted = chain.total_minted();
     assert!(minted > 0, "第一个币要真的被发行出来");
     assert_eq!(
+        minted, simchain::INIT_REWARD,
+        "块高 1 的第一笔只结清一个块的排放：{} 微 = 初始排放档",
+        minted
+    );
+    assert_eq!(
         chain.balance_of(&miner.address),
         minted,
         "发行只进挖矿者，且此刻全网只有他有钱"
     );
+    // 钱位只有 `DECIMALS=9` 这一个口径（界面与命令层的除数都是 1e9）：
+    // 这里曾拿 1e6 念数，于是文档把 3.33 QLX 写成了 3,330 QLX。
     println!(
-        "第一个币：矿格 ({x},{y}) 第 {layer} 层 → 块高 1 发行 {minted} 微 QLX（{} QLX），矿签 {}",
-        minted as f64 / 1e6,
+        "第一个币：矿格 ({x},{y}) 第 {layer} 层 → 块高 1 发行 {minted} 微 QLX（{:.2} QLX），矿签 {}",
+        minted as f64 / 1e9,
         &hex::encode(digest)[..16]
     );
 
@@ -227,4 +234,56 @@ fn two_machines_mine_and_transfer() {
 
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// 在飞的矿签只许一张（§9.34 三进程真链实测暴露的脏池）
+///
+/// 实测里：75 个块、24 次落格、进块的只有 2 张——剩下的 22 张注定进不了块（矿签的
+/// 地表判据每个块重画一次），却躺在池里被 5 秒一次的再广播原样推给全网，邻居们
+/// 每张都真验一次签、再拒一次，三个进程一共刷出 328 条「拒收联邦交易」。
+/// 这个闸把那条路径堵在源头：多签的那一张根本不该存在。
+#[test]
+fn only_one_claim_is_in_flight() {
+    let dir = tmp("inflight");
+    let blocks = dir.join("blocks.jsonl");
+    let (_ks, wallet) = keystore::create_wallet(&dir.join("keystore.json"), PW).expect("建钱包");
+    let core = std::sync::Arc::new(wallet);
+    let chain = simchain::SimChain::new(dir.join("ledger.json"), blocks.clone());
+    let entities = std::sync::Arc::new(world::EntityLedger::new(dir.join("entities.jsonl")));
+    chain.attach_world(entities.clone());
+
+    // ① 连按两次按钮：第二次必须被认出来是重复签
+    let hop = node::mine_one_hop(&chain, &entities, &blocks, &core, 0, |_| {})
+        .expect("干净创世的第一跳要交出凭据");
+    assert_eq!(chain.pending_claims_of(&core.address), 1, "一张凭据在飞");
+    assert!(chain.is_pooled(&hop.claim_digest), "凭据的原件就在自家池里");
+    let again = node::mine_one_hop(&chain, &entities, &blocks, &core, 0, |_| {});
+    let err = match again {
+        Ok(_hop) => panic!("第二次按必须被拒，不该又签出一张凭据"),
+        Err(e) => e,
+    };
+    assert!(err.starts_with("上一张矿签"), "第二次按必须被拒：{err}");
+    assert_eq!(chain.pending_claims_of(&core.address), 1, "拒了就不许多签一张");
+
+    // ② 出块收下它：池子当场干净，此后没有任何垃圾可广播
+    let (event, _header, wires, _dusts) = chain.mine_block(&core).expect("第 1 块应出块");
+    assert_eq!(wires.len(), 1, "块 1 带走了那张凭据");
+    assert_eq!(event.minted, simchain::INIT_REWARD, "第一笔结清一个块的排放");
+    assert!(!chain.is_pooled(&hop.claim_digest), "已入账的凭据不许还躺在池里");
+    assert_eq!(chain.pending_claims_of(&core.address), 0, "在飞数归零");
+    assert_eq!(chain.mempool_len(), 0, "池子空了");
+
+    // ③ 节奏没到的那几个块：一个字节都不该进池
+    for h in 2..=6u64 {
+        chain.mine_block(&core).expect("空块照出");
+        assert_eq!(chain.height(), h);
+        assert_eq!(chain.mempool_len(), 0, "块高 {h} 之后池里不该有残留");
+    }
+    println!(
+        "在飞凭据闸门：块高 {} 时池子 0 笔，第一笔发行 {} 微 QLX",
+        chain.height(),
+        chain.total_minted()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

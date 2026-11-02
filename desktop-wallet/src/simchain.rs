@@ -90,6 +90,9 @@ pub const BLOCK_V_POOL: u8 = 5;
 /// 有了②，「胜者超时未出块、别人接手」第一次变成一件**可验**的事：块高一个回合的
 /// 抢跑，只有把时间戳推到父块之后 `MINT_TAKEOVER_SECS` 以外才被接受（见 `check_ticket_census`）。
 pub const BLOCK_V_TICKET: u8 = 6;
+
+/// 本机归档（`.bak-*`）保留份数：审计要"最近几次可回看"，不要"每次切换永久占盘"。
+const ARCHIVE_KEEP: usize = 3;
 pub const BLOCK_V: u8 = BLOCK_V_TICKET;
 /// v5 激活高度：此高度之后**只认 v5**。现有本地链在 141 左右，
 /// 200 给两台机器留出升级窗口，之后光尘开始逐块进块。
@@ -1419,7 +1422,40 @@ impl SimChain {
         );
         *self.ledger.lock().unwrap() = Ledger::default();
         *self.corrupted.lock().unwrap() = false;
+        self.prune_archives();
         tag
+    }
+
+    /// 归档只留最近 [`ARCHIVE_KEEP`] 份（按 mtime 从旧到新删）。
+    ///
+    /// 这不是洁癖：§9.34 那次四进程真链联跑，一台 189 块的节点目录 50 MB，
+    /// 其中 42–54 份是每次分叉切换整本改名留下的 `.bak-fork-*` 副本——链本身才 1.5 MB。
+    /// 审计要的是"最近几次切换可回看"，不是"每一次切换永久占盘"。
+    /// 只删本机自己写出的归档名，且不碰共识数据：块哈希、链内容、余额一律不受影响。
+    fn prune_archives(&self) {
+        for path in [&self.blocks_path, &self.ledger_path] {
+            let Some(dir) = path.parent() else { continue };
+            let Some(stem) = path.file_name().and_then(|s| s.to_str()) else { continue };
+            let prefix = format!("{stem}.bak-");
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            let mut old: Vec<(std::time::SystemTime, PathBuf)> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.starts_with(&prefix))
+                })
+                .filter_map(|p| p.metadata().and_then(|m| m.modified()).ok().map(|t| (t, p)))
+                .collect();
+            if old.len() <= ARCHIVE_KEEP {
+                continue;
+            }
+            old.sort();
+            for (_, p) in old.iter().take(old.len() - ARCHIVE_KEEP) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
     }
 
     /// 重放校验：逐行读块头，重算块哈希并与记录比对；无 blocks 文件视为通过
@@ -2019,6 +2055,9 @@ impl SimChain {
         drop(ledger);
         let proof = (version >= BLOCK_V_TICKET).then(|| TicketProof::clone(ticket));
         append_block_line(&self.blocks_path, &header, &wires, &dusts, proof);
+        // 块一出，地表就重画了：池里那些没被这块收走的矿签从此再也进不了块。
+        // 不撤的话，5 秒一次的再广播会把它们原样送给全网（§9.34 实测的 328 条「拒收」）
+        self.prune_stale_pool();
 
         let balance = self.balance_of(&miner);
         Some((
@@ -2877,6 +2916,9 @@ impl SimChain {
             atomic_write(&self.ledger_path, &bytes);
         }
         drop(ledger);
+        // 只有本代块（v6+）的哈希绑住了门票，块行才该带上原件。
+        // 旧代块带着票入账 = 审计档案里躺着一张谁都没复验过的票，还白占 10.5 KB。
+        let ticket = if header.version >= BLOCK_V_TICKET { ticket } else { None };
         append_block_line(&self.blocks_path, header, &wires, &dusts, ticket);
 
         // 已入账的 from 地址，其池内挂着的后续交易 nonce 已可能过期——先撤下等重发
@@ -2884,6 +2926,7 @@ impl SimChain {
         froms.sort();
         froms.dedup();
         self.drop_pending_for(&froms);
+        self.prune_stale_pool();
 
         Ok(BlockEvent {
             height: header.height,
@@ -2978,6 +3021,7 @@ impl SimChain {
                 &self.ledger_path,
                 self.ledger_path.with_extension(format!("json.bak-fork-{tag}")),
             );
+            self.prune_archives();
         }
 
         *self.ledger.lock().unwrap() = staged;
@@ -3055,6 +3099,131 @@ impl SimChain {
             let from: String = crate::crypto::to_bech32_ql(&p.envelope.from_addr);
             !addrs.contains(&from)
         });
+    }
+
+    /// 这个地址还挂着几张没进块的矿签（一回合只该有一张在飞，见 [`mine_one_hop`]）
+    pub fn pending_claims_of(&self, addr: &str) -> usize {
+        let want = hex::encode(bech32_decode_addr(addr).unwrap_or_default());
+        self.mempool
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| {
+                hex::encode(&p.envelope.from_addr) == want
+                    && claim_cell_of(&p.envelope).is_some()
+            })
+            .count()
+    }
+
+    /// 这张原件本机池子里是不是已经有了（周期性再广播会把自家池子原样送回来，
+    /// 那既不是攻击也不是拒收理由——不该每次都念一条「拒收联邦交易」）
+    pub fn is_pooled(&self, digest: &[u8; 32]) -> bool {
+        self.mempool.lock().unwrap().iter().any(|p| &p.digest == digest)
+    }
+
+    /// 这笔交易是否**已经在链上**（`records` 里查得到它的摘要）。
+    /// 转账到底到账没有，只认这一条：它意味着某个块把这份原件逐笔重验签收进去了。
+    pub fn is_applied(&self, digest: &[u8; 32]) -> bool {
+        let want = hex::encode(digest);
+        self.ledger
+            .lock()
+            .unwrap()
+            .records
+            .iter()
+            .any(|r| r.hash_hex == want)
+    }
+
+    /// 清掉池里**再也进不了块**的交易，返回清掉的笔数。
+    ///
+    /// 判据就是打包时那一套（同一个 `is_ore`、同一个 expiry、同一个已消耗 nonce），
+    /// 所以这里不是"节点不喜欢就丢"，而是"留着它也一定进不了块"：
+    /// - 过期（`expiry ≤ 块高`）；
+    /// - nonce 已被块消耗（分叉切换、被采纳后回灌失败的那批）；
+    /// - 矿签所在格子被下一个块的地表重画掉了——矿脉配额混了全部历史 VRF，
+    ///   每出一块重算一次，所以一张矿签只有在它签出后的**那一个**块里才成立。
+    ///
+    /// 为什么必须主动清：出块循环 1.2 秒一跳、块 2 秒一个，节奏窗口打开的那几秒里
+    /// 能签下好几张，而块每块只收一张；剩下的会一直躺在池里，被 5 秒一次的
+    /// 再广播原样送给全网，每个邻居都验一次、拒一次。真链三进程实测（§9.34）
+    /// 就是这么刷出 328 条「拒收」的。
+    ///
+    /// 这是**节点自己的池子卫生，不是共识判据**：不清的节点不会因为少收而少拿钱，
+    /// 发行判据在 [`apply_wire`] 与 [`claim_window`] 里，一个字都没动。
+    pub fn prune_stale_pool(&self) -> usize {
+        if *self.corrupted.lock().unwrap() {
+            return 0;
+        }
+        let ledger = self.ledger.lock().unwrap();
+        let height = ledger.height;
+        let words = crate::world::terrain::seed_words(GENESIS_HASH_HEX, &ledger.vrfs);
+        let mut mp = self.mempool.lock().unwrap();
+        let before = mp.len();
+        // 同一地址只留 nonce 最小的那张矿签：剩下的等重画
+        let mut claims_seen: Vec<String> = Vec::new();
+        // 撤下来的矿签要念得出为什么（§9.34：两台机器出块数均势，发行却全进一边，
+        // 而输掉那张签原本一声不响——运营者看不出自己为什么一分钱没进）
+        let mut notes: Vec<String> = Vec::new();
+        mp.retain(|p| {
+            let from = crate::crypto::to_bech32_ql(&p.envelope.from_addr);
+            let claim = claim_cell_of(&p.envelope);
+            if claim.is_some() {
+                if p.envelope.expiry <= height {
+                    notes.push(format!(
+                        "{} 的矿签过期：它只签给块高 ≤{}，链已经到 {}",
+                        short_addr_pub(&from),
+                        p.envelope.expiry,
+                        height
+                    ));
+                    return false;
+                }
+                if p.envelope.nonce < ledger.nonces.get(&from).copied().unwrap_or(0) {
+                    notes.push(format!(
+                        "{} 的矿签 nonce 落后：签的是 {}，链上已应用到 {}",
+                        short_addr_pub(&from),
+                        p.envelope.nonce,
+                        ledger.nonces.get(&from).copied().unwrap_or(0)
+                    ));
+                    return false;
+                }
+                if claims_seen.iter().any(|a| a == &from) {
+                    notes.push(format!(
+                        "{} 已经有更靠前的一张矿签在飞：这一张等下一拍",
+                        short_addr_pub(&from)
+                    ));
+                    return false;
+                }
+                claims_seen.push(from.clone());
+                let (x, y, layer) = claim.expect("上面 claim_cell_of 已判定有值");
+                if !crate::world::ore::is_ore(x as u32, y as u32, &words, height) {
+                    notes.push(format!(
+                        "格子 ({x},{y}) 第 {layer} 层的矿签赶不上这一拍：块 {height} 重画了地表，那一格不再是矿"
+                    ));
+                    return false;
+                }
+                if crate::world::ore::ore_layer(x as u32, y as u32) != layer {
+                    notes.push(format!(
+                        "格子 ({x},{y}) 的矿签赶不上这一拍：签的是第 {layer} 层，块 {height} 重画后那一格换成了第 {} 层",
+                        crate::world::ore::ore_layer(x as u32, y as u32)
+                    ));
+                    return false;
+                }
+                return true;
+            }
+            if p.envelope.expiry <= height {
+                return false;
+            }
+            if p.envelope.nonce < ledger.nonces.get(&from).copied().unwrap_or(0) {
+                return false;
+            }
+            true
+        });
+        for n in notes.iter().take(4) {
+            eprintln!("[QLight] 池里撤下一张矿签（没人拒收它，是它赶不上这一拍）：{n}");
+        }
+        if notes.len() > 4 {
+            eprintln!("[QLight] 同一拍还撤下 {} 张矿签（同上，逐条不再念）", notes.len() - 4);
+        }
+        before - mp.len()
     }
 
     // ---------------- 联邦只读暴露（net 层使用）----------------

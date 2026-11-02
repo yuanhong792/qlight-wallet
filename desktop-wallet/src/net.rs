@@ -1647,6 +1647,11 @@ impl Net {
             }
 
             NetMsg::Tx(w) => {
+                // 自家池子会被 5 秒一次的再广播原样送回来。那不是拒收理由，也不该
+                // 每次都念一条日志——链上真跑起来时，这类回环比真交易还多（§9.34）
+                if chain.is_pooled(&crate::tx::tx_digest(&w.envelope)) {
+                    return;
+                }
                 let from = crate::crypto::to_bech32_ql(&w.envelope.from_addr);
                 match chain.accept_remote_tx(w) {
                     Ok(_) => eprintln!("[QLight] 联邦交易入池 {}…（原件独立验签通过，等下块打包）", short_addr(&from)),
@@ -2103,8 +2108,15 @@ impl Net {
                 // 接受了对端块 → 从它的落账时刻起进入下一轮选举
                 ms.phase = Phase::Direct;
                 ms.beat_next = now_ms() + BEAT_MS;
+                // 这句话必须念得出证据：v6（块高 2000）之前的块里根本没有门票，
+                // 跟着念"门票复验通过"就是假话——三进程实测的第一批块正是这种情况
+                let ticket_note = if header.version >= crate::simchain::BLOCK_V_TICKET {
+                    "出块门票复验通过"
+                } else {
+                    "这一代块还没有门票"
+                };
                 eprintln!(
-                    "[QLight] 已采用联邦块 #{}（逐笔重验签 + 块哈希重算 + 出块门票复验通过，全网账本对齐）",
+                    "[QLight] 已采用联邦块 #{}（逐笔重验签 + 块哈希重算 + {ticket_note}，全网账本对齐）",
                     header.height
                 );
                 self.chase_world(&header, ms, swarm, topics, chain);
@@ -2249,6 +2261,9 @@ impl Net {
         if now >= ms.ann_next {
             ms.ann_next = now + ANNOUNCE_EVERY_MS;
             pub_msg(swarm, &topics.sync, &Self::announce_msg(chain, &self.my_rules));
+            // 再广播之前先清一遍：把地表重画后注定进不了块的矿签发给邻居，
+            // 只会换来对面一次真验签 + 一条「拒收」——两边都白干活
+            chain.prune_stale_pool();
             let wires = chain.mempool_wires_pub();
             for wire in wires {
                 pub_msg(swarm, &topics.tx, &NetMsg::Tx(wire));
@@ -2521,6 +2536,9 @@ fn pub_block(
     dusts: &[crate::world::dust::DustRecord],
     ticket: Option<crate::simchain::TicketProof>,
 ) {
+    // v6 之前的块哈希不绑门票，跟着块走的原件既没人复验、又把一条空块撑到 11 KB
+    // （§9.34 实测：v4 块行里躺着 10,583 字节的票）。只有块自己认它时才发。
+    let ticket = ticket.filter(|_| header.version >= crate::simchain::BLOCK_V_TICKET);
     pub_msg(
         swarm,
         topic,

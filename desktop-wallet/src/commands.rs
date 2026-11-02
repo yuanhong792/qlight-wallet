@@ -8,6 +8,7 @@ use crate::crypto;
 use crate::feedback;
 use crate::keystore::{self, Keystore, WalletCore};
 use crate::net;
+use crate::node;
 use crate::prefs;
 use crate::simchain::{self, bech32_decode_addr, BlockEvent, SimChain};
 use crate::tx;
@@ -836,7 +837,7 @@ pub fn world_snapshot(state: AppCtx) -> WorldSnapshot {
 
     // 矿脉：与渲染器用同一份大地/地表，所以钱包算出的矿和网页上那片土地是同一片
     let words = world::terrain::seed_words(&simchain::genesis_hash_hex(), &vrfs);
-    let taken = ore_taken(&state_map);
+    let taken = node::ore_taken(&state_map);
     let candidates = world::ore::scan(&words, height, &taken, 512).len();
     let owned_by_me = state_map
         .values()
@@ -996,17 +997,6 @@ pub fn world_archive_ledger(state: AppCtx) -> Result<LedgerArchive, String> {
     Ok(LedgerArchive { tag, files })
 }
 
-/// 已占用的格子（`released` 的不算：断租即让位，与 `world::live_at` 同一判据）
-fn ore_taken(map: &std::collections::BTreeMap<String, world::Entity>) -> world::ore::Taken {
-    let mut t = world::ore::Taken::new();
-    for e in map.values() {
-        if !e.released {
-            t.insert((e.x as u32, e.y as u32, e.layer as u32));
-        }
-    }
-    t
-}
-
 /// 一次挖矿的产物：世界里的方块（立即落账）+ 等待进块的发行凭据。
 #[derive(serde::Serialize)]
 pub struct MineResult {
@@ -1029,70 +1019,36 @@ pub struct MineResult {
 /// 在世界里落一个贴地方块（免费），同时提交一张**发行凭据**——
 /// 下一个块收下它，才会按这一笔**最多一个当前节奏档**发行新币进本机余额（空块不补发）。
 ///
-/// **没有造出来的方块，就没有发行**：币不是计时器印出来的，是世界里多了一格
-/// 别人可复算的坐标换来的（§9.13「世界即矿场」）。两次发行至少隔这把钥匙
-/// 当前挣到的节奏档（50→10 块），所以脚本刷得再快也快不过世界自己重画地表的节奏。
+/// **界面上的按钮和无头节点 [`crate::node::mine_one_hop`] 走同一份实现**：
+/// 两处各写一遍，迟早有一遍把"先提交凭据、被拒就不落方块"的顺序写反。
+///
+/// 要念清楚它管得住什么、管不住什么：本命令**在自己这台机器上**保证落一格才要一笔发行，
+/// 但共识侧收下矿签时只看冷却/是矿/贴地三件事，不翻实体账本（§9.13 的这条边界）。
 #[tauri::command]
 pub fn world_mine_once(state: AppCtx, kind: u8) -> Result<MineResult, String> {
     let core = state.core.read().unwrap().clone().ok_or("钱包未解锁")?;
-    let map = live_world(&state)?;
-    let vrfs = vrf_sequence(&state.blocks_path);
-    let height = state.chain.height();
-    let ready_at = state.chain.next_claim_height(&core.address);
-    if ready_at > height + 1 {
-        return Err(format!(
-            "本回合已结算：下一笔挖矿发行在块高 {ready_at}（约 {} 秒后）",
-            (ready_at - height - 1) * simchain::BLOCK_INTERVAL_SECS
-        ));
-    }
-    let words = world::terrain::seed_words(&simchain::genesis_hash_hex(), &vrfs);
-    let taken = ore_taken(&map);
-    let hits = world::ore::scan(&words, height, &taken, 8);
-    let (x, y, layer) = *hits.first().ok_or_else(|| {
-        format!(
-            "本回合无矿可挖：配额 {}／{}，{} 格扫描内没有空闲矿脉——等下一个块重画地表",
-            world::ore::ore_quota(height),
-            world::ore::ORE_SEED_SPACE,
-            world::ore::SCAN_CAP
-        )
-    })?;
-    let kind = kind.min(world::SLOT_COUNT - 1);
-    // 这一跳之前这把钥匙的节奏（已落矿格数 + 当前最小间隔）：块一结算它就往前挪一档
-    let pace = state.chain.claim_pace(&core.address);
-
-    // 先提交发行凭据：被拒就不该在世界里落方块（否则会造出一格"挖不出发行"的矿）
-    let (wire, digest) = state.chain.submit_claim(&core, x, y, layer)?;
-    state.net.broadcast_tx(wire);
-
-    let name = format!("矿·{}_{}_{}", x, y, layer);
-    let record = commit_record(
-        &state,
+    let hop = node::mine_one_hop(
+        &state.chain,
+        &state.entities,
+        &state.blocks_path,
         &core,
-        &world::Draft {
-            op: world::op::CLAIM,
-            entity_id_hex: "",
-            parent_hex: "",
-            name: &name,
-            x,
-            y,
-            layer,
-            kind,
-            height,
-            ts: now_unix(),
-        },
+        kind,
+        |wire| state.net.broadcast_tx(wire),
     )?;
+    let record = hop.record;
+    publish_entity(&state, &record);
     Ok(MineResult {
         record,
-        claim_tx_hex: hex::encode(digest),
-        x,
-        y,
-        layer,
-        claim_height: height + 1,
-        reward: state.chain.claim_preview(&core.address).1,
         // 这一格落下去，节奏就往前挪一档（v3 里创造唯一买得到的东西）：
         // UI 要能在同一跳里说出"下一笔最快 X 块后结算"，进度感才是真的进度感。
-        pace_floor: pace.1,
-        pace_next_floor: simchain::craft_floor(pace.0 + 1),
+        claim_tx_hex: hex::encode(hop.claim_digest),
+        x: hop.x,
+        y: hop.y,
+        layer: hop.layer,
+        claim_height: hop.claim_height,
+        reward: hop.reward,
+        pace_floor: hop.pace_floor,
+        pace_next_floor: hop.pace_next_floor,
     })
 }
 
