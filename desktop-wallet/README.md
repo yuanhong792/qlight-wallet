@@ -51,6 +51,28 @@ scripts/build-macos.sh   # 一键：cargo build --release → .app → QLight-Wa
 
 首次运行 → 设置密码 → 生成钱包 → 每 2s 出块挖矿 → 复制地址收款 → 签发交易转账。
 
+### 4.1 无头中继节点（`--node`，DESIGN.md §9.32）
+
+一台 24 小时开着的机器就能当邻居的入口，**不需要服务器软件**：它验账、转发、追缺口，**一块不出、一分钱不拿**（收益仍归各台钱包自己签的门票）。
+
+```bash
+qlight-wallet --node                       # 数据目录默认 ~/.qlight/node，监听 tcp/47410
+QL_DATA_DIR=/srv/qlight QL_LISTEN_PORT=47410 qlight-wallet --node
+```
+
+| 环境变量 | 作用 |
+|---|---|
+| `QL_DATA_DIR` | 节点数据目录（账本、身份密钥、`seeds.json`、`peer-id.txt` 都在这里面） |
+| `QL_LISTEN_PORT` | 固定监听端口，默认 `47410`；被占用会自动退回系统分配端口（那时别人拨不到固定地址，日志会说明） |
+| `QL_SEEDS` | 种子地址，逗号/空格分隔：`/ip4/<IP>/tcp/47410/p2p/<PeerId>` |
+| `QL_ADVERTISE` | 对外可拨地址（公网机器必填，程序猜不出自己的公网 IP）；不设就只报回环/内网地址 |
+
+种子名单还有两个来源：编译期 `net::SEEDS_BUILTIN`（**当前是空的**——还没有一台对外常驻的公网节点，写进编译期就是写假话）与 `<数据目录>/seeds.json`（字符串数组）。节点启动会把 `peer-id.txt` 和自己算出的「可拨地址」打在日志里，运营者抄走那一行，就是别人该填的种子。
+
+Windows 上那个 GUI 程序是 `windows_subsystem = "windows"`（无控制台），要日志得重定向：`qlight-wallet.exe --node > node.log 2>&1`。
+
+**闸门**：`cargo test --test relay_node` 用本机 loopback 起三台中继，C 的种子只有 A、B 的种子也只有 A，三台各自独立数据目录（同机引导注册表帮不上忙），最后断言 C 靠 **A 转发过来的签名地址自报**认识 B，且三台 `blocks.jsonl` 都只有创世那一行。跨真实公网（NAT / 防火墙 / 公网 IP）仍未跑过一次。
+
 ## 5. 目录
 
 ```
@@ -59,11 +81,14 @@ desktop-wallet/
 ├── capabilities/default.json     # Tauri 2 权限
 ├── icons/                        # .icns + .png（源自 logo/draft/icon-dark.svg）
 ├── src/
-│   ├── lib.rs / main.rs          # Tauri 入口与命令注册
+│   ├── lib.rs / main.rs          # Tauri 入口与命令注册（main 认 --node / --help）
+│   ├── node.rs                   # 无头中继节点：共用开账本 + 空核心槽（永不出块）
 │   ├── crypto.rs                 # ML-DSA-65 + SHAKE-256 + ql1 地址
 │   ├── keystore.rs               # Argon2id + AES-256-GCM 密钥库
 │   ├── tx.rs                     # QL-TX-v1 canonical CBOR + digest
 │   ├── simchain.rs               # 内置账本链 + VRF 心跳
+│   ├── net.rs                    # libp2p 联邦网络（8 个主题）+ 种子名单 + 地址自报
+│   ├── world/                    # 实体账本 / 光尘 / 地形 / 席位
 │   └── commands.rs               # Tauri 命令层
 └── ui/                           # index.html / style.css / app.js（品牌深空蓝+金）
 ```

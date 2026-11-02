@@ -50,6 +50,7 @@ fn line(h: &simchain::BlockHeader) -> String {
         header: h.clone(),
         wires: vec![],
         dusts: vec![],
+        ticket: None,
     };
     format!("{}\n", serde_json::to_string(&l).unwrap())
 }
@@ -73,6 +74,7 @@ fn v1_block(prev_hex: &str, height: u64) -> simchain::BlockHeader {
         entity_count: 0,
         dust_root_hex: String::new(),
         dust_count: 0,
+        ticket_vrf_hex: String::new(),
         txs: vec![],
     }
 }
@@ -152,6 +154,7 @@ fn committed_block(
         // v2/v3/v4 的域里没有光尘的位置：留空，让换域对照保持纯净
         dust_root_hex: String::new(),
         dust_count: 0,
+        ticket_vrf_hex: String::new(),
         txs: vec![],
     }
 }

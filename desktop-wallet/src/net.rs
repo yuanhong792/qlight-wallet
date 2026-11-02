@@ -1,16 +1,22 @@
-//! B 档联邦网络（M2.1）：libp2p gossipsub + 双路发现（mDNS + 引导注册表）
+//! B 档联邦网络（M2.1）：libp2p gossipsub + 四路发现（mDNS / 引导注册表 / 种子名单 / 地址自报）
 //!
 //! 目标：多节点收同一批交易、VRF 心跳门票选出块人、其他节点验签拒绝坏块、全网账本一致。
 //!
-//! 邻居发现双保险（关键：macOS 同机两个进程之间组播包送不到——系统级限制，
+//! 邻居发现四层（关键：macOS 同机两个进程之间组播包送不到——系统级限制，
 //! 已实测 loopback/en0 口均不通；故 mDNS 只能服务跨机场景，同机多开走注册表）：
 //! - mDNS：跨机局域网自动发现（UDP 5353 组播）；
 //! - 引导注册表：所有实例把「节点号 + 监听地址 + 时间戳」合并写进公共
 //!   `peers-registry.json`（fs2 独占锁防并发），周期互读 → TCP 直连。
 //!   等同比特币 peers.dat 固定种子：同机 TCP 回环不经组播、不过防火墙，必通。
 //!   条目 15 分钟未刷新自动裁剪（防止单次运行残留），容量上限 64。
+//! - 种子名单（§9.32）：`SEEDS_BUILTIN`（编译期）+ `QL_SEEDS`（环境变量）+
+//!   `<数据目录>/seeds.json`，每条 `/ip4/<IP>/tcp/47410/p2p/<PeerId>`。固定端口 +
+//!   固定身份（`libp2p-identity.bin`）才写得出这种地址；每 4s 重拨一轮，断开的邻居
+//!   要能重新拨回来。
+//! - 地址自报（§9.32）：已签名，任何一跳转来都认得出发布者——所以装对一台种子，
+//!   种子认识的人我会自己找到（比特币 addr 消息的同一件事）。
 //!
-//! 消息面（7 个 gossip 主题，载荷均 JSON）：
+//! 消息面（8 个 gossip 主题，载荷均 JSON）：
 //! - `qlx/reg/v1`    注册：{pk(1952B hex), salt(8B hex)} → 对端独立重算 ql1 地址，
 //!   得到「地址 ↔ 公钥」的可验证绑定（跨节点验签的公钥来源）
 //! - `qlx/tx/v1`     交易中继：{envelope, sig_hex} → 对端真验签入池
@@ -26,6 +32,11 @@
 //!   heading, seq, ts, sig}。对端现场复算「这把公钥配这份盐 = 这个地址」再验签，
 //!   所以冒充不了别人；但坐标本身无从证明，所以它只用来"看见彼此"——
 //!   不进块、不落盘、不参与归属或发行的任何判定，一句话：在场挣不到钱。
+//! - `qlx/peers/v1`  地址自报（**共识之外**，见 §9.32）：Peers{pk, addrs, ts, sig}，
+//!   用 libp2p 身份钥匙（ed25519，非钱包钥匙）签。签名是为了**认得出发布者**：
+//!   gossipsub 跑 Anonymous 模式，应用层拿到的 `message.source` 恒为 None，
+//!   上一跳只有 `propagation_source` —— 未签名的自报收方连"这是谁说的"都不知道。
+//!   验签定出发布者 → 每条地址的 `/p2p` 必须等于他 → 只影响"下次拨谁"，账本与块不动。
 //!
 //! 出块节拍 —— 提交驱动（关键设计，避免各节点按各自墙钟出块导致双挖分叉）：
 //! 1. 节点在「高度 H-1 落账」的那一刻（本地挖出或收到对端块），广播高度 H 的门票
@@ -71,19 +82,43 @@
 //!   陌生人之间真正的规则一致性要靠链本身裁决（§9.18 的诚实边界；门票证明与罚没在 M2.2）。
 
 use crate::keystore::WalletCore;
-use crate::simchain::{BlockEvent, BlockHeader, SimChain, BLOCK_V_V5_ACTIVATION};
+use crate::simchain::{BlockEvent, BlockHeader, SimChain, BLOCK_V_V6_ACTIVATION};
 use futures::StreamExt;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::multiaddr::Protocol;
 use libp2p::{gossipsub, Multiaddr, PeerId};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use fs2::FileExt;
 use tauri::{AppHandle, Emitter};
+
+// ---------------------------------------------------------------- 事件出口
+
+/// 事件出口：GUI 用 Tauri 的 `emit` 推给前端；无头中继没有前端，事件直接丢弃。
+///
+/// 网络层原本到处 `app.emit(..)`，那是它和界面之间唯一的耦合点。把它收成一个类型，
+/// `--node` 就能用**同一份**网络代码常驻：不必为起进程拖一整套 webview，
+/// 也不必复制一份"看着一样、但没人维护"的后台实现。
+#[derive(Clone)]
+pub enum Sink {
+    Gui(AppHandle),
+    Headless,
+}
+
+impl Sink {
+    fn emit<T: serde::Serialize + Clone>(&self, event: &str, payload: T) {
+        match self {
+            Sink::Gui(app) => {
+                let _ = app.emit(event, payload);
+            }
+            Sink::Headless => {}
+        }
+    }
+}
 
 // ---------------------------------------------------------------- 节拍参数
 
@@ -93,6 +128,9 @@ pub const BEAT_MS: u64 = 2000;
 pub const WINDOW_MS: u64 = 2000;
 /// 败选后等待胜者块的兜底时限
 pub const WAIT_MS: u64 = 3400;
+/// 每个高度留档的门票上限：一张票要一次 ML-DSA 验签才进档，
+/// 这个闸是给"注册过地址的人拿票刷内存"留的（本机局域网规模远用不到）。
+const ROUND_TICKETS_MAX: usize = 64;
 /// 注册重广播周期（保证新邻居拿到我们的公钥）
 pub const REG_EVERY_MS: u64 = 15000;
 /// 链公告周期（触发对账/追账）
@@ -119,6 +157,21 @@ const DUST_HEAD_EVERY_MS: u64 = 13_000;
 /// 光尘快照条数上限
 const DUST_SNAP_MAX_LINES: usize = 65_536;
 
+// —— 公网组网（DESIGN.md §9.32）——
+/// 默认固定监听端口：种子名单要写死地址，端口就不能是系统随机分配的。
+/// 被占用（同机第二个 GUI 实例）时自动退回随机端口，功能不中断，只是别人拨不到它。
+pub const DEFAULT_LISTEN_PORT: u16 = 47410;
+/// 自报地址周期：比链公告慢一档、比引导注册表快一档都行，这里取 8s——
+/// 新拨上来的邻居最迟等一个周期就能从 gossip 里看到第三方的可拨地址
+const PEERS_EVERY_MS: u64 = 8000;
+/// 单条自报消息里的地址上限（也是给 gossip 放大器设的闸门）
+const PEERS_ADDRS_MAX: usize = 16;
+/// 自报时效：地址会变（换网络、换端口），一小时前签的自报就别再照着拨了。
+/// 注意这是**新鲜度**判据，不是准入判据：准入只看签名。
+const PEERS_MAX_AGE_SECS: u64 = 3600;
+/// 时钟来回允许的余量（对端快一点点不该被当成未来消息丢掉）
+const PEERS_CLOCK_SLACK_SECS: u64 = 60;
+
 // —— 在场广播（DESIGN.md §9.19，**共识之外**）——
 /// 心跳重发周期：位置没动也重发一次，晚来的邻居不必等我移动就能看见我
 const POS_HEARTBEAT_MS: u64 = 4000;
@@ -143,11 +196,15 @@ const TOPIC_ENT: &str = "qlx/ent/v1";
 const TOPIC_DUST: &str = "qlx/dust/v1";
 /// 在场中继：谁在世界的哪个位置。只有展示价值，**没有任何一条会落进账本或块**
 const TOPIC_POS: &str = "qlx/pos/v1";
-/// 门票消息前缀（签名域隔离）
-const TICKET_PREFIX: &[u8] = b"QL-TICKET-V1";
+/// 地址中继：各节点自报「我在这几个地址上监听」。只影响"拨得到拨不到"，
+/// 不参与任何账本判定；载荷里没有别人的地址，所以它不是地址推荐器（见 §9.32）
+const TOPIC_PEERS: &str = "qlx/peers/v1";
 /// 在场消息前缀：与门票/交易/实体/光尘四个签名域全部隔离，
 /// 一条在场签名不可能被误当成任何有账本意义的东西
 const POS_PREFIX: &[u8] = b"QL-POS-V1";
+/// 地址自报前缀：同样是为了签名域隔离——一把 libp2p 身份钥匙签过的字节，
+/// 不可能被拿去冒充门票或在场（而且它压根不是 ML-DSA 钥匙，见 §9.32）
+const PEERS_PREFIX: &[u8] = b"QL-PEERS-V1";
 
 // ---------------------------------------------------------------- 网络消息
 
@@ -172,6 +229,11 @@ pub enum NetMsg {
         /// v5 起：块内光尘记录（旧版本节点发来的消息没有这个字段，按空读）
         #[serde(default)]
         dusts: Vec<crate::world::dust::DustRecord>,
+        /// v6 起：出块门票原件（公钥 ‖ 地址盐 ‖ 签名）。
+        /// 块哈希只绑它的指纹，原件靠这条消息随块送达——收方因此不需要注册表、
+        /// 也不需要"刚好收到过这张票"，就能独立复验"这个块是谁、为哪个高度开的"。
+        #[serde(default)]
+        ticket: Option<crate::simchain::TicketProof>,
     },
     Ticket {
         addr: String,
@@ -232,6 +294,12 @@ pub enum NetMsg {
     /// 「这把公钥 + 这份盐派生出的地址就是它声称的那个」再验签，与 `Tx` 同一手法，
     /// 不依赖注册表的消息顺序。落进去的只有内存名单，账本与块一个字节都不碰。
     Pos(PresenceWire),
+    /// 地址自报（共识之外）：**我自己**在听哪些地址。整条消息由本节点的 libp2p
+    /// 身份钥匙签名——gossipsub 跑 Anonymous 模式，应用层拿不到"谁原始发布"，
+    /// 上一跳（`propagation_source`）也不是发布者。所以"这条是谁说的"只能由签名给出，
+    /// 否则收方连采信的对象都没有（第一版就是这么写的，集成测试里第三台机器永远发现不了人）。
+    /// 落进去的只有"下次拨谁"，账本与块一字节不碰。
+    Peers(PeersWire),
 }
 
 /// 在场原件：坐标定点化为整数（`POS_SCALE` 倍）后才进签名消息——浮点没有可比字节。
@@ -304,6 +372,130 @@ fn sign_pos_wire(
     w
 }
 
+// ---------------------------------------------------------------- 地址自报（§9.32）
+
+/// 地址自报原件：**本机 libp2p 身份钥匙**签下的「我在这几个地址上监听」。
+///
+/// 为什么必须签名：本节点的 gossipsub 是 `MessageAuthenticity::Anonymous`，
+/// 交给应用层的 `message.source` 恒为 `None`，能拿到的只有 `propagation_source`
+/// （上一跳）。也就是说传输层压根不告诉收方"这条是谁发布的"——不签名就没有发布者，
+/// 自报地址也无从采信（第一版正是这样，中继转发链路上第三台机器永远发现不了第二台）。
+/// 签了名之后，验签得到的公钥就是发布者，每条地址的 `/p2p` 必须等于它，与谁转发无关。
+///
+/// 这把钥匙只是传输层身份（Noise 握手用的 ed25519），与钱无关，也进不了任何账本判定。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct PeersWire {
+    /// 发布者 libp2p 公钥（protobuf 编码 hex）
+    pub pk_hex: String,
+    /// 每条都带 `/p2p/<发布者 PeerId>`
+    pub addrs: Vec<String>,
+    /// 签发时刻（秒）
+    pub ts: u64,
+    pub sig_hex: String,
+}
+
+/// 签名消息 = 前缀 ‖ ts ‖ (每条地址的长度 + 字节)
+///
+/// 地址逐条带长度前缀：`["/ip4/1.2.3.4", "/tcp/1"]` 与 `["/ip4/1.2.3.4/tcp/1"]`
+/// 拼起来是同一条字符串，不锁长度就签不出唯一字节，等于给转发者留改包空间。
+fn peers_msg_bytes(w: &PeersWire) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.extend_from_slice(PEERS_PREFIX);
+    m.extend_from_slice(&w.ts.to_be_bytes());
+    for a in &w.addrs {
+        m.extend_from_slice(&(a.len() as u32).to_be_bytes());
+        m.extend_from_slice(a.as_bytes());
+    }
+    m
+}
+
+/// 用本节点身份钥匙签一条自报（`now_ms` 由调用方给，测试可注入时钟）
+fn make_peers_wire(
+    kp: &libp2p::identity::Keypair,
+    addrs: Vec<String>,
+    now_ms: u64,
+) -> PeersWire {
+    let mut w = PeersWire {
+        pk_hex: hex::encode(kp.public().encode_protobuf()),
+        addrs,
+        ts: now_ms / 1000,
+        sig_hex: String::new(),
+    };
+    let Ok(sig) = kp.sign(&peers_msg_bytes(&w)) else {
+        // 只有 secp256k1 之类需要额外上下文的算法会走到这里；本节点只用 ed25519
+        eprintln!("[QLight] 身份钥匙签不出地址自报，本轮不发");
+        w.addrs.clear();
+        return w;
+    };
+    w.sig_hex = hex::encode(sig);
+    w
+}
+
+/// 验一条地址自报，返回（发布者 PeerId，可拨地址）。判不过就整条丢。
+///
+/// 三道判据，全在连接层，**没有任何一条碰账本**：
+/// 1. 签名 + 时效：验签得到发布者，`ts` 太老或来自未来都丢（防攒包重放）；
+/// 2. 自报只替自己：每条地址的 `/p2p` 必须等于验签出来的发布者，代报第三方无效；
+/// 3. 档位只挡回环：从非回环邻居学来的 `127.0.0.1` 拨的是我自己家里，丢了。
+///    其余档位不设闸 —— 拨不通的代价只是一次退避，而误丢的代价是永远连不上。
+fn verify_peers_ad(
+    w: &PeersWire,
+    my_pid: PeerId,
+    via_scope: &str,
+    now_ms: u64,
+) -> Option<(PeerId, Vec<Multiaddr>)> {
+    if w.addrs.is_empty() || w.addrs.len() > PEERS_ADDRS_MAX {
+        eprintln!("[QLight] 丢弃地址自报：一次报了 {} 条（上限 {PEERS_ADDRS_MAX}）", w.addrs.len());
+        return None;
+    }
+    let now_s = now_ms / 1000;
+    if w.ts > now_s + PEERS_CLOCK_SLACK_SECS || w.ts + PEERS_MAX_AGE_SECS < now_s {
+        eprintln!("[QLight] 丢弃地址自报：签发时刻 {} 相对现在 {now_s} 已失效", w.ts);
+        return None;
+    }
+    let Ok(bytes) = hex::decode(&w.pk_hex) else {
+        eprintln!("[QLight] 丢弃地址自报：公钥不是十六进制");
+        return None;
+    };
+    let Ok(pk) = libp2p::identity::PublicKey::try_decode_protobuf(&bytes) else {
+        eprintln!("[QLight] 丢弃地址自报：公钥解不开");
+        return None;
+    };
+    let Ok(sig) = hex::decode(&w.sig_hex) else {
+        eprintln!("[QLight] 丢弃地址自报：签名不是十六进制");
+        return None;
+    };
+    if !pk.verify(&peers_msg_bytes(w), &sig) {
+        eprintln!("[QLight] 丢弃地址自报：签名验不过");
+        return None;
+    }
+    let publisher = pk.to_peer_id();
+    // 自己那条从自己的主题里绕回来（或邻居把我原来的包转发给我）——不必再拨自己
+    if publisher == my_pid {
+        return None;
+    }
+    let mut list: Vec<Multiaddr> = Vec::new();
+    for raw in &w.addrs {
+        let Some((claim, addr)) = split_identity(raw) else {
+            eprintln!("[QLight] 丢弃自报里解析不了的地址：{raw}");
+            continue;
+        };
+        if claim != publisher {
+            eprintln!("[QLight] 丢弃自报里代别人发的地址（声称 {claim}，发布者 {publisher}）：{raw}");
+            continue;
+        }
+        if addr_scope(&addr) == "loopback" && via_scope != "loopback" {
+            eprintln!("[QLight] 丢弃跨网段自报地址（回环地址经 {via_scope} 邻居转来，拨不到）：{raw}");
+            continue;
+        }
+        list.push(addr);
+    }
+    if list.is_empty() {
+        return None;
+    }
+    Some((publisher, list))
+}
+
 #[derive(NetworkBehaviour)]
 pub struct QlBehaviour {
     pub gossipsub: gossipsub::Behaviour,
@@ -329,6 +521,7 @@ struct Topics {
     ent: gossipsub::IdentTopic,
     dust: gossipsub::IdentTopic,
     pos: gossipsub::IdentTopic,
+    peers: gossipsub::IdentTopic,
 }
 
 // ---------------------------------------------------------------- 出块轮状态机
@@ -365,6 +558,14 @@ struct MachineState {
     dust_asked: Option<String>,
     /// 下次重发本机位置的时刻（在场心跳）
     pos_next: u64,
+    /// 本机这一轮广播出去的门票原件：`Some((高度, 票))`。
+    /// 胜者出块时必须把**这一张**放进块里——邻居手里握的就是它的 vrf'，
+    /// 出块时另签一张（哪怕同一把钥匙）都可能得到另一个指纹，胜者反被当成抢块。
+    my_ticket: Option<(u64, crate::simchain::TicketProof)>,
+    /// 各高度收到的**验过签**的门票：高度 → `[(vrf', 地址)]`。
+    /// 它是接收侧"这块是不是抢块"的全部依据：我握着一张更低的真票，别人就不能出这个块
+    /// （除非胜者沉默到超过接管间隔）。只在内存里，重启即清零 = 重新开始判断这一轮。
+    round_tickets: std::collections::BTreeMap<u64, Vec<(String, String)>>,
 }
 
 impl Default for MachineState {
@@ -381,6 +582,8 @@ impl Default for MachineState {
             dust_next: now + 3000,
             dust_asked: None,
             pos_next: now + 3500, // 解锁后先报一次位置，再按心跳重发
+            my_ticket: None,
+            round_tickets: Default::default(),
         }
     }
 }
@@ -546,13 +749,13 @@ impl VersionCensus {
         };
         if !fork.is_empty() {
             eprintln!(
-                "[QLight] 联邦规则分歧（本机 {mine}）：{}；两端互相验不过对方的块，块高超过 {BLOCK_V_V5_ACTIVATION} 后会各出各的链且谁都不报错",
+                "[QLight] 联邦规则分歧（本机 {mine}）：{}；两端互相验不过对方的块，块高超过 {BLOCK_V_V6_ACTIVATION} 后会各出各的链且谁都不报错",
                 rows(&fork)
             );
         }
         if !odd.is_empty() {
             eprintln!(
-                "[QLight] 联邦版本不齐、规则指纹相同（本机 {my_version}）：{}；规则家族内改过判据（本轮：光尘轮次只认进块块高）时这一样会分叉，请统一发行包",
+                "[QLight] 联邦版本不齐、规则指纹相同（本机 {my_version}）：{}；规则家族内改过判据（本轮：出块门票进块哈希、块时间戳成判据）时这一样会分叉，请统一发行包",
                 rows(&odd)
             );
         }
@@ -604,6 +807,14 @@ pub struct Net {
     my_rules: String,
     /// 公共引导注册表（base_dir/peers-registry.json，所有实例共享）
     boot_path: PathBuf,
+    /// 固定监听端口（0 = 交给系统分配）
+    listen_port: u16,
+    /// libp2p 身份密钥落盘位置：重启后还是同一个 PeerId，种子名单才写得死
+    identity_path: PathBuf,
+    /// 种子节点：(对端 PeerId, 去掉 `/p2p` 的可拨地址)
+    seeds: Vec<(PeerId, Multiaddr)>,
+    /// 运营者指定对外公布的地址（公网机器上 `127.0.0.1` 不够用）
+    announce: Vec<Multiaddr>,
 }
 
 enum NetCmd {
@@ -667,34 +878,207 @@ pub fn addr_scope(a: &Multiaddr) -> &'static str {
     "unknown"
 }
 
-/// 门票签名消息 = 前缀 ‖ height(8B BE) ‖ prev_hash（收发双方同构重建）
-fn ticket_msg_bytes(height: u64, prev_hash_hex: &str) -> Vec<u8> {
-    let mut m = Vec::with_capacity(12 + prev_hash_hex.len());
-    m.extend_from_slice(TICKET_PREFIX);
-    m.extend_from_slice(&height.to_be_bytes());
-    m.extend_from_slice(prev_hash_hex.as_bytes());
-    m
+/// 门票的三个原语（签名域前缀、票消息、vrf'）已经搬进共识层
+/// （`simchain::{TICKET_PREFIX, ticket_msg_bytes, ticket_vrf}`）——
+/// v6 起接收方要按同一口径独立复验它，判据不能只住在发送方。
+pub use crate::simchain::{ticket_msg_bytes, ticket_vrf, TICKET_PREFIX};
+
+// ---------------------------------------------------------------- 节点启动参数
+
+/// 编译期内置种子名单：**目前是空的**。
+///
+/// 本机还没有一台对外常驻的公网节点，往这里写地址就是写假话。真上线一台之后，
+/// 把它的 `/ip4/<公网IP>/tcp/47410/p2p/<PeerId>` 填进来，客户端装上就自动接网——
+/// 比特币的内置种子也是这个做法（种子只负责"第一次找到人"，之后靠网络自己长）。
+pub const SEEDS_BUILTIN: &[&str] = &[];
+
+/// 节点启动参数：GUI 与无头 `--node` 走同一条网络代码路径，
+/// 差别只有事件出口（推前端 / 丢弃）和有没有解锁的钱包（无头永远没有 ⇒ 永不出块）。
+pub struct NodeOpts {
+    pub sink: Sink,
+    /// 本节点数据目录：libp2p 身份密钥与 `seeds.json` 放这里
+    pub data_dir: PathBuf,
+    /// 同机互读的引导注册表（公共根目录，所有实例共享同一份）
+    pub registry_path: PathBuf,
+    /// 固定监听端口（`QL_LISTEN_PORT`；0 = 交给系统分配）
+    pub listen_port: u16,
+    /// 要对外公布的地址（`QL_ADVERTISE`，逗号分隔）
+    pub announce: Vec<String>,
 }
 
-/// 门票 vrf' = SHAKE-256(prefix ‖ 票消息 ‖ sig)（签名唯一 → vrf' 唯一）
-fn ticket_vrf(msg: &[u8], sig: &[u8]) -> Vec<u8> {
-    let mut all = Vec::with_capacity(msg.len() + sig.len());
-    all.extend_from_slice(msg);
-    all.extend_from_slice(sig);
-    crate::crypto::shake256(TICKET_PREFIX, &all, 32)
+/// 环境变量里的多地址列表：逗号 / 空格 / 换行都算分隔
+pub fn env_list(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .unwrap_or_default()
+        .split([',', ' ', '\n', '\t', '\r'])
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// 种子名单三个来源合一：内置 + `QL_SEEDS` + `<data>/seeds.json`（JSON 字符串数组），
+/// 去重保序。文件读不到或解析不了只告警，不致命——钱包照常单机跑。
+pub fn collect_seeds(data_dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |raw: String| {
+        if !out.iter().any(|s| s == &raw) {
+            out.push(raw);
+        }
+    };
+    for s in SEEDS_BUILTIN.iter().map(|s| s.to_string()) {
+        push(s);
+    }
+    for s in env_list("QL_SEEDS") {
+        push(s);
+    }
+    let path = data_dir.join("seeds.json");
+    match std::fs::read_to_string(&path) {
+        Ok(txt) => match serde_json::from_str::<Vec<String>>(&txt) {
+            Ok(list) => {
+                for s in list {
+                    let s = s.trim().to_string();
+                    if !s.is_empty() {
+                        push(s);
+                    }
+                }
+            }
+            Err(e) => eprintln!("[QLight] {} 不是字符串数组，忽略：{e}", path.display()),
+        },
+        Err(_) => {}
+    }
+    out
+}
+
+/// 多地址 → (对端 PeerId, 剥掉 `/p2p` 的可拨地址)。
+///
+/// 必须带 `/p2p/<PeerId>`：邻居计数、退避、地址范围三态全按 PeerId 记，
+/// 不知道对方身份就连"两次拨到的是不是同一台"都判不出来。
+/// 拨号时 `adopt_peer` 会把 `/p2p` 拼回去，所以这里存的是剥掉的版本。
+fn split_identity(raw: &str) -> Option<(PeerId, Multiaddr)> {
+    let Ok(addr) = raw.trim().parse::<Multiaddr>() else {
+        return None;
+    };
+    let Some(Protocol::P2p(pid)) = addr.iter().find(|p| matches!(p, Protocol::P2p(_))) else {
+        return None;
+    };
+    let mut dialable = Multiaddr::empty();
+    for p in addr.iter() {
+        if !matches!(p, Protocol::P2p(_)) {
+            dialable.push(p);
+        }
+    }
+    Some((pid, dialable))
+}
+
+/// 种子名单用的版本：同一套解析，但把"为什么这条没生效"说清楚
+pub fn parse_seed(raw: &str) -> Option<(PeerId, Multiaddr)> {
+    let addr = raw.trim();
+    match split_identity(addr) {
+        Some(v) => Some(v),
+        None => {
+            eprintln!(
+                "[QLight] 种子地址无效或缺少 /p2p/<PeerId>，跳过：{addr}\n         完整地址长这样：/ip4/<IP>/tcp/{DEFAULT_LISTEN_PORT}/p2p/<对端PeerId>"
+            );
+            None
+        }
+    }
+}
+
+/// libp2p 身份密钥文件名（放在节点数据目录里）
+pub const IDENTITY_FILE: &str = "libp2p-identity.bin";
+
+/// 读本节点身份密钥（没有就生成并落盘）——无头节点靠它算出 PeerId，
+/// 写进 `peer-id.txt` 给运营者抄进种子名单。
+pub fn load_identity(data_dir: &Path) -> libp2p::identity::Keypair {
+    load_or_create_identity(&data_dir.join(IDENTITY_FILE))
+}
+
+/// libp2p 身份密钥：落盘复用，重启后 PeerId 不变。
+///
+/// 旧实现每次 `with_new_identity()` —— 重启一次就变成一台陌生机器，
+/// 种子名单里写死的 `/p2p/<PeerId>` 当场作废。这把钥匙只是传输层身份（Noise 握手），
+/// 与钱无关：钱包钥匙在 `keystore.json` 里，argon2id + aes-256-gcm 守着。
+fn load_or_create_identity(path: &Path) -> libp2p::identity::Keypair {
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(kp) = libp2p::identity::Keypair::from_protobuf_encoding(&bytes) {
+            return kp;
+        }
+        eprintln!("[QLight] 身份密钥文件读不懂，重新生成一份：{}", path.display());
+    }
+    let kp = libp2p::identity::Keypair::generate_ed25519();
+    match kp.to_protobuf_encoding() {
+        Ok(bytes) if std::fs::write(path, &bytes).is_ok() => harden_key_file(path),
+        _ => eprintln!(
+            "[QLight] 身份密钥写不进 {}，本次运行的 PeerId 是临时的（邻居记不住这台）",
+            path.display()
+        ),
+    }
+    kp
+}
+
+#[cfg(unix)]
+fn harden_key_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// Windows：ACL 跟着用户目录走，这里没有 posix mode 可用
+#[cfg(not(unix))]
+fn harden_key_file(_path: &Path) {}
+
+/// 监听地址转"别人拨得到的地址"：`0.0.0.0` / `::` 是通配，不能直接给对端。
+/// 未指定 IP 换成回环——同机邻居能用；跨网段与公网要靠 `QL_ADVERTISE`（DESIGN.md §9.32）。
+fn dialable_from_listen(a: &Multiaddr) -> Option<Multiaddr> {
+    let mut out = Multiaddr::empty();
+    for p in a.iter() {
+        match p {
+            Protocol::Ip4(ip) if ip.octets() == [0, 0, 0, 0] => {
+                out.push(Protocol::Ip4(std::net::Ipv4Addr::LOCALHOST))
+            }
+            Protocol::Ip6(ip) if ip.octets() == [0; 16] => {
+                out.push(Protocol::Ip6(std::net::Ipv6Addr::LOCALHOST))
+            }
+            other => out.push(other),
+        }
+    }
+    // 只有带 IP 的地址才谈得上"拨得到"
+    out.iter()
+        .any(|p| matches!(p, Protocol::Ip4(_) | Protocol::Ip6(_)))
+        .then_some(out)
 }
 
 impl Net {
-    /// 启动联邦网络（swarm 在 Tauri 的 tokio 运行时里常驻）
+    /// 启动联邦网络（swarm 常驻在 Tauri 的 tokio 运行时里；无头节点用同一个入口）
     pub fn start(
-        app: AppHandle,
+        opts: NodeOpts,
         chain: Arc<SimChain>,
         entities: Arc<crate::world::EntityLedger>,
         dust: Arc<crate::world::dust::DustLedger>,
         core_slot: Arc<RwLock<Option<Arc<WalletCore>>>>,
-        boot_path: PathBuf,
     ) -> Arc<Net> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<NetCmd>();
+        let seed_list = collect_seeds(&opts.data_dir);
+        let seeds: Vec<(PeerId, Multiaddr)> =
+            seed_list.iter().filter_map(|raw| parse_seed(raw)).collect();
+        if !seed_list.is_empty() {
+            eprintln!(
+                "[QLight] 种子名单 {} 条（可解析 {} 条）：{}",
+                seed_list.len(),
+                seeds.len(),
+                seed_list.join("  ")
+            );
+        }
+        let announce: Vec<Multiaddr> = opts
+            .announce
+            .iter()
+            .filter_map(|s| match s.parse::<Multiaddr>() {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("[QLight] QL_ADVERTISE 地址无效，跳过：{s}（{e}）");
+                    None
+                }
+            })
+            .collect();
         let net = Arc::new(Net {
             chain,
             entities,
@@ -711,9 +1095,13 @@ impl Net {
             dial_scope: Mutex::new(HashMap::new()),
             peer_scope: Mutex::new(HashMap::new()),
             my_rules: crate::simchain::rules_tag(),
-            boot_path,
+            boot_path: opts.registry_path,
+            listen_port: opts.listen_port,
+            identity_path: opts.data_dir.join(IDENTITY_FILE),
+            seeds,
+            announce,
         });
-        tauri::async_runtime::spawn(run_swarm(app, net.clone(), cmd_rx));
+        tauri::async_runtime::spawn(run_swarm(opts.sink, net.clone(), cmd_rx));
         net
     }
 
@@ -775,7 +1163,7 @@ impl Net {
     }
 
     /// 分歧集合变了才推事件：chip 自己按两堆明细决定说什么颜色
-    fn emit_versions(&self, app: &AppHandle) {
+    fn emit_versions(&self, app: &Sink) {
         let _ = app.emit("net_versions", self.version_report());
     }
 
@@ -900,7 +1288,7 @@ impl Net {
         })
     }
 
-    fn emit_presence(&self, app: &AppHandle) {
+    fn emit_presence(&self, app: &Sink) {
         let _ = app.emit("net_presence", self.presence_report());
     }
 
@@ -1031,7 +1419,7 @@ impl Net {
         }
     }
 
-    fn on_peers_expired(&self, list: Vec<(PeerId, Multiaddr)>, seen: &mut HashSet<PeerId>, app: &AppHandle) {
+    fn on_peers_expired(&self, list: Vec<(PeerId, Multiaddr)>, seen: &mut HashSet<PeerId>, app: &Sink) {
         for (pid, _) in list {
             if seen.remove(&pid) {
                 // 邻居离线：它的地址范围与拨号记录一起清掉，三态统计才不会挂着死人
@@ -1130,6 +1518,114 @@ impl Net {
         }
     }
 
+    // -------------------------------------------------------------- 种子与地址
+
+    /// 重拨种子名单（固定端口 + 常驻节点）。已连接、退避期内都由 `adopt_peer` 自己判，
+    /// 所以这里跟着引导节拍每 4s 走一遍就行：种子重启过、刚上线，下一轮就连上。
+    #[allow(clippy::too_many_arguments)]
+    fn seed_tick(
+        &self,
+        seen: &mut HashSet<PeerId>,
+        backoff: &mut HashMap<PeerId, u64>,
+        established: &HashSet<PeerId>,
+        swarm: &mut libp2p::Swarm<QlBehaviour>,
+        topics: &Topics,
+        chain: &Arc<SimChain>,
+    ) {
+        for (pid, addr) in &self.seeds {
+            self.adopt_peer(
+                *pid,
+                vec![addr.clone()],
+                seen,
+                backoff,
+                established,
+                swarm,
+                topics,
+                chain,
+                "种子名单",
+            );
+        }
+    }
+
+    /// 我对外可拨的地址：`QL_ADVERTISE` 优先（公网机器靠它，程序猜不出自己的公网 IP），
+    /// 再加监听地址把通配 IP 换成回环（同机邻居用得上）。每条都带 `/p2p/<我的 PeerId>`。
+    fn my_announce(&self, my_pid: PeerId, my_addrs: &[Multiaddr]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |a: Multiaddr| {
+            // 运营者可能把 /p2p 也写进 QL_ADVERTISE：剥掉再统一拼，避免出现两个身份段
+            let (_, a) = match split_identity(&a.to_string()) {
+                Some((pid, stripped)) => (pid, stripped),
+                None => (my_pid, a),
+            };
+            let s = format!("{a}/p2p/{my_pid}");
+            if !out.iter().any(|e| e == &s) {
+                out.push(s);
+            }
+        };
+        for a in &self.announce {
+            push(a.clone());
+        }
+        for a in my_addrs {
+            if let Some(d) = dialable_from_listen(a) {
+                push(d);
+            }
+        }
+        out.truncate(PEERS_ADDRS_MAX);
+        out
+    }
+
+    /// 周期自报地址：没人连着时不发（纯噪声），发了也只报自己（签名锁死了这一点）。
+    fn peers_tick(
+        &self,
+        kp: &libp2p::identity::Keypair,
+        my_pid: PeerId,
+        my_addrs: &[Multiaddr],
+        established: &HashSet<PeerId>,
+        swarm: &mut libp2p::Swarm<QlBehaviour>,
+        topics: &Topics,
+    ) {
+        if established.is_empty() {
+            return;
+        }
+        let addrs = self.my_announce(my_pid, my_addrs);
+        if addrs.is_empty() {
+            return;
+        }
+        pub_msg(swarm, &topics.peers, &NetMsg::Peers(make_peers_wire(kp, addrs, now_ms())));
+    }
+
+    /// 收到（可能是任何一跳转来的）地址自报 → 验签定出发布者，再按老路拨过去。
+    ///
+    /// `from` 是 gossipsub 的上一跳，只用来判"这条地址是不是从公网/局域网那边转来的"；
+    /// 真正的发布者由签名决定，所以中继转发不会让这条消息作废。
+    #[allow(clippy::too_many_arguments)]
+    fn on_peers_advertised(
+        &self,
+        wire: PeersWire,
+        from: Option<PeerId>,
+        my_pid: PeerId,
+        seen: &mut HashSet<PeerId>,
+        backoff: &mut HashMap<PeerId, u64>,
+        established: &HashSet<PeerId>,
+        swarm: &mut libp2p::Swarm<QlBehaviour>,
+        topics: &Topics,
+        chain: &Arc<SimChain>,
+    ) {
+        let Some(via) = from else { return };
+        let via_scope = self
+            .peer_scope
+            .lock()
+            .unwrap()
+            .get(&via.to_string())
+            .copied()
+            .unwrap_or("unknown");
+        let Some((publisher, list)) = verify_peers_ad(&wire, my_pid, via_scope, now_ms()) else {
+            return;
+        };
+        eprintln!("[QLight] 采信 {publisher} 自报的 {} 条地址（经 {via} 转来，{via_scope}）", list.len());
+        self.adopt_peer(publisher, list, seen, backoff, established, swarm, topics, chain, "地址gossip");
+    }
+
     /// 联邦消息入口
     fn on_net_msg(
         &self,
@@ -1138,10 +1634,14 @@ impl Net {
         swarm: &mut libp2p::Swarm<QlBehaviour>,
         ms: &mut MachineState,
         topics: &Topics,
-        app: &AppHandle,
+        app: &Sink,
         chain: &Arc<SimChain>,
     ) {
         match msg {
+            // 地址自报在 swarm 循环里就地消化（seen/退避/已连接那三本账都在循环手里），
+            // 走到这里只有一种情况：对端把地址广播发到了别的主题上——不当账本消息处理
+            NetMsg::Peers(..) => {}
+
             NetMsg::Reg { pk_hex, salt_hex } => {
                 self.accept_registry(&pk_hex, &salt_hex);
             }
@@ -1154,8 +1654,8 @@ impl Net {
                 }
             }
 
-            NetMsg::Block { header, txs, dusts } => {
-                self.on_block_wire(header, txs, dusts, swarm, ms, topics, app, chain)
+            NetMsg::Block { header, txs, dusts, ticket } => {
+                self.on_block_wire(header, txs, dusts, ticket, swarm, ms, topics, app, chain)
             }
 
             NetMsg::Entity(list) => {
@@ -1529,10 +2029,11 @@ impl Net {
         header: BlockHeader,
         txs: Vec<TxWire>,
         dusts: Vec<crate::world::dust::DustRecord>,
+        ticket: Option<crate::simchain::TicketProof>,
         swarm: &mut libp2p::Swarm<QlBehaviour>,
         ms: &mut MachineState,
         topics: &Topics,
-        app: &AppHandle,
+        app: &Sink,
         chain: &Arc<SimChain>,
     ) {
         let my = chain.height();
@@ -1574,9 +2075,22 @@ impl Net {
             return;
         }
 
-        // —— 高度衔接：整块真验（原件逐笔验签 + 凭据对照 + 块哈希重算）——
+        // —— 高度衔接：整块真验（原件逐笔验签 + 凭据对照 + 块哈希重算 + 门票 + 时间）——
         // 不再先查注册表：块自带公钥与地址盐，验证不需要"对方先注册过"。
-        match chain.apply_remote_block(&header, txs, dusts) {
+        // 本机在这一轮见过的最低票一并交给裁决——它就是"这块是不是轮到他出"的全部证据。
+        let winner = ms
+            .round_tickets
+            .get(&header.height)
+            .and_then(|list| {
+                crate::simchain::elect_winner(
+                    list.iter().map(|(vrf, addr)| (vrf.as_str(), addr.as_str())),
+                )
+                .map(|(vrf, addr)| crate::simchain::RoundWinner {
+                    vrf_hex: vrf.to_string(),
+                    addr: addr.to_string(),
+                })
+            });
+        match chain.apply_remote_block(&header, txs, dusts, ticket, winner) {
             Ok(mut event) => {
                 event.balance = self
                     .core_slot
@@ -1590,7 +2104,7 @@ impl Net {
                 ms.phase = Phase::Direct;
                 ms.beat_next = now_ms() + BEAT_MS;
                 eprintln!(
-                    "[QLight] 已采用联邦块 #{}（逐笔重验签 + 块哈希重算通过，全网账本对齐）",
+                    "[QLight] 已采用联邦块 #{}（逐笔重验签 + 块哈希重算 + 出块门票复验通过，全网账本对齐）",
                     header.height
                 );
                 self.chase_world(&header, ms, swarm, topics, chain);
@@ -1702,16 +2216,23 @@ impl Net {
         if !crate::crypto::verify(&vk, &msg, &sig) {
             return; // 假票直接丢
         }
-        let vrf = ticket_vrf(&msg, &sig);
-        tickets.insert(hex::encode(&vrf), addr);
+        let vrf = hex::encode(ticket_vrf(&msg, &sig));
+        tickets.insert(vrf.clone(), addr.clone());
+        // 同一批票还要活过这一轮：块到达时（可能就晚了几拍）接收侧要拿它判断
+        // "这块到底是胜者出的，还是有人抢块"。只在本机参加投票时记录 = 只记我认得的这一轮。
+        let seen_here = ms.round_tickets.entry(height).or_default();
+        if seen_here.len() < ROUND_TICKETS_MAX && !seen_here.iter().any(|(v, _)| v == &vrf) {
+            seen_here.push((vrf, addr));
+        }
     }
+
 
     /// 出块状态机节拍（由 run_swarm 每 120ms 调用一次）
     fn machine_tick(
         &self,
         swarm: &mut libp2p::Swarm<QlBehaviour>,
         ms: &mut MachineState,
-        app: &AppHandle,
+        app: &Sink,
         chain: &Arc<SimChain>,
         topics: &Topics,
         prev_unlocked: &mut bool,
@@ -1793,11 +2314,18 @@ impl Net {
 
         let Some(core) = self.core_slot.read().unwrap().clone() else { return };
 
+        // —— 选举留档只跟最近几轮：更早的高度已经不会再有块来了，留着只会涨内存 ——
+        {
+            let tip = chain.height();
+            ms.round_tickets.retain(|h, _| *h + 2 >= tip && *h <= tip + 2);
+        }
+
         // —— 出块状态机 ——
         match &ms.phase {
             Phase::Direct if now >= ms.beat_next => {
                 if self.peers.load(Ordering::Relaxed) == 0 {
-                    // A 档行为：单机直出
+                    // A 档行为：单机直出（没有选举，也就没有"抢块"可言；票照样签一张，
+                    // 因为块格式从 v6 起**每一块**都要带门票——包括这台机器独自跑的块）
                     if let Some((event, ..)) = chain.mine_block(&core) {
                         let _ = app.emit("chain_block", &event);
                     }
@@ -1806,9 +2334,11 @@ impl Net {
                     // 联邦模式：广播自己的门票并开票窗
                     let height = chain.height() + 1;
                     let prev = chain.tip_hash_hex_pub();
-                    let msg = ticket_msg_bytes(height, &prev);
-                    let sig = crate::crypto::sign(&core.signing_key, &msg);
-                    let vrf = ticket_vrf(&msg, &sig);
+                    // 这一张就是"我要在这个高度、这条父链上出块"的公开承诺。
+                    // 它被存下来：胜者若是我，块里必须放**这一张**原件，
+                    // 邻居手里握的 vrf' 才是同一个数。
+                    let proof = crate::simchain::make_ticket_proof(&core, height, &prev);
+                    let vrf = crate::simchain::ticket_vrf_hex(&proof, height, &prev);
                     pub_msg(
                         swarm,
                         &topics.sync,
@@ -1816,11 +2346,12 @@ impl Net {
                             addr: core.address.clone(),
                             height,
                             prev_hash_hex: prev,
-                            sig_hex: hex::encode(&sig),
+                            sig_hex: proof.sig_hex.clone(),
                         },
                     );
+                    ms.my_ticket = Some((height, proof));
                     let mut tickets = HashMap::new();
-                    tickets.insert(hex::encode(&vrf), core.address.clone());
+                    tickets.insert(vrf, core.address.clone());
                     ms.phase = Phase::Voting {
                         height,
                         until_ms: now + WINDOW_MS,
@@ -1834,40 +2365,68 @@ impl Net {
                 tickets,
             } if now >= *until_ms => {
                 // —— 开票：vrf' 最小（并列比地址）者出块 ——
-                let winner = tickets
-                    .iter()
-                    .min_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)))
-                    .map(|(_, addr)| addr.clone());
-                let mine_now = winner.as_deref() == Some(core.address.as_str());
-                if mine_now {
-                    if let Some((event, header, wires, dusts)) = chain.mine_block(&core) {
-                        pub_block(swarm, &topics.block, &header, &wires, &dusts);
+                let winner = crate::simchain::elect_winner(
+                    tickets.iter().map(|(vrf, addr)| (vrf.as_str(), addr.as_str())),
+                )
+                .map(|(_, addr)| addr.to_string());
+                let n_tickets = tickets.len();
+                let won = winner.as_deref() == Some(core.address.as_str());
+                let (ticket_height, ticket) = match &ms.my_ticket {
+                    Some(t) => t.clone(),
+                    None => {
+                        // 本机这一轮没开票（例如投票期被同高分叉打断）：现签一张，
+                        // 代价是邻居可能握着我上一轮的票——块仍然自证，只是"轮到我"这条
+                        // 只能靠接管间隔放行。
+                        let h = chain.height() + 1;
+                        (h, crate::simchain::make_ticket_proof(&core, h, &chain.tip_hash_hex_pub()))
+                    }
+                };
+                if won && ticket_height == chain.height() + 1 {
+                    if let Some((event, header, wires, dusts)) =
+                        chain.mine_block_with_ticket(&core, &ticket, now / 1000)
+                    {
+                        pub_block(swarm, &topics.block, &header, &wires, &dusts, Some(ticket));
                         let _ = app.emit("chain_block", &event);
                     }
+                    ms.phase = Phase::Direct;
+                    ms.beat_next = now + BEAT_MS;
+                    ms.my_ticket = None;
                 } else {
-                    eprintln!(
-                        "[QLight] 高度 {height} 由 {} 出块（{} 张有效票），等待胜者块",
-                        winner.as_deref().map(short_addr).unwrap_or_default(),
-                        tickets.len()
-                    );
-                    ms.phase = Phase::Waiting {
-                        height: *height,
-                        until_ms: now + WAIT_MS,
-                    };
-                    return;
+                    if !won {
+                        eprintln!(
+                            "[QLight] 高度 {height} 由 {} 出块（{n_tickets} 张有效票），等待胜者块",
+                            winner.as_deref().map(short_addr).unwrap_or_default()
+                        );
+                        ms.phase = Phase::Waiting {
+                            height: *height,
+                            until_ms: now + WAIT_MS,
+                        };
+                        ms.my_ticket = None;
+                        return;
+                    }
+                    // 胜者是我，但链尖已经动了（收了别人的块）：这一轮的票作废，回直出节拍
+                    ms.phase = Phase::Direct;
+                    ms.beat_next = now + BEAT_MS;
+                    ms.my_ticket = None;
                 }
-                ms.phase = Phase::Direct;
-                ms.beat_next = now + BEAT_MS;
             }
             Phase::Waiting { height, until_ms } if now >= *until_ms => {
-                // 自愈兜底：胜者一直没出块（掉线/作恶），本机接手（本地网 liveness）
+                // 自愈兜底：胜者一直没出块（掉线/作恶），本机接手（本地网 liveness）。
+                // v6 起这件事全网都看得见：块里的门票不是本轮最低票，能放行只因为
+                // 块内时间已经在父块之后 `MINT_TAKEOVER_SECS` 以外——胜者确实沉默够了。
                 eprintln!("[QLight] 高度 {height} 胜者超时未出块，本机兜底出块");
-                if let Some((event, header, wires, dusts)) = chain.mine_block(&core) {
-                    pub_block(swarm, &topics.block, &header, &wires, &dusts);
+                let h = chain.height() + 1;
+                let prev = chain.tip_hash_hex_pub();
+                let proof = crate::simchain::make_ticket_proof(&core, h, &prev);
+                if let Some((event, header, wires, dusts)) =
+                    chain.mine_block_with_ticket(&core, &proof, now / 1000)
+                {
+                    pub_block(swarm, &topics.block, &header, &wires, &dusts, Some(proof));
                     let _ = app.emit("chain_block", &event);
                 }
                 ms.phase = Phase::Direct;
                 ms.beat_next = now + BEAT_MS;
+                ms.my_ticket = None;
             }
             _ => {}
         }
@@ -1960,6 +2519,7 @@ fn pub_block(
     header: &BlockHeader,
     wires: &[TxWire],
     dusts: &[crate::world::dust::DustRecord],
+    ticket: Option<crate::simchain::TicketProof>,
 ) {
     pub_msg(
         swarm,
@@ -1968,6 +2528,7 @@ fn pub_block(
             header: header.clone(),
             txs: wires.to_vec(),
             dusts: dusts.to_vec(),
+            ticket,
         },
     );
 }
@@ -1983,7 +2544,7 @@ fn snapshot_tip_of(lines: &str) -> Option<(u64, String)> {
 }
 
 /// 推送一次链状态（追账/对齐后刷新 UI）
-fn emit_status(app: &AppHandle, net: &Net, chain: &Arc<SimChain>) {
+fn emit_status(app: &Sink, net: &Net, chain: &Arc<SimChain>) {
     let core = net.core_slot.read().unwrap().clone();
     let height = chain.height();
     let event = BlockEvent {
@@ -2005,11 +2566,14 @@ fn emit_status(app: &AppHandle, net: &Net, chain: &Arc<SimChain>) {
 
 // ---------------------------------------------------------------- swarm 生命周期
 
-fn build_swarm() -> Result<libp2p::Swarm<QlBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+fn build_swarm(
+    kp: libp2p::identity::Keypair,
+    port: u16,
+) -> Result<libp2p::Swarm<QlBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
     // 端口复用策略在 libp2p 0.56 起由连接层自动处理（Config 留默认即可）
     let tcp_cfg = libp2p::tcp::Config::default();
 
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(kp)
         .with_tokio()
         .with_tcp(
             tcp_cfg,
@@ -2042,13 +2606,32 @@ fn build_swarm() -> Result<libp2p::Swarm<QlBehaviour>, Box<dyn std::error::Error
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse::<Multiaddr>()?)?;
+    // 固定端口优先：种子名单要能写死地址，前提是端口不每次换。
+    // 端口被占（同机第二个 GUI 实例）就退回系统分配——这台照样能出块、能连人，
+    // 只是别人拨不到它，日志里会把这件事说明白。
+    let bind = if port > 0 {
+        format!("/ip4/0.0.0.0/tcp/{port}")
+    } else {
+        "/ip4/0.0.0.0/tcp/0".to_string()
+    };
+    match swarm.listen_on(bind.parse::<Multiaddr>()?) {
+        Ok(_) if port > 0 => eprintln!("[QLight] 监听固定端口 tcp/{port}（种子名单可直接拨这个）"),
+        Ok(_) => {}
+        Err(e) if port > 0 => {
+            eprintln!(
+                "[QLight] 固定端口 tcp/{port} 绑不上（{e}）→ 改用系统分配端口：本机功能不受影响，但别人拨不到固定地址"
+            );
+            swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse::<Multiaddr>()?)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(swarm)
 }
 
 /// swarm 主循环：事件 / 指令 / 状态机节拍 三路 select
-async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NetCmd>) {
-    let mut swarm = match build_swarm() {
+async fn run_swarm(app: Sink, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NetCmd>) {
+    let keypair = load_or_create_identity(&net.identity_path);
+    let mut swarm = match build_swarm(keypair.clone(), net.listen_port) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[QLight] 联邦网络不可用：{e} —— 退回单机出块模式（账本与验签不受影响）");
@@ -2065,6 +2648,7 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
         ent: gossipsub::IdentTopic::new(TOPIC_ENT),
         dust: gossipsub::IdentTopic::new(TOPIC_DUST),
         pos: gossipsub::IdentTopic::new(TOPIC_POS),
+        peers: gossipsub::IdentTopic::new(TOPIC_PEERS),
     };
     for t in [
         &topics.reg,
@@ -2074,6 +2658,7 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
         &topics.ent,
         &topics.dust,
         &topics.pos,
+        &topics.peers,
     ] {
         if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(t) {
             eprintln!("[QLight] 订阅失败：{e}");
@@ -2091,7 +2676,11 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
     // 真实建立的连接（邻居计数的唯一事实来源：UI chip 与单机/联邦判定都用它）
     let mut established: HashSet<PeerId> = HashSet::new();
     let mut next_boot = now_ms() + 1500;
+    let mut next_peers = now_ms() + 1500;
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
+    eprintln!("[QLight] 本节点身份（重启不变）：{my_pid}");
+    // 种子名单第一件事就拨：固定端口 + 固定 PeerId，才谈得上"装上就能找到人"
+    net.seed_tick(&mut seen, &mut backoff, &established, &mut swarm, &topics, &chain);
 
     loop {
         tokio::select! {
@@ -2104,20 +2693,30 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
                     SwarmEvent::Behaviour(QlBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(list))) => {
                         net.on_peers_expired(list, &mut seen, &app);
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                         established.insert(peer_id);
-                        // 拨过的地址才进范围名单：没拨过 = 对方连进来，我们看不到它的来源地址
-                        if let Some(s) = net.dial_scope.lock().unwrap().remove(&peer_id.to_string()) {
-                            net.peer_scope.lock().unwrap().insert(peer_id.to_string(), s);
-                        }
+                        // 拨过的地址进范围名单；对方连进来的用它回源地址（send_back_addr）。
+                        // 中继节点大多是被拨的一方，没有这一半，三态统计会挂着一片 unknown。
+                        let peer_addr = match &endpoint {
+                            libp2p::core::ConnectedPoint::Dialer { address, .. } => address.clone(),
+                            libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.clone(),
+                        };
+                        let scope = match net.dial_scope.lock().unwrap().remove(&peer_id.to_string()) {
+                            Some(s) => s,
+                            None => addr_scope(&peer_addr),
+                        };
+                        net.peer_scope.lock().unwrap().insert(peer_id.to_string(), scope);
                         let cnt = established.len();
                         net.peers.store(cnt, Ordering::Relaxed);
                         let _ = app.emit("net_peers", serde_json::json!({ "count": cnt }));
-                        eprintln!("[QLight] 已连接邻居 {peer_id}（联邦 {cnt} 节点，连接数 {num_established}）");
+                        eprintln!("[QLight] 已连接邻居 {peer_id}（{peer_addr}，{scope}；联邦 {cnt} 节点，连接数 {num_established}）");
                     }
                     SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                         if num_established == 0 {
                             established.remove(&peer_id);
+                            // 断开的邻居要能重拨：seen 不清掉，种子/注册表/地址 gossip 三条路
+                            // 都会在这里永久跳过它（常驻中继最怕的就是"断一次就再也不认识"）
+                            seen.remove(&peer_id);
                             net.peer_scope.lock().unwrap().remove(&peer_id.to_string());
                             net.dial_scope.lock().unwrap().remove(&peer_id.to_string());
                             let cnt = established.len();
@@ -2136,19 +2735,43 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
                         }
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, .. } => {
-                        // 拨号失败 → 只退避重试，不动计数（计数以真实连接为准）
+                        // 拨号失败 → 退避后重试，不动计数（计数以真实连接为准）。
+                        // seen 一起清掉，否则退避到期也再也进不了 adopt_peer。
                         if let Some(pid) = peer_id {
                             backoff.insert(pid, now_ms() + BOOT_RETRY_MS);
+                            seen.remove(&pid);
                         }
                     }
-                    SwarmEvent::Behaviour(QlBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
+                    SwarmEvent::Behaviour(QlBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, propagation_source, .. })) => {
+                        // 本节点跑的是 `MessageAuthenticity::Anonymous`，gossipsub 交上来的
+                        // `message.source` 恒为 None（传输层不提供"谁原始发布"）。
+                        // 上一跳 = propagation_source；原始发布者 = 消息里自带签名的那一位。
+                        let from = Some(propagation_source);
                         match serde_json::from_slice::<(u64, NetMsg)>(&message.data) {
-                            Ok((_, m)) => net.on_net_msg(m, message.source, &mut swarm, &mut ms, &topics, &app, &chain),
+                            // 地址自报走连接层的那条路（seen/退避/established 都在循环手里），
+                            // 不进球体的账本消息分发
+                            Ok((_, NetMsg::Peers(wire))) => net.on_peers_advertised(
+                                wire,
+                                from,
+                                my_pid,
+                                &mut seen,
+                                &mut backoff,
+                                &established,
+                                &mut swarm,
+                                &topics,
+                                &chain,
+                            ),
+                            Ok((_, m)) => net.on_net_msg(m, from, &mut swarm, &mut ms, &topics, &app, &chain),
                             Err(e) => eprintln!("[QLight] 丢弃未知网络消息：{e}"),
                         }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        eprintln!("[QLight] 联邦网络监听：{address}（mDNS + 引导注册表已开启）");
+                        eprintln!("[QLight] 联邦网络监听：{address}（mDNS + 引导注册表 + 种子名单已开启）");
+                        // 把"别人该怎么拨到我"这行字符串打在显眼处：填进 seeds.json
+                        // 或 SEEDS_BUILTIN 就是下一台种子节点
+                        if let Some(d) = dialable_from_listen(&address) {
+                            eprintln!("[QLight] 可拨地址：{d}/p2p/{my_pid}");
+                        }
                         my_addrs.push(address.clone());
                         net.write_boot(my_pid, &my_addrs);
                     }
@@ -2175,6 +2798,12 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
                 if now >= next_boot {
                     next_boot = now + BOOT_EVERY_MS;
                     net.boot_tick(my_pid, &my_addrs, &mut seen, &mut backoff, &established, &mut swarm, &topics, &chain);
+                    // 种子节点可能刚重启、刚上线：每轮注册表节拍都重拨一遍（退避期内自动跳过）
+                    net.seed_tick(&mut seen, &mut backoff, &established, &mut swarm, &topics, &chain);
+                }
+                if now >= next_peers {
+                    next_peers = now + PEERS_EVERY_MS;
+                    net.peers_tick(&keypair, my_pid, &my_addrs, &established, &mut swarm, &topics);
                 }
                 net.machine_tick(&mut swarm, &mut ms, &app, &chain, &topics, &mut prev_unlocked);
             }
@@ -2183,7 +2812,7 @@ async fn run_swarm(app: AppHandle, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc:
 }
 
 /// 联邦网络初始化失败时的退路：与 A 档完全一致的单机出块（账本/验签口径不变）
-async fn local_miner(app: AppHandle, chain: Arc<SimChain>, core_slot: Arc<RwLock<Option<Arc<WalletCore>>>>) {
+async fn local_miner(app: Sink, chain: Arc<SimChain>, core_slot: Arc<RwLock<Option<Arc<WalletCore>>>>) {
     let mut next = now_ms() + 1000;
     loop {
         if now_ms() >= next {
@@ -2202,6 +2831,94 @@ async fn local_miner(app: AppHandle, chain: Arc<SimChain>, core_slot: Arc<RwLock
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keypid() -> PeerId {
+        libp2p::identity::Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    /// 自报只认签名：发布者由验签定出来，与"这条从哪个邻居转来"无关（中继的命门）；
+    /// 代报第三方、改过一个字节、过期、太新、自己绕回来的，全都不采信
+    #[test]
+    fn an_advertised_address_belongs_to_whoever_signed_it() {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let pid = kp.public().to_peer_id();
+        let stranger = keypid();
+        let now = 1_700_000_000_000; // 固定时钟：判据是纯函数，别让测试跟着墙钟飘
+        let own = format!("/ip4/127.0.0.1/tcp/47410/p2p/{pid}");
+        let proxy = format!("/ip4/127.0.0.1/tcp/47411/p2p/{stranger}");
+
+        let wire = make_peers_wire(&kp, vec![own.clone(), proxy], now);
+        let (publisher, list) = verify_peers_ad(&wire, stranger, "loopback", now).unwrap();
+        assert_eq!(publisher, pid, "发布者由验签定，不看上一跳");
+        assert_eq!(list.len(), 1, "只该留下发布者自己那条：{list:?}");
+        assert_eq!(list[0].to_string(), "/ip4/127.0.0.1/tcp/47410");
+
+        // 回环地址经公网邻居转来 = 拨的是我自己家里，丢
+        assert!(
+            verify_peers_ad(&wire, stranger, "public", now).is_none(),
+            "跨网段的回环自报不该去拨"
+        );
+
+        // 改地址=改签名消息：只换掉一条地址，签名就对不上（这一条只有签名能挡住）
+        let mut tampered = wire.clone();
+        tampered.addrs[0] = format!("/ip4/198.51.100.7/tcp/47410/p2p/{pid}");
+        assert!(verify_peers_ad(&tampered, stranger, "loopback", now).is_none());
+
+        // 合法签名但一小时前签的（重放攒包）→ 时效闸丢掉
+        let mut stale = wire.clone();
+        stale.ts = now / 1000 - PEERS_MAX_AGE_SECS - 1;
+        stale.sig_hex = hex::encode(kp.sign(&peers_msg_bytes(&stale)).unwrap());
+        assert!(verify_peers_ad(&stale, stranger, "loopback", now).is_none());
+
+        // 自己发的包绕回来自个儿：不必再拨自己
+        assert!(verify_peers_ad(&wire, pid, "loopback", now).is_none());
+
+        // 前缀域隔离：地址自报的签名消息不可能被读成在场或门票
+        assert!(peers_msg_bytes(&wire).starts_with(PEERS_PREFIX));
+        assert!(!peers_msg_bytes(&wire).starts_with(POS_PREFIX));
+    }
+
+    /// 种子地址必须自带身份；拨出去的地址不带 `/p2p`（adopt_peer 负责拼回去）
+    #[test]
+    fn a_seed_needs_an_identity_and_stores_a_dialable_address() {
+        let pid = keypid();
+        let (got, addr) = parse_seed(&format!("/ip4/10.0.0.5/tcp/47410/p2p/{pid}")).unwrap();
+        assert_eq!(got, pid);
+        assert_eq!(addr.to_string(), "/ip4/10.0.0.5/tcp/47410");
+        assert!(parse_seed("/ip4/10.0.0.5/tcp/47410").is_none(), "没有 /p2p 就不知道拨到的是谁");
+        assert!(parse_seed("不是地址").is_none());
+    }
+
+    /// `0.0.0.0` 是通配，不能直接给别人拨；换成回环至少同机邻居能用
+    #[test]
+    fn a_wildcard_listener_becomes_a_dialable_loopback() {
+        let d = dialable_from_listen(&"/ip4/0.0.0.0/tcp/47410".parse().unwrap()).unwrap();
+        assert_eq!(d.to_string(), "/ip4/127.0.0.1/tcp/47410");
+        assert_eq!(addr_scope(&d), "loopback");
+        assert!(dialable_from_listen(&"/ip4/10.1.2.3/tcp/47410".parse().unwrap())
+            .unwrap()
+            .to_string()
+            .starts_with("/ip4/10.1.2.3"), "已经是具体 IP 就别动它");
+    }
+
+    /// `seeds.json` 读的是字符串数组；坏文件只告警，不影响钱包继续跑
+    #[test]
+    fn a_seed_file_adds_addresses_and_a_broken_one_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("qlight-seeds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = keypid();
+        std::fs::write(
+            dir.join("seeds.json"),
+            format!(r#"["/ip4/127.0.0.1/tcp/47410/p2p/{pid}", " ", "/ip4/127.0.0.1/tcp/47411/p2p/{pid}"]"#),
+        )
+        .unwrap();
+        let got = collect_seeds(&dir);
+        assert!(got.iter().any(|s| s.ends_with(&format!("/p2p/{pid}"))), "{got:?}");
+        assert!(!got.iter().any(|s| s.is_empty()), "空串不该进名单");
+        std::fs::write(dir.join("seeds.json"), b"{ not json }").unwrap();
+        let _ = collect_seeds(&dir); // 不该 panic
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const MINE: &str = "b5|QL-ENTREC-v4|QL-DUST-v1";
     const MY: &str = "0.4.1";

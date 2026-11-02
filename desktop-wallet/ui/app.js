@@ -433,7 +433,7 @@ $("btn-guide-hide").addEventListener("click", async () => {
   renderGuide();
 });
 
-// —— 联机三态：前两档能用，公网没实现就说没实现
+// —— 联机三态：前两档开箱能用，公网那一档要自己接一台常驻中继节点
 function renderNetstate() {
   const list = $("netstate-list");
   if (!list) return;
@@ -447,7 +447,8 @@ function renderNetstate() {
   list.innerHTML =
     li(local ? "on" : "off", t("netstate.local"), t("netstate.local.note"), local) +
     li(lan ? "on" : "off", t("netstate.lan"), t("netstate.lan.note"), lan) +
-    li("todo", t("netstate.public"), t("netstate.public.note"), pub);
+    // 拨到了公网邻居就按"已连上"显示；没拨到才是"待办"（软件不自带种子地址）
+    li(pub ? "on" : "todo", t("netstate.public"), t("netstate.public.note"), pub);
   if (!local && !lan && !pub) {
     list.insertAdjacentHTML("afterbegin", `<li class="off"><b>${t("netstate.none")}</b></li>`);
   }

@@ -156,9 +156,10 @@ fn two_machines_mine_and_transfer() {
     chain_a.submit_claim(&a, x, y, layer).expect("矿签入池");
     let (_e, h1, w1, d1) = chain_a.mine_block(&a).expect("A 出块 1");
 
-    // B 补账：整链对账走的就是 apply_remote_block，逐条验签验链，不认快照本身
+    // B 补账：整链对账走的就是 apply_remote_block，逐条验签验链，不认快照本身。
+    // 块 1 在 v6 激活高度（2000）之前：那一代的票既不在块里、也不是判据，传 None 是如实描述。
     chain_b
-        .apply_remote_block(&h1, w1, d1)
+        .apply_remote_block(&h1, w1, d1, None, None)
         .expect("B 应收下 A 的块 1");
     assert_eq!(chain_b.height(), 1);
     assert_eq!(chain_b.tip_hash_hex_pub(), chain_a.tip_hash_hex_pub(), "两机链尖一致");
@@ -194,7 +195,7 @@ fn two_machines_mine_and_transfer() {
     greedy.minted_after += 1_000_000;
     greedy.reward_total += 1_000_000;
     let refused = chain_a
-        .apply_remote_block(&greedy, w2.clone(), vec![])
+        .apply_remote_block(&greedy, w2.clone(), vec![], None, None)
         .err()
         .expect("改过发行的块头不可能过验");
     println!("伪造块被拒的理由：{refused}");
@@ -204,7 +205,7 @@ fn two_machines_mine_and_transfer() {
     );
 
     chain_a
-        .apply_remote_block(&h2, w2, d2)
+        .apply_remote_block(&h2, w2, d2, None, None)
         .expect("A 收下 B 出的块 2");
 
     assert_eq!(chain_a.tip_hash_hex_pub(), chain_b.tip_hash_hex_pub(), "转账后两机同一条链");

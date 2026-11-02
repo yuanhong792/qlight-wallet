@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod feedback;
 pub mod keystore;
 pub mod net;
+pub mod node;
 pub mod prefs;
 pub mod simchain;
 pub mod tx;
@@ -44,7 +45,6 @@ pub fn run() {
             let keystore_path = data_dir.join("keystore.json");
             let ledger_path = data_dir.join("ledger.json");
             let blocks_path = data_dir.join("blocks.jsonl");
-            let entities_path = data_dir.join("entities.jsonl");
             let prefs_path = data_dir.join("prefs.json");
             // 偏好跟着账本走，不跟 webview 存储走：同机多开时 localStorage 是共享的，
             // 而"这个钱包玩过没有"属于某一本账，不属于某个渲染进程。
@@ -52,48 +52,33 @@ pub fn run() {
             if let Some(w) = prefs_warn {
                 eprintln!("[QLight] {w}");
             }
-            let chain =
-                simchain::SimChain::new(ledger_path.clone(), blocks_path.clone());
-
-            // 链被归档重置 = 换了一个世界：同目录下的实体/光尘账本记的是旧链的块高与
-            // 手续费交易，留在新链上会让每一次写入都判定「账本第 1 条起校验失败」。
-            // 与链一样只归档不删除，tag 相同，便于成对找回。
-            if let Some(tag) = chain.take_reset_tag() {
-                for name in ["entities.jsonl", "dust.jsonl"] {
-                    let from = data_dir.join(name);
-                    if !from.exists() {
-                        continue;
-                    }
-                    let to = data_dir.join(format!("{name}.bak-world-{tag}"));
-                    if std::fs::rename(&from, &to).is_ok() {
-                        eprintln!(
-                            "[QLight] 链已重置：旧世界的 {name} 已归档为 {}",
-                            to.display()
-                        );
-                    }
-                }
-            }
+            // 三本账（链 + 世界实体 + 光尘）的打开流程与无头中继共用一处，
+            // 不会出现"钱包跑得好、节点跑不通"的口径分裂
+            let store = node::open_store(&data_dir);
+            let chain = store.chain;
+            let entities = store.entities;
+            let dust = store.dust;
 
             // 解锁核心槽：AppState 与联邦网络共用同一个 Arc（锁定/解锁一处写两侧同步）
             let core_slot: Arc<RwLock<Option<Arc<keystore::WalletCore>>>> =
                 Arc::new(RwLock::new(None));
             // 引导注册表放公共根目录：所有实例（根目录 + node-N）都读写同一份，
             // 互相读到对方的「节点号 + 监听地址」就 TCP 直连（macOS 同机组播不通的替代正路）
-            let entities = Arc::new(world::EntityLedger::new(entities_path));
-            let dust_path = data_dir.join("dust.jsonl");
-            let dust = Arc::new(world::dust::DustLedger::new(dust_path));
-            // v2 出块要向整本实体账本承诺世界（块哈希绑 `entity_root`），
-            // 所以链必须在网络与命令层拿到副本之前就先看到它
-            chain.attach_world(entities.clone());
-            // v5 起出块要把光尘记录带给全网：链必须看得到同一个光尘账本
-            chain.attach_dust(dust.clone());
             let net = net::Net::start(
-                app.handle().clone(),
+                net::NodeOpts {
+                    sink: net::Sink::Gui(app.handle().clone()),
+                    data_dir: data_dir.clone(),
+                    registry_path: base_dir.join("peers-registry.json"),
+                    listen_port: std::env::var("QL_LISTEN_PORT")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u16>().ok())
+                        .unwrap_or(net::DEFAULT_LISTEN_PORT),
+                    announce: net::env_list("QL_ADVERTISE"),
+                },
                 chain.clone(),
                 entities.clone(),
                 dust.clone(),
                 core_slot.clone(),
-                base_dir.join("peers-registry.json"),
             );
 
             app.manage(commands::AppState {

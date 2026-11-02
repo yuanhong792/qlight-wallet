@@ -77,17 +77,36 @@ pub const BLOCK_V_MINER: u8 = 4;
 /// 一本 gossip 账。有了它，池子才能在链上成立——光尘的稀缺性（配额、一格一次）
 /// 第一次变成全网一致的状态，陌生人之间才谈得上兑换。
 pub const BLOCK_V_POOL: u8 = 5;
-pub const BLOCK_V: u8 = BLOCK_V_POOL;
+/// v6 = 出块人门票与块时间戳进裁决（域 `QL-BLOCK-V7`）。
+///
+/// 这一版把两件"只在发送方成立"的事搬到接收方：
+/// ① 块必须带一张**由出块人自己签、绑定(块高,父块)的门票**，且块哈希绑住门票指纹
+///    （`ticket_vrf_hex`）。任何节点拿块里的原件即可独立复验：公钥→地址复算、ML-DSA
+///    验签、`SHAKE(票消息 ‖ 签名)` 与块头逐字相等——不需要注册表、不需要"刚好收到过那张票"。
+/// ② `ts_unix` 从"绑进哈希但没人看"变成**判据**：块内时间必须晚于最近 11 块的中位数、
+///    不得比本机时钟超前过 `MAX_FUTURE_SECS`（口径同比特币 BIP113 + MAX_FUTURE_TIME，
+///    参数按 2 秒节奏收紧）。
+///
+/// 有了②，「胜者超时未出块、别人接手」第一次变成一件**可验**的事：块高一个回合的
+/// 抢跑，只有把时间戳推到父块之后 `MINT_TAKEOVER_SECS` 以外才被接受（见 `check_ticket_census`）。
+pub const BLOCK_V_TICKET: u8 = 6;
+pub const BLOCK_V: u8 = BLOCK_V_TICKET;
 /// v5 激活高度：此高度之后**只认 v5**。现有本地链在 141 左右，
 /// 200 给两台机器留出升级窗口，之后光尘开始逐块进块。
 ///
 /// 没有激活高度，攻击者可以在任意高度造 v0 块，绕过矿签与冷却无条件领
 /// `reward_at(h)`；旧链（v0）在启动校验时会被归档重置。
 pub const BLOCK_V_V5_ACTIVATION: u64 = 200;
+/// v6 激活高度。现有机器已跑到 1300 上下，2000 给两台机器（以及已经打包出去的
+/// 0.5.0）留出升级窗口；到点之后旧版本节点会在这里硬分叉，
+/// 而这条分叉不再静默——`rules_tag()` 随块版本变化，邻居界面直接报「规则分歧」。
+pub const BLOCK_V_V6_ACTIVATION: u64 = 2000;
 
-/// 某个块高允许的最低版本：激活高度之后只认 v5，之前允许历史版本逐级升级。
+/// 某个块高允许的最低版本：激活高度之后只认该代规则，之前允许历史版本逐级升级。
 pub fn version_floor_at(height: u64) -> u8 {
-    if height > BLOCK_V_V5_ACTIVATION {
+    if height > BLOCK_V_V6_ACTIVATION {
+        BLOCK_V_TICKET
+    } else if height > BLOCK_V_V5_ACTIVATION {
         BLOCK_V_POOL
     } else {
         BLOCK_V_LEGACY
@@ -118,6 +137,255 @@ pub const MINE_COOLDOWN_BLOCKS: u64 = 50;
 /// 矿签是一笔**零金额、零手续费**的转账，收款方是这个世界坐标本身——
 /// 它证明"我在这块高挖中了这一格"，奖励归付款人（= 出块者），不需要任何注册表。
 pub const CLAIM_TAG: [u8; 4] = *b"QLOR";
+
+// ---------------------------------------------------------------- 出块门票（v6 起是接收侧判据）
+
+/// 门票分域前缀。原先只在 `net.rs` 里（选举是发送方的事），
+/// v6 起接收方要独立复验它，判据必须和共识住在同一个文件里。
+pub const TICKET_PREFIX: &[u8] = b"QL-TICKET-V1";
+
+/// 门票签名消息 = 前缀 ‖ height(8B BE) ‖ prev_hash（收发双方同构重建）
+pub fn ticket_msg_bytes(height: u64, prev_hash_hex: &str) -> Vec<u8> {
+    let mut m = Vec::with_capacity(12 + prev_hash_hex.len());
+    m.extend_from_slice(TICKET_PREFIX);
+    m.extend_from_slice(&height.to_be_bytes());
+    m.extend_from_slice(prev_hash_hex.as_bytes());
+    m
+}
+
+/// 门票 vrf' = SHAKE-256(prefix ‖ 票消息 ‖ sig)（签名唯一 → vrf' 唯一）
+pub fn ticket_vrf(msg: &[u8], sig: &[u8]) -> Vec<u8> {
+    let mut all = Vec::with_capacity(msg.len() + sig.len());
+    all.extend_from_slice(msg);
+    all.extend_from_slice(sig);
+    crypto::shake256(TICKET_PREFIX, &all, 32)
+}
+
+/// 门票原件：公钥 + 地址盐 + 对「本块高 ‖ 本父块」的签名。
+///
+/// 三件都要随块存放，少一件这张票就没人能独立复验：
+/// 公钥证明是谁签的，地址盐把公钥钉到块头那个 `miner` 上（地址 = `SHAKE(pk ‖ salt)`），
+/// 签名把这个人钉到**这一个高度、这一条父链**上。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketProof {
+    pub pk_hex: String,
+    pub salt_hex: String,
+    pub sig_hex: String,
+}
+
+/// 本机钱包签一张 `height` 高度的出块门票（父块 = `prev_hash_hex`）。
+///
+/// 由**发起这一轮选举的那个节点**调用一次、广播出去，胜者出块时把同一张原件放进块里。
+/// 不在出块时现签：ML-DSA 是否确定性签名不由我们保证，两次签出的 sig 不同就会得到
+/// 两个 vrf'，邻居手里那张票就跟块上这张对不上了。
+pub fn make_ticket_proof(
+    core: &crate::keystore::WalletCore,
+    height: u64,
+    prev_hash_hex: &str,
+) -> TicketProof {
+    let msg = ticket_msg_bytes(height, prev_hash_hex);
+    let sig = crypto::sign(&core.signing_key, &msg);
+    TicketProof {
+        pk_hex: hex::encode(&core.pk_bytes),
+        salt_hex: hex::encode(core.addr_salt),
+        sig_hex: hex::encode(&sig),
+    }
+}
+
+/// 门票指纹（64 个 hex）：块头 `ticket_vrf_hex` 就是它。
+pub fn ticket_vrf_hex(proof: &TicketProof, height: u64, prev_hash_hex: &str) -> String {
+    let Ok(sig) = hex::decode(&proof.sig_hex) else {
+        return String::new();
+    };
+    hex::encode(ticket_vrf(&ticket_msg_bytes(height, prev_hash_hex), &sig))
+}
+
+/// 独立复验一张出块门票。三步缺一即整块作废（判据全在 `check_ticket_binding`）。
+pub fn verify_ticket_proof(header: &BlockHeader, proof: &TicketProof) -> Result<(), String> {
+    check_ticket_binding(
+        header.height,
+        &header.prev_hash_hex,
+        &header.miner,
+        &header.ticket_vrf_hex,
+        proof,
+    )
+}
+
+/// 门票与"它声称的那一个块"是否互相对应。三步：
+/// ① 由 `pk ‖ salt` 复算的地址必须就是块头声明的出块人；
+/// ② ML-DSA 验签，消息必须是「本块高 ‖ 本父块」——一张票只开一个高度的一条链；
+/// ③ `SHAKE(票消息 ‖ 签名)` 必须与块哈希绑住的指纹逐字相等——
+///    块不能事后领一张好票，也不能把票挪到另一个块上。
+///
+/// 单独拆出来是因为出块方也要用它：块还没算出来之前就该知道自己这张票行不行，
+/// 而不是把一块连本机判据都过不了的块写进账本再回滚。
+pub fn check_ticket_binding(
+    height: u64,
+    prev_hash_hex: &str,
+    miner: &str,
+    ticket_vrf_hex: &str,
+    proof: &TicketProof,
+) -> Result<(), String> {
+    if miner.is_empty() {
+        return Err("块头缺 miner，门票无从对照".into());
+    }
+    let pk_raw = hex::decode(&proof.pk_hex).map_err(|_| "门票公钥不是合法 hex".to_string())?;
+    let salt_raw = hex::decode(&proof.salt_hex).map_err(|_| "门票地址盐不是合法 hex".to_string())?;
+    if salt_raw.len() != 8 {
+        return Err(format!("门票地址盐长度 {} ≠ 8 字节", salt_raw.len()));
+    }
+    let mut salt = [0u8; 8];
+    salt.copy_from_slice(&salt_raw);
+    let Some(vk) = crypto::decode_pk(&pk_raw) else {
+        return Err("门票公钥解不开（须 1952 字节 ML-DSA-65 公钥）".into());
+    };
+    // ① 公钥＋盐 → 地址，必须与块哈希里的 miner 同一个人
+    if crypto::derive_address(&vk, &salt) != miner {
+        return Err("门票公钥与出块人地址不是同一个人".into());
+    }
+    // ② 签名必须真的落在这一个(块高, 父块)上
+    let sig = hex::decode(&proof.sig_hex).map_err(|_| "门票签名不是合法 hex".to_string())?;
+    let msg = ticket_msg_bytes(height, prev_hash_hex);
+    if !crypto::verify(&vk, &msg, &sig) {
+        return Err("门票验签失败（换块高或换父块都算废票）".into());
+    }
+    // ③ 块哈希绑住的指纹必须是这张票本身
+    if hex::encode(ticket_vrf(&msg, &sig)) != ticket_vrf_hex {
+        return Err("块头声明的门票指纹与票原件不符".into());
+    }
+    Ok(())
+}
+
+/// 本机对这一轮选举的认知：我见过的**最低票**（并列比地址，与发送方同一裁决口径）。
+#[derive(Debug, Clone)]
+pub struct RoundWinner {
+    pub vrf_hex: String,
+    pub addr: String,
+}
+
+/// 开票：门票指纹最小者胜，并列比地址。
+///
+/// 出块方（net 的开票窗口）与接收方（`check_ticket_census` 里"本机见过的最低票"）
+/// 共用这一处口径——两边算出不同的胜者，就等于两台诚实机器互相拒收。
+/// 入参是 `(vrf_hex, address)`，两者都是小写 hex / bech32，逐字比即逐字节比。
+pub fn elect_winner<'a>(
+    tickets: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<(&'a str, &'a str)> {
+    tickets
+        .into_iter()
+        .min_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)))
+}
+
+/// 接收侧的门票裁决。
+///
+/// v6 之前这块只有一句"票不在块里、也不在任何判据里"——谁把块推过来都收。
+/// 现在：票必须是真票（`verify_ticket_proof`），而且**只要本机在这一轮见过更低的真票**，
+/// 这个块就是抢块。唯一的放行口是胜者沉默：块内时间比父块晚过 `MINT_TAKEOVER_SECS`
+/// 才允许别人接手——这条口子恰好只有"时间戳是判据"之后才站得住（②），两件事是一对。
+pub fn check_ticket_census(
+    header: &BlockHeader,
+    proof: Option<&TicketProof>,
+    parent_ts: Option<u64>,
+    winner: Option<&RoundWinner>,
+) -> Result<(), String> {
+    if header.version < BLOCK_V_TICKET {
+        return Ok(());
+    }
+    if header.ticket_vrf_hex.len() != 64 {
+        return Err("v6 块没有声明出块门票 → 整块拒绝".into());
+    }
+    let Some(p) = proof else {
+        return Err("v6 块缺门票原件 → 无从复验，整块拒绝".into());
+    };
+    verify_ticket_proof(header, p)?;
+    let Some(w) = winner else {
+        // 本机这一轮没收到任何票（刚上线/漏了 gossip）：票是真的，但"谁该出块"无从判断。
+        // 收下，并把这件事记在拒收口径之外——它不是"验过了"，是"没法验"。
+        return Ok(());
+    };
+    if w.vrf_hex.as_str() <= header.ticket_vrf_hex.as_str() {
+        let stale = parent_ts.is_some_and(|pts| header.ts_unix < pts.saturating_add(MINT_TAKEOVER_SECS));
+        if w.addr != header.miner && stale {
+            return Err(format!(
+                "抢块：本轮胜者是 {}（门票 {}…），这块的门票 {}… 更大，且父块之后不到 {MINT_TAKEOVER_SECS}s → 整块拒绝",
+                short_addr_pub(&w.addr),
+                &w.vrf_hex[..8],
+                &header.ticket_vrf_hex[..8]
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn short_addr_pub(addr: &str) -> String {
+    if addr.len() > 16 {
+        format!("{}…{}", &addr[..8], &addr[addr.len() - 6..])
+    } else {
+        addr.to_string()
+    }
+}
+
+// ---------------------------------------------------------------- 块时间戳判据（v6 起）
+
+/// 中位数时间窗口：最近 N 块（同比特币的 median-11）。
+pub const TS_MEDIAN_WINDOW: usize = 11;
+/// 块内时间允许超前本机时钟的上限。比特币是 2 小时，这里按 2 秒一块的节奏收到 2 分钟：
+/// 它同时是"单个出块人最多能把链上时间往前推多远"的上限。
+pub const MAX_FUTURE_SECS: u64 = 120;
+/// 胜者沉默多久算超时、别人可以接手（块）。必须大于一个正常回合
+/// （`BEAT_MS` 起票 + `WINDOW_MS` 开票 + 出块 ≈ 4s），又远小于本机时钟可能的误差。
+pub const MINT_TAKEOVER_SECS: u64 = 6;
+
+/// 最近若干块时间戳的中位数（窗口从旧到新；空窗口 None）。
+pub fn median_ts(window: &[u64]) -> Option<u64> {
+    if window.is_empty() {
+        return None;
+    }
+    let mut v = window.to_vec();
+    v.sort_unstable();
+    Some(v[v.len() / 2])
+}
+
+/// v6 起 `ts_unix` 是判据（此前它只被块哈希绑住、没人看过一眼）：
+/// ① 必须晚于最近 11 块的中位数时间——单个节点改不动"链上现在几点"，
+///    把时间往回拨以重置接管计时、或往回造时间锁定条件，都过不了这一关；
+/// ② 不得超前本机时钟 `MAX_FUTURE_SECS`——把链上时间往前灌的上限就在这里。
+/// 旧版本块按旧口径原样重放（不追溯），所以历史链不会因这两条被推翻。
+pub fn check_block_time(ver: u8, ts: u64, window: &[u64], now: u64) -> Result<(), String> {
+    if ver < BLOCK_V_TICKET {
+        return Ok(());
+    }
+    if let Some(med) = median_ts(window) {
+        if ts <= med {
+            return Err(format!(
+                "块时间戳 {ts} 没有晚于最近 {} 块的中位数时间 {med} → 整块拒绝（时间回溯/重置接管计时）",
+                window.len()
+            ));
+        }
+    }
+    if ts > now.saturating_add(MAX_FUTURE_SECS) {
+        return Err(format!(
+            "块时间戳比本机时钟超前 {}s > 上限 {MAX_FUTURE_SECS}s → 整块拒绝（有人想灌链上时间）",
+            ts - now
+        ));
+    }
+    Ok(())
+}
+
+/// 出块人自己该用的时间戳：本机时钟与"链上中位数 + 1"取大者（比特币节点同样会把
+/// 出块时间向前夹，而不是拿本机时钟去跟别人的时钟争）。
+pub fn clamp_block_ts(window: &[u64], now: u64) -> u64 {
+    median_ts(window).map(|m| m.saturating_add(1)).unwrap_or(now).max(now)
+}
+
+/// 块入账后推进时间窗口（三个入账口共用：本地出块 / 联邦块 / 快照重放）。
+fn push_block_time(l: &mut Ledger, ts: u64) {
+    l.ts_recent.push(ts);
+    if l.ts_recent.len() > TS_MEDIAN_WINDOW {
+        l.ts_recent.remove(0);
+    }
+    l.parent_ts = Some(ts);
+}
 
 // ---------------------------------------------------------------- 创世块（方案 A，借鉴 BTC）
 //
@@ -178,6 +446,8 @@ pub fn genesis_header() -> BlockHeader {
         entity_count: 0,
         dust_root_hex: String::new(),
         dust_count: 0,
+        // 创世块没有出块人，也就没有门票可声明（v6 判据从激活高度起才对块生效）
+        ticket_vrf_hex: String::new(),
         txs: vec![TxAttestation {
             digest_hex: hex::encode(genesis_manifesto_digest()),
             from: String::new(),
@@ -256,6 +526,14 @@ pub struct Ledger {
     /// 不进 ledger.json：它可以从 blocks.jsonl 逐行重建，存两份只会漂移。
     #[serde(skip)]
     pub vrfs: Vec<String>,
+    /// 最近 `TS_MEDIAN_WINDOW` 个已应用块的时间戳（旧→新）。
+    /// 与 `vrfs` 同一口径：块文件里逐行可数，绝不另存一份可能过期的副本。
+    /// v6 起它是**判据**（中位数时间），不再只是一个展示字段。
+    #[serde(skip)]
+    pub ts_recent: Vec<u64>,
+    /// 链尖那一块的时间戳（None = 只有创世）。接管计时（胜者沉默多久算超时）从它起算。
+    #[serde(skip)]
+    pub parent_ts: Option<u64>,
     /// 每个地址已经落下的矿格数（v3 的节奏阶梯就看这个数）。
     /// 与 `vrfs` 同一口径：块文件里逐笔可数，绝不另存一份可能过期的副本。
     #[serde(skip)]
@@ -281,6 +559,8 @@ impl Default for Ledger {
             dust_tips: BTreeMap::new(),
             pools: BTreeMap::new(),
             vrfs: vec![],
+            ts_recent: vec![],
+            parent_ts: None,
             claims_by: BTreeMap::new(),
         }
     }
@@ -318,6 +598,13 @@ pub struct BlockHeader {
     /// v5 起：块内光尘记录条数（展示与对账用，根里已经覆盖）
     #[serde(default)]
     pub dust_count: u64,
+    /// v6 起：出块门票的指纹 = `SHAKE("QL-TICKET-V1" ‖ 票消息 ‖ 签名)`。
+    ///
+    /// 它进块哈希，所以"这个块是用哪张票出的"从此改不了：换票、把票挪到别的块、
+    /// 事后补领一张好票，都会让哈希对不上。票的**原件**在块行里（`BlockLine::ticket`），
+    /// 由这三十六字节的指纹锚住。旧行缺省按空串读（v5 及以前没有这个字段）。
+    #[serde(default)]
+    pub ticket_vrf_hex: String,
     pub txs: Vec<TxAttestation>,
 }
 
@@ -359,6 +646,13 @@ pub struct BlockLine {
     /// v5 起：本块收录的光尘记录原件（逐条可独立验签验链，块不要求任何人信任）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dusts: Vec<crate::world::dust::DustRecord>,
+    /// v6 起：出块门票**原件**（公钥 ‖ 地址盐 ‖ 签名）。
+    ///
+    /// 和交易原件同一个道理：块头那句"我是本轮胜者"只是声称，只有拿到签名原件，
+    /// 任何第三方才能独立复算地址、验签、并把指纹对回块哈希。它不参与块哈希
+    /// （参与的是 `ticket_vrf_hex`），所以和 `wires` 一样是"随块存放的凭证"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<TicketProof>,
 }
 
 impl BlockWire {
@@ -636,7 +930,47 @@ pub fn block_hash_of_dust(
     h
 }
 
+/// v6 的块哈希：在 v5 的预镜像上再绑**出块门票指纹**，域 `QL-BLOCK-V7`。
+///
+/// 为什么门票必须进块哈希：不进，则"这个块是用哪张票出的"只是一个可以事后改写的
+/// 说法——先出一个没票的块，被邻居质疑时再补一张胜者票上去，块哈希却纹丝不动。
+/// 绑进来之后，一块一票、一票一(块高,父块)，改票即改块哈希，抢块只能靠明着拒收发现。
+pub fn block_hash_of_ticket(
+    prev_hash_hex: &str,
+    height: u64,
+    ts_unix: u64,
+    minted_after: u64,
+    vrf: &[u8],
+    root: &[u8; 32],
+    entity_root: &[u8; 32],
+    entity_count: u64,
+    miner: &str,
+    dust_root: &[u8; 32],
+    dust_count: u64,
+    ticket_vrf: &[u8; 32],
+) -> [u8; 32] {
+    let mut block_in: Vec<u8> = Vec::with_capacity(229 + miner.len());
+    block_in.push(BLOCK_V_TICKET);
+    block_in.extend_from_slice(prev_hash_hex.as_bytes());
+    block_in.extend_from_slice(&height.to_be_bytes());
+    block_in.extend_from_slice(&ts_unix.to_be_bytes());
+    block_in.extend_from_slice(&minted_after.to_be_bytes());
+    block_in.extend_from_slice(vrf);
+    block_in.extend_from_slice(root);
+    block_in.extend_from_slice(entity_root);
+    block_in.extend_from_slice(&entity_count.to_be_bytes());
+    block_in.extend_from_slice(miner.as_bytes());
+    block_in.extend_from_slice(dust_root);
+    block_in.extend_from_slice(&dust_count.to_be_bytes());
+    block_in.extend_from_slice(ticket_vrf);
+    let out = crypto::shake256(b"QL-BLOCK-V7", &block_in, 32);
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&out);
+    h
+}
+
 /// 块内光尘记录的集合指纹：与顺序无关（升序哈希后取 SHAKE-256）。
+///
 /// 空集合返回全零，和 `tx_root_of` 的空块口径一致。
 pub fn dust_root_of(records: &[crate::world::dust::DustRecord]) -> [u8; 32] {
     if records.is_empty() {
@@ -690,6 +1024,27 @@ pub fn block_hash_of_header(
         }
         let mut dr = [0u8; 32];
         dr.copy_from_slice(&dr_raw);
+        if bh.version >= BLOCK_V_TICKET {
+            // v6 起门票指纹也是块哈希的一部分：空串（没声明门票）在此就解不开，形同作废
+            let mut tv = [0u8; 32];
+            if bh.ticket_vrf_hex.len() != 64 || hex::decode_to_slice(&bh.ticket_vrf_hex, &mut tv).is_err() {
+                return None;
+            }
+            return Some(block_hash_of_ticket(
+                &bh.prev_hash_hex,
+                bh.height,
+                bh.ts_unix,
+                bh.minted_after,
+                vrf,
+                root,
+                &er,
+                bh.entity_count,
+                &bh.miner,
+                &dr,
+                bh.dust_count,
+                &tv,
+            ));
+        }
         return Some(block_hash_of_dust(
             &bh.prev_hash_hex,
             bh.height,
@@ -983,16 +1338,26 @@ impl SimChain {
         let mut last_v0 = 0u64;
         let mut last_version = BLOCK_V_LEGACY;
         let mut claims_by: BTreeMap<String, u64> = BTreeMap::new();
+        // 链尖时间戳 + 最近 11 块的中位数窗口：v6 起"链上现在几点"是判据，
+        // 必须和 vrfs 一样从块文件逐行重建，而不是信 ledger.json 里的副本。
+        let mut parent_ts: Option<u64> = None;
+        let mut ts_recent: Vec<u64> = Vec::new();
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let Ok(bl) = serde_json::from_str::<BlockLine>(line) else { continue };
             if bl.header.height == 0 {
+                parent_ts = Some(bl.header.ts_unix);
                 continue;
             }
             vrfs.push(bl.header.vrf_hex.clone());
             last_version = bl.header.version;
+            parent_ts = Some(bl.header.ts_unix);
+            ts_recent.push(bl.header.ts_unix);
+            if ts_recent.len() > TS_MEDIAN_WINDOW {
+                ts_recent.remove(0);
+            }
             if bl.header.version == BLOCK_V_LEGACY {
                 last_v0 = bl.header.height;
             }
@@ -1008,6 +1373,8 @@ impl SimChain {
         }
         let mut l = self.ledger.lock().unwrap();
         l.vrfs = vrfs;
+        l.ts_recent = ts_recent;
+        l.parent_ts = parent_ts;
         // v0 每块都发过：水位至少跟到最后一条 v0 块，避免升级后重复补发。
         l.last_claim_height = last_claim.max(last_v0);
         l.last_block_version = last_version;
@@ -1362,7 +1729,7 @@ impl SimChain {
     }
 
     /// 出块（由 net 网络循环每 2s 调用）：池内逐笔真验签 → 状态转移 → 块哈希绑定交易 → 原子持久化。
-    /// 返回 (块事件, 块头, 块内交易原件) —— 块头+交易原件供联邦网络广播给对端复验。
+    /// 返回 (块事件, 块头, 块内交易原件, 块内光尘原件) —— 块头+原件供联邦网络广播给对端复验。
     ///
     /// v1 规则：**只有收下了一张本机矿签，这个块才发行**；否则块照出、手续费照收，
     /// 但 `reward_total` 里没有任何新币。币因此不是计时器印的，是世界里多了一格
@@ -1371,17 +1738,67 @@ impl SimChain {
         &self,
         core: &crate::keystore::WalletCore,
     ) -> Option<(BlockEvent, BlockHeader, Vec<BlockWire>, Vec<crate::world::dust::DustRecord>)> {
+        // 没有现成的票就自己签一张（单机直出与测试入口走这条）。
+        // 联邦模式不走这里：那一轮的票在开票前就广播出去了，块里必须是**那一张**，
+        // 否则邻居手里握着的 vrf' 和块上声明的对不上，胜者反被当成抢块。
+        let prev = self.ledger.lock().unwrap().prev_hash_hex.clone();
+        let height = self.ledger.lock().unwrap().height + 1;
+        let ticket = make_ticket_proof(core, height, &prev);
+        self.mine_block_with_ticket(core, &ticket, now_unix())
+    }
+
+    /// 出块，并指定这一轮广播过的那张门票（`ticket` 必须是本节点在选举时发出的原件）。
+    /// `now` 注入而非内部取时：时间戳从 v6 起是判据，判据就得可彩排。
+    pub fn mine_block_with_ticket(
+        &self,
+        core: &crate::keystore::WalletCore,
+        ticket: &TicketProof,
+        now: u64,
+    ) -> Option<(BlockEvent, BlockHeader, Vec<BlockWire>, Vec<crate::world::dust::DustRecord>)> {
         if *self.corrupted.lock().unwrap() {
             return None;
         }
         let mut ledger = self.ledger.lock().unwrap();
         let height_next = ledger.height + 1;
         let prev_hash_before = ledger.prev_hash_hex.clone();
-        // 分叉窗口：激活高度之前照旧出 v4（还没升级的机器也认），之后只出 v5
-        let version = if height_next > BLOCK_V_V5_ACTIVATION {
+        // 分叉窗口：激活高度之前照旧出上一代块（还没升级的机器也认），之后只出新版本
+        let version = if height_next > BLOCK_V_V6_ACTIVATION {
+            BLOCK_V_TICKET
+        } else if height_next > BLOCK_V_V5_ACTIVATION {
             BLOCK_V_POOL
         } else {
             BLOCK_V_MINER
+        };
+        // v6 起块内时间是判据：向前夹到"链上中位数 + 1"之上（绝不拿本机时钟去争），
+        // 并且当场自检，绝不做出一块自己这关都过不了的块。
+        //
+        // 自检用的"现在"取 `本机时钟` 与 `链上中位数` 的大者：一台时钟慢了 3 分钟的
+        // 诚实机器，夹完时间戳落在链上时间里（邻居都认），拿它自己的时钟当参照反而
+        // 会把它判成"超前太多"而永远出不了块——那是把慢钟当成罪，不叫判据。
+        let ts = if version >= BLOCK_V_TICKET {
+            let ts = clamp_block_ts(&ledger.ts_recent, now);
+            let med = median_ts(&ledger.ts_recent).unwrap_or(now);
+            if let Err(e) = check_block_time(version, ts, &ledger.ts_recent, now.max(med)) {
+                eprintln!("[QLight] 暂缓出块：{e}");
+                return None;
+            }
+            ts
+        } else {
+            now
+        };
+        // v6 起块必须带一张绑死(块高,父块,出块人)的门票。出块前先自验：
+        // 一张连本机判据都过不了的票，不该写进账本、更不该广播出去。
+        let ticket_fpr = if version >= BLOCK_V_TICKET {
+            let fpr = ticket_vrf_hex(ticket, height_next, &prev_hash_before);
+            if let Err(e) =
+                check_ticket_binding(height_next, &prev_hash_before, &core.address, &fpr, ticket)
+            {
+                eprintln!("[QLight] 暂缓出块：本轮门票不合格 → {e}");
+                return None;
+            }
+            fpr
+        } else {
+            String::new()
         };
 
         // —— VRF 存活心跳（轻节点证明；输入绑定钱包种子/高度/前块哈希）——
@@ -1438,7 +1855,6 @@ impl SimChain {
         let mut digests: Vec<[u8; 32]> = Vec::with_capacity(taken.len() + 1);
         let mut wires: Vec<BlockWire> = Vec::with_capacity(taken.len() + 1);
         let mut fee_pool: u64 = 0;
-        let ts = now_unix();
         let miner = core.address.clone();
 
         // 矿签先执行：同一地址的普通交易 nonce 紧随其后
@@ -1520,7 +1936,28 @@ impl SimChain {
         };
         let dust_root = dust_root_of(&dusts);
         let dust_count = dusts.len() as u64;
-        let block_hash = if version >= BLOCK_V_POOL {
+        let block_hash = if version >= BLOCK_V_TICKET {
+            let mut tv = [0u8; 32];
+            if let Ok(b) = hex::decode(&ticket_fpr) {
+                if b.len() == 32 {
+                    tv.copy_from_slice(&b);
+                }
+            }
+            block_hash_of_ticket(
+                &prev_hash_before,
+                height_next,
+                ts,
+                ledger.total_minted,
+                &vrf,
+                &root,
+                &entity_root,
+                entity_count,
+                &miner,
+                &dust_root,
+                dust_count,
+                &tv,
+            )
+        } else if version >= BLOCK_V_POOL {
             block_hash_of_dust(
                 &prev_hash_before,
                 height_next,
@@ -1552,6 +1989,7 @@ impl SimChain {
         ledger.prev_hash_hex = hex::encode(&block_hash);
         ledger.last_block_version = version;
         ledger.entity_count_committed = entity_count;
+        push_block_time(&mut ledger, ts);
 
         // —— 原子持久化 + 追加可审计块头 ——
         if let Ok(bytes) = serde_json::to_vec(&*ledger) {
@@ -1575,10 +2013,12 @@ impl SimChain {
                 String::new()
             },
             dust_count,
+            ticket_vrf_hex: ticket_fpr,
             txs: included,
         };
         drop(ledger);
-        append_block_line(&self.blocks_path, &header, &wires, &dusts);
+        let proof = (version >= BLOCK_V_TICKET).then(|| TicketProof::clone(ticket));
+        append_block_line(&self.blocks_path, &header, &wires, &dusts, proof);
 
         let balance = self.balance_of(&miner);
         Some((
@@ -1889,6 +2329,9 @@ impl SimChain {
         let mut prev_entity_count: u64 = 0;
         // 每个地址已经落下的矿格数：v3 的节奏阶梯只读这个纯块头可复算的量
         let mut claims_by: BTreeMap<String, u64> = BTreeMap::new();
+        // 最近若干块的时间戳：v6 起中位数时间是判据，重放时必须逐块跟着走
+        let mut ts_window: Vec<u64> = Vec::new();
+        let now = now_unix();
         for bh in headers {
             // 创世行只做锚定：与源码常量逐字相等；它没有出块者，也没有排放
             if bh.height == 0 {
@@ -1922,6 +2365,16 @@ impl SimChain {
             }
             if bh.prev_hash_hex != expect_prev {
                 return false;
+            }
+            // v6 起块头要声明门票，且块内时间要过中位数/未来上限这两关
+            // （门票的签名原件不在块头里，那是块行的活：见 `apply_block_line`）
+            if bh.version >= BLOCK_V_TICKET {
+                if bh.ticket_vrf_hex.len() != 64 {
+                    return false;
+                }
+                if check_block_time(bh.version, bh.ts_unix, &ts_window, now).is_err() {
+                    return false;
+                }
             }
             let mut digests = Vec::with_capacity(bh.txs.len());
             for t in &bh.txs {
@@ -1971,6 +2424,10 @@ impl SimChain {
                 next_claim
             };
             prev_version = bh.version;
+            ts_window.push(bh.ts_unix);
+            if ts_window.len() > TS_MEDIAN_WINDOW {
+                ts_window.remove(0);
+            }
             expect_prev = bh.block_hash_hex.clone();
         }
         true
@@ -2066,6 +2523,14 @@ impl SimChain {
             }
             l.entity_count_committed = h.entity_count;
         }
+        // v6 起，追账快照里的每一块同样要过门票与时间这两道关。
+        // 选举本身在离线重放时无从判断（那需要"当时收到的票"），能判断的是：
+        // 这个块确实是被**出块人自己的钥匙**签名、且绑死在这一个(块高,父块)上的门票开出来的。
+        check_ticket_census(h, bl.ticket.as_ref(), l.parent_ts, None)
+            .map_err(|e| format!("块 #{} 门票不过 → 快照拒收：{e}", h.height))?;
+        check_block_time(h.version, h.ts_unix, &l.ts_recent, now_unix())
+            .map_err(|e| format!("块 #{} 时间不过 → 快照拒收：{e}", h.height))?;
+
         if bl.wires.len() != h.txs.len() {
             return Err(format!(
                 "块 #{} 交易原件不全（凭据 {} 笔，原件 {} 笔）→ 无从验签，快照拒收",
@@ -2124,6 +2589,7 @@ impl SimChain {
         l.height = h.height;
         l.prev_hash_hex = h.block_hash_hex.clone();
         l.last_block_version = h.version;
+        push_block_time(l, h.ts_unix);
         Ok(())
     }
 
@@ -2222,13 +2688,19 @@ impl SimChain {
         Ok(digest)
     }
 
-    /// 接受联邦对端出的块：整块真验（逐笔**原件**重验签重放 + tx_root/块哈希重算 + 排放口径），
-    /// staging 全过且与块头完全一致才一次成型入账（失败不落任何状态）。
+    /// 接受联邦对端出的块：整块真验（逐笔**原件**重验签重放 + tx_root/块哈希重算 + 排放口径
+    /// + **出块门票**与**块内时间**判据），staging 全过且与块头完全一致才一次成型入账（失败不落任何状态）。
+    ///
+    /// `ticket` 是块带的门票原件，`winner` 是本机对**这一轮选举**的认知
+    /// （net 层从收到的票里算出的最低票）。两者都可能为空：没票 = 无从复验；
+    /// 没胜者 = 本机这一轮没收到任何票，那只能验"票是真的"，验不了"轮到你"。
     pub fn apply_remote_block(
         &self,
         header: &BlockHeader,
         wires: Vec<BlockWire>,
         dusts: Vec<crate::world::dust::DustRecord>,
+        ticket: Option<TicketProof>,
+        winner: Option<RoundWinner>,
     ) -> Result<BlockEvent, String> {
         if *self.corrupted.lock().unwrap() {
             return Err("账本完整性校验未通过，拒绝外部块".into());
@@ -2270,6 +2742,13 @@ impl SimChain {
                 ));
             }
         }
+
+        // —— v6 起新增的两道接收侧判据（在此之前它们只存在于发送方，块一旦离开发送方就没人看）——
+        // ① 门票：这张票必须真、必须绑本块高与本父块、必须就是出块人自己的钥匙签的；
+        //    并且只要本机在这一轮见过更低的真票，这个块就是抢块（胜者沉默超时才放行）。
+        check_ticket_census(header, ticket.as_ref(), ledger.parent_ts, winner.as_ref())?;
+        // ② 时间：块内时间必须晚于最近 11 块的中位数，且不得超前本机时钟上限。
+        check_block_time(header.version, header.ts_unix, &ledger.ts_recent, now_unix())?;
 
         // —— staging 复本上逐笔重验+重放（任何一笔不过 → 整块拒绝）——
         // 与本地出块共用 `apply_wire`：矿签的坐标、冷却、出块者身份都在同一处判。
@@ -2391,13 +2870,14 @@ impl SimChain {
         if header.version >= BLOCK_V_WORLD {
             staged.entity_count_committed = header.entity_count;
         }
+        push_block_time(&mut staged, header.ts_unix);
         *ledger = staged;
 
         if let Ok(bytes) = serde_json::to_vec(&*ledger) {
             atomic_write(&self.ledger_path, &bytes);
         }
         drop(ledger);
-        append_block_line(&self.blocks_path, header, &wires, &dusts);
+        append_block_line(&self.blocks_path, header, &wires, &dusts, ticket);
 
         // 已入账的 from 地址，其池内挂着的后续交易 nonce 已可能过期——先撤下等重发
         let mut froms: Vec<String> = header.txs.iter().map(|t| t.from.clone()).collect();
@@ -2467,6 +2947,8 @@ impl SimChain {
             dust_tips: BTreeMap::new(),
             pools: BTreeMap::new(),
             vrfs: vec![],
+            ts_recent: vec![],
+            parent_ts: None,
             claims_by: BTreeMap::new(),
         };
         for bl in &block_lines {
@@ -2691,12 +3173,14 @@ fn append_block_line(
     h: &BlockHeader,
     wires: &[BlockWire],
     dusts: &[crate::world::dust::DustRecord],
+    ticket: Option<TicketProof>,
 ) {
     use std::io::Write;
     let line = BlockLine {
         header: h.clone(),
         wires: wires.to_vec(),
         dusts: dusts.to_vec(),
+        ticket,
     };
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -2832,6 +3316,7 @@ mod tests {
             entity_count: 0,
             dust_root_hex: String::new(),
             dust_count: 0,
+            ticket_vrf_hex: String::new(),
             txs: vec![],
         };
         one.block_hash_hex = hex::encode(block_hash_of(
@@ -3085,6 +3570,7 @@ mod tests {
             entity_count: 0,
             dust_root_hex: String::new(),
             dust_count: 0,
+            ticket_vrf_hex: String::new(),
             txs: vec![],
         }
     }
@@ -3116,6 +3602,7 @@ mod tests {
             entity_count: 0,
             dust_root_hex: String::new(),
             dust_count: 0,
+            ticket_vrf_hex: String::new(),
             txs: vec![],
         };
         let mut v0 = v0;
@@ -3132,7 +3619,18 @@ mod tests {
         );
 
         assert_eq!(version_floor_at(BLOCK_V_V5_ACTIVATION), BLOCK_V_LEGACY);
-        assert_eq!(version_floor_at(BLOCK_V_V5_ACTIVATION + 1), BLOCK_V);
+        assert_eq!(version_floor_at(BLOCK_V_V5_ACTIVATION + 1), BLOCK_V_POOL);
+        // v6 同理：激活高度之前仍是上一代，过了才必须带门票
+        assert_eq!(version_floor_at(BLOCK_V_V6_ACTIVATION), BLOCK_V_POOL);
+        assert_eq!(version_floor_at(BLOCK_V_V6_ACTIVATION + 1), BLOCK_V_TICKET);
+
+        // 块版本必须进规则指纹：联邦告警（§9.18）靠这个字段认出"没升级的邻居"，
+        // 指纹一样就静默分叉了。
+        assert!(
+            rules_tag().starts_with(&format!("b{BLOCK_V_TICKET}|")),
+            "规则指纹该报出当前块版本，实得 {}",
+            rules_tag()
+        );
     }
 
     /// v0→v4 升级：水位跟到最后一条 v0，第一笔 v4 只结算升级后的新块。
@@ -3154,6 +3652,7 @@ mod tests {
             entity_count: 0,
             dust_root_hex: String::new(),
             dust_count: 0,
+            ticket_vrf_hex: String::new(),
             txs: vec![],
         };
         let mut v0 = v0;
@@ -3434,6 +3933,7 @@ mod tests {
             entity_count: 0,
             dust_root_hex: String::new(),
             dust_count: 0,
+            ticket_vrf_hex: String::new(),
             txs: vec![],
         };
         b1.block_hash_hex = hex::encode(block_hash_of(
@@ -3467,6 +3967,7 @@ mod tests {
             entity_count: 0,
             dust_root_hex: String::new(),
             dust_count: 0,
+            ticket_vrf_hex: String::new(),
             txs: vec![TxAttestation {
                 digest_hex: hex::encode(digest),
                 from: victim.address.clone(),
@@ -3493,12 +3994,14 @@ mod tests {
             serde_json::to_string(&BlockLine {
                 header: b1,
                 wires: vec![],
+                ticket: None,
                 dusts: vec![],
             })
             .unwrap(),
             serde_json::to_string(&BlockLine {
                 header: b2,
                 wires: vec![wire],
+                ticket: None,
                 dusts: vec![],
             })
             .unwrap(),
@@ -3815,6 +4318,356 @@ mod tests {
             assert_eq!(l.balances.get(&miner.address), Some(&(qlx_start - qlx_in)));
             assert_eq!(l.dust.balance_of(&miner.address), 0);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // ------------------------------------------- ③ v6：门票与块时间进接收侧判据
+
+    /// 用**给定的一张票**造一个把它的指纹绑进块哈希的 v6 块。
+    ///
+    /// 出块时现签第二次得到的可能是另一张票（ML-DSA 不保证确定性签名），
+    /// 所以凡是要跟"本机这一轮见过的票"对照的测试，都必须把票递进来复用。
+    fn block_from_ticket(
+        core: &crate::keystore::WalletCore,
+        prev: &str,
+        height: u64,
+        ts: u64,
+        proof: &TicketProof,
+    ) -> BlockHeader {
+        let fpr = ticket_vrf_hex(proof, height, prev);
+        assert_eq!(fpr.len(), 64, "门票指纹必须是 64 个 hex");
+        let vrf = [9u8; 32];
+        let (entity_count, entity_root_hex) = crate::world::set_digest(&[]);
+        let mut er = [0u8; 32];
+        er.copy_from_slice(&hex::decode(&entity_root_hex).unwrap());
+        let dr = dust_root_of(&[]);
+        let mut tv = [0u8; 32];
+        hex::decode_to_slice(&fpr, &mut tv).unwrap();
+        let hash = block_hash_of_ticket(
+            prev,
+            height,
+            ts,
+            0,
+            &vrf,
+            &tx_root_of(&[]),
+            &er,
+            entity_count,
+            &core.address,
+            &dr,
+            0,
+            &tv,
+        );
+        BlockHeader {
+            version: BLOCK_V_TICKET,
+            height,
+            ts_unix: ts,
+            prev_hash_hex: prev.to_string(),
+            block_hash_hex: hex::encode(hash),
+            vrf_hex: hex::encode(vrf),
+            minted_after: 0,
+            reward_total: 0,
+            miner: core.address.clone(),
+            entity_root_hex,
+            entity_count,
+            dust_root_hex: hex::encode(dr),
+            dust_count: 0,
+            ticket_vrf_hex: fpr,
+            txs: vec![],
+        }
+    }
+
+    /// 造一张真票，再造一个用它开出来的 v6 块（父块、块高、块内时间、出块人
+    /// 四个入参全都参与裁决：改了不重算哈希过不了块那一关，重算了又过不了票那一关）。
+    fn ticketed_block(
+        core: &crate::keystore::WalletCore,
+        prev: &str,
+        height: u64,
+        ts: u64,
+    ) -> (BlockHeader, TicketProof) {
+        let proof = make_ticket_proof(core, height, prev);
+        let header = block_from_ticket(core, prev, height, ts, &proof);
+        (header, proof)
+    }
+
+    /// 同一回合两张票的高低，口径直接取生产代码那一处（`elect_winner`）。
+    fn order_round(
+        ca: &crate::keystore::WalletCore,
+        cb: &crate::keystore::WalletCore,
+        height: u64,
+        prev: &str,
+    ) -> ((TicketProof, String), (TicketProof, String)) {
+        let pa = make_ticket_proof(ca, height, prev);
+        let pb = make_ticket_proof(cb, height, prev);
+        let va = ticket_vrf_hex(&pa, height, prev);
+        let vb = ticket_vrf_hex(&pb, height, prev);
+        let both = [(va.as_str(), ca.address.as_str()), (vb.as_str(), cb.address.as_str())];
+        let (win_vrf, _) = elect_winner(both.into_iter()).expect("两张票必有胜者");
+        // 谁的指纹就是胜者那张，谁就是本轮出块人；另一张是"本机握着的更低票"的反面
+        if win_vrf == va.as_str() {
+            ((pa, ca.address.clone()), (pb, cb.address.clone()))
+        } else {
+            ((pb, cb.address.clone()), (pa, ca.address.clone()))
+        }
+    }
+
+    /// 开票口径只有一处：指纹小者胜，并列才比地址。
+    #[test]
+    fn the_lowest_ticket_wins_the_round() {
+        assert_eq!(
+            elect_winner([("aa", "ql1z"), ("bb", "ql1a")]),
+            Some(("aa", "ql1z")),
+            "指纹小者优先，地址靠后"
+        );
+        assert_eq!(
+            elect_winner([("aa", "ql1b"), ("aa", "ql1a")]),
+            Some(("aa", "ql1a")),
+            "同指纹并列才比地址"
+        );
+        assert_eq!(elect_winner([] as [(&str, &str); 0]), None, "一张票也没有 = 无从裁决");
+    }
+
+    /// 一张票只开一个块：换块高、换父块、换人、换指纹，四种挪动全部作废。
+    #[test]
+    fn one_ticket_opens_exactly_one_block() {
+        let core = test_core(30);
+        let prev = genesis_hash_hex();
+        let proof = make_ticket_proof(&core, 7, &prev);
+        let fpr = ticket_vrf_hex(&proof, 7, &prev);
+        assert!(
+            check_ticket_binding(7, &prev, &core.address, &fpr, &proof).is_ok(),
+            "本本分分的一张票必须验得过"
+        );
+
+        // ① 挪到下一个高度：同一张票不能连着开两个块
+        let err = check_ticket_binding(8, &prev, &core.address, &fpr, &proof).unwrap_err();
+        assert!(err.contains("废票"), "换块高应算废票，实得：{err}");
+        // ② 挪到另一条链上（换父块）
+        let other_prev = hex::encode([3u8; 32]);
+        let err = check_ticket_binding(7, &other_prev, &core.address, &fpr, &proof).unwrap_err();
+        assert!(err.contains("废票"), "换父块应算废票，实得：{err}");
+        // ③ 换个出块人来领这张票
+        let thief = test_core(31);
+        let err = check_ticket_binding(7, &prev, &thief.address, &fpr, &proof).unwrap_err();
+        assert!(err.contains("不是同一个人"), "换人应算李鬼，实得：{err}");
+        // ④ 块事后想领一张好票：指纹与票原件对不上
+        let fake_fpr = hex::encode([0u8; 32]);
+        let err = check_ticket_binding(7, &prev, &core.address, &fake_fpr, &proof).unwrap_err();
+        assert!(err.contains("不符"), "换指纹应算事后领票，实得：{err}");
+        // ⑤ 签名改一个字节
+        let mut broken = proof.clone();
+        let mut raw = hex::decode(&broken.sig_hex).unwrap();
+        let n = raw.len();
+        raw[n / 2] ^= 0x01;
+        broken.sig_hex = hex::encode(&raw);
+        let err = check_ticket_binding(7, &prev, &core.address, &fpr, &broken).unwrap_err();
+        assert!(err.contains("废票"), "改签名应算废票，实得：{err}");
+        // ⑥ 空出块人：连对照的对象都没有
+        assert!(check_ticket_binding(7, &prev, "", &fpr, &proof).unwrap_err().contains("miner"));
+    }
+
+    /// 门票的代价要有实测数字，不能只写"每张票约 10 KB"：一张票随块存放的 hex 载体
+    /// = 公钥 1952B + 签名 3309B + 地址盐 8B，逐字节 hex 翻倍。这条锁住的是"v6 的块比
+    /// v5 永远胖多少"这个账——改了 ML-DSA 参数或载体编码就会在这里翻红。
+    #[test]
+    fn a_ticket_costs_its_carrier_bytes() {
+        let core = test_core(40);
+        let proof = make_ticket_proof(&core, 7, &genesis_hash_hex());
+        assert_eq!(proof.pk_hex.len() / 2, crypto::PK_LEN);
+        assert_eq!(proof.sig_hex.len() / 2, crypto::SIG_LEN);
+        assert_eq!(proof.salt_hex.len(), 16);
+        let hex_chars = proof.pk_hex.len() + proof.sig_hex.len() + proof.salt_hex.len();
+        assert_eq!(hex_chars, (crypto::PK_LEN + crypto::SIG_LEN + 8) * 2);
+        assert_eq!(hex_chars, 10_538, "门票载体 = 10,538 个 hex 字符");
+    }
+
+    /// 票没进块 = 整块拒绝；一条也没入账；票补齐才收。
+    #[test]
+    fn a_v6_block_without_its_ticket_is_refused_and_leaves_no_trace() {
+        let (dir, chain) = temp_chain("v6-noticket");
+        let core = test_core(32);
+        let rival = test_core(33);
+        let base = now_unix();
+        let (h, proof) = ticketed_block(&core, &chain.tip_hash_hex_pub(), 1, base);
+
+        // ① 声明了指纹、没带原件：本机无从复验
+        let err = chain.apply_remote_block(&h, vec![], vec![], None, None).err().unwrap();
+        assert!(err.contains("缺门票原件"), "实得：{err}");
+
+        // ② 连指纹都没声明
+        let mut bare = h.clone();
+        bare.ticket_vrf_hex = String::new();
+        let err = chain
+            .apply_remote_block(&bare, vec![], vec![], Some(proof.clone()), None)
+            .err().unwrap();
+        assert!(err.contains("没有声明出块门票"), "实得：{err}");
+
+        // ③ 带一张别人的真票（票是好票，块不是它开的）
+        let (_, rival_proof) = ticketed_block(&rival, &chain.tip_hash_hex_pub(), 1, base);
+        let err = chain
+            .apply_remote_block(&h, vec![], vec![], Some(rival_proof), None)
+            .err().unwrap();
+        assert!(err.contains("不是同一个人"), "实得：{err}");
+
+        assert_eq!(chain.height(), 0, "三次拒收不该留下一块");
+        assert_eq!(chain.total_minted(), 0, "拒收不该发过币");
+
+        // ④ 原件补齐 → 同一个人、同一个块高、同一个父块，这才收下
+        chain
+            .apply_remote_block(&h, vec![], vec![], Some(proof), None)
+            .expect("带真票的 v6 块应被收下");
+        assert_eq!(chain.height(), 1);
+        assert_eq!(chain.tip_hash_hex_pub(), h.block_hash_hex);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 本机这一轮握着一张更低的真票时，票大的那块就是抢块；胜者沉默才允许接手。
+    #[test]
+    fn a_larger_ticket_cannot_mint_until_the_winner_goes_silent() {
+        let (dir, chain) = temp_chain("v6-census");
+        let a = test_core(34);
+        let b = test_core(35);
+        let base = now_unix();
+
+        // 块 1：谁出都行（这一轮本机没收到任何票 → 判据只能验真，不能验名次）
+        let (h1, p1) = ticketed_block(&a, &chain.tip_hash_hex_pub(), 1, base);
+        chain
+            .apply_remote_block(&h1, vec![], vec![], Some(p1), None)
+            .expect("块 1 应入账");
+        let parent_ts = chain.ledger.lock().unwrap().parent_ts.expect("入账后该有父块时间");
+        assert_eq!(parent_ts, base);
+
+        // 块 2：本机见过两张票，握着的胜者不是出块人
+        let prev2 = chain.tip_hash_hex_pub();
+        let ((win_proof, win_addr), (lose_proof, lose_addr)) = order_round(&a, &b, 2, &prev2);
+        let winner = RoundWinner {
+            vrf_hex: ticket_vrf_hex(&win_proof, 2, &prev2),
+            addr: win_addr.clone(),
+        };
+        let loser_core = if lose_addr == a.address { &a } else { &b };
+        let h2 = block_from_ticket(loser_core, &prev2, 2, parent_ts + 1, &lose_proof);
+        let err = chain
+            .apply_remote_block(&h2, vec![], vec![], Some(lose_proof.clone()), Some(winner.clone()))
+            .err().unwrap();
+        assert!(err.contains("抢块"), "票大又没到接管时间，必须拒，实得：{err}");
+        assert_eq!(chain.height(), 1, "抢块不该入账");
+
+        // 胜者自己出这块：同时间戳、同一轮，放行
+        let winner_core = if win_addr == a.address { &a } else { &b };
+        let h2_win = block_from_ticket(winner_core, &prev2, 2, parent_ts + 1, &win_proof);
+        chain
+            .apply_remote_block(&h2_win, vec![], vec![], Some(win_proof), Some(winner.clone()))
+            .expect("本轮胜者出块应入账");
+        assert_eq!(chain.height(), 2);
+
+        // 块 3：这一轮本机同样只握着一张更低的票，而胜者迟迟没出块——
+        //      过了接管时间，票大的那块才允许接手（本地网 liveness 的兜底口）
+        let prev3 = chain.tip_hash_hex_pub();
+        let ((win3, win3_addr), (lose3, lose3_addr)) = order_round(&a, &b, 3, &prev3);
+        let winner3 = RoundWinner {
+            vrf_hex: ticket_vrf_hex(&win3, 3, &prev3),
+            addr: win3_addr,
+        };
+        let loser3_core = if lose3_addr == a.address { &a } else { &b };
+        let parent3 = chain.ledger.lock().unwrap().parent_ts.expect("块 2 入账后该有父块时间");
+
+        // 差一秒都没到接管时间 → 还是抢块
+        let h3_early = block_from_ticket(loser3_core, &prev3, 3, parent3 + MINT_TAKEOVER_SECS - 1, &lose3);
+        let err = chain
+            .apply_remote_block(&h3_early, vec![], vec![], Some(lose3.clone()), Some(winner3.clone()))
+            .err().unwrap();
+        assert!(err.contains("抢块"), "接管时间还差 1s，必须拒，实得：{err}");
+
+        // 胜者沉默到点 → 票大的接手，这块站得住
+        let h3_late = block_from_ticket(loser3_core, &prev3, 3, parent3 + MINT_TAKEOVER_SECS, &lose3);
+        chain
+            .apply_remote_block(&h3_late, vec![], vec![], Some(lose3), Some(winner3))
+            .expect("胜者沉默超过接管时间，兜底出块应放行");
+        assert_eq!(chain.height(), 3, "兜底块入账");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 块内时间：晚于最近 11 块的中位数、不得超前本机时钟 120s；旧版本块不追溯。
+    #[test]
+    fn block_time_is_median_past_with_a_future_cap() {
+        let window: Vec<u64> = (1000..1011).collect();
+        assert_eq!(median_ts(&window), Some(1005), "11 块的中位数是排序后第 6 个");
+        assert_eq!(median_ts(&[1000u64, 1002, 1001, 1003]), Some(1002), "偶数窗口取上中位");
+        assert_eq!(median_ts(&[]), None, "空窗口没有中位数");
+
+        // 时间回溯：等于中位数也不行（否则可以把接管计时拨回去重来）
+        let err = check_block_time(BLOCK_V_TICKET, 1005, &window, 2000).unwrap_err();
+        assert!(err.contains("中位数"), "实得：{err}");
+        assert!(check_block_time(BLOCK_V_TICKET, 1006, &window, 2000).is_ok());
+
+        // 灌时间：上限内放行，超出整块拒
+        assert!(check_block_time(BLOCK_V_TICKET, 2120, &window, 2000).is_ok());
+        let err = check_block_time(BLOCK_V_TICKET, 2121, &window, 2000).unwrap_err();
+        assert!(err.contains("超前"), "实得：{err}");
+
+        // v6 之前的块按旧口径重放：历史链不因这两条被推翻
+        assert!(check_block_time(BLOCK_V_POOL, 1, &window, 2000).is_ok());
+        assert!(check_block_time(BLOCK_V_POOL, 9_999_999, &window, 2000).is_ok());
+
+        // 出块人该用的时间：拿本机时钟跟链上时间争没意义，向前夹
+        assert_eq!(clamp_block_ts(&window, 1006), 1006);
+        assert_eq!(clamp_block_ts(&window, 800), 1006, "慢钟也得出得了块：夹到中位数+1");
+        assert_eq!(clamp_block_ts(&[], 777), 777, "链上还没有别的时间可参照，只能用自己");
+
+        // 夹完再过不了自检，那才是真出不了块的情况：时钟快了 10 分钟
+        let now_far = 1005 + 600;
+        let ts = clamp_block_ts(&window, now_far);
+        assert_eq!(ts, now_far);
+        assert!(check_block_time(BLOCK_V_TICKET, ts, &window, now_far).is_ok(), "超前是按它自己的钟算的");
+        // 而邻居（正常时钟）会拒——这就是"单个节点最多能把链上时间推多远"的边界
+        assert!(check_block_time(BLOCK_V_TICKET, ts, &window, 1006).unwrap_err().contains("超前"));
+    }
+
+    /// 激活高度：v6 规则只管 v6 块，之前的每一块照旧重放（历史不许被追溯推翻）。
+    #[test]
+    fn v6_judgement_starts_at_its_activation_height() {
+        assert_eq!(version_floor_at(BLOCK_V_V6_ACTIVATION), BLOCK_V_POOL);
+        assert_eq!(version_floor_at(BLOCK_V_V6_ACTIVATION + 1), BLOCK_V_TICKET);
+        // 出块人自己：v6 块不带票出不了，v5 块不需要票
+        assert!(BLOCK_V_V6_ACTIVATION > BLOCK_V_V5_ACTIVATION, "两代激活窗口不能倒着排");
+    }
+
+    /// 快照重放同样有这两道闸：整链自洽但票被摘掉，照样整条拒收。
+    #[test]
+    fn a_replayed_snapshot_is_held_to_the_same_ticket_rules() {
+        let (dir, chain) = temp_chain("v6-snap-src");
+        let core = test_core(36);
+        let base = now_unix();
+        let (h, proof) = ticketed_block(&core, &chain.tip_hash_hex_pub(), 1, base);
+        chain
+            .apply_remote_block(&h, vec![], vec![], Some(proof.clone()), None)
+            .expect("源链先自己走一遍接收侧");
+        let lines = std::fs::read_to_string(dir.join("blocks.jsonl")).unwrap();
+        assert!(lines.contains("\"ticket_vrf_hex\""), "块文件里该写着门票指纹");
+
+        // ① 原样重放到空机器：逐块复验票，账对得上
+        let (dir2, dst) = temp_chain("v6-snap-dst");
+        assert_eq!(dst.install_snapshot(&lines).unwrap(), 1, "带票的快照应整链采用");
+        assert_eq!(dst.tip_hash_hex_pub(), chain.tip_hash_hex_pub(), "两机同一条链");
+
+        // ② 把票从块行里摘掉（块头一个字没改，哈希照样自洽）
+        let mut rows: Vec<String> = lines.lines().map(str::to_string).collect();
+        let mut bl: BlockLine = serde_json::from_str(rows.last().unwrap()).unwrap();
+        bl.ticket = None;
+        *rows.last_mut().unwrap() = serde_json::to_string(&bl).unwrap();
+        let err = dst.install_snapshot(&rows.join("\n")).unwrap_err();
+        assert!(err.contains("门票"), "摘掉票的快照必须整条拒收，实得：{err}");
+
+        // ③ 把票换成另一张真票（李鬼拿着真票开真块）
+        let other_proof = make_ticket_proof(&test_core(37), 2, &chain.tip_hash_hex_pub());
+        let mut bl: BlockLine = serde_json::from_str(rows.last().unwrap()).unwrap();
+        bl.ticket = Some(other_proof);
+        *rows.last_mut().unwrap() = serde_json::to_string(&bl).unwrap();
+        let err = dst.install_snapshot(&rows.join("\n")).unwrap_err();
+        assert!(err.contains("门票"), "换票的快照也必须拒，实得：{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
