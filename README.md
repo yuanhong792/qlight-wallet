@@ -92,6 +92,7 @@ node tools/world/world.js --blocks <你的>/blocks.jsonl   # 用你自己的链�
 node tools/world/test_first_person.js               # 零依赖：DOM/WebGL 桩跑通"低头连点原地起柱→踩上去→拆掉自己那块"
 python3 tools/world/test_ore_v1.py                  # 矿脉规则 QL-ORE-v1：现场生成 ore_golden.json（缺 node 时跳过 JS 侧，需 NODE_BIN=/path/to/node）
 cargo test --lib ore::tests::ore_matches_cross_language_golden   # Rust 共识侧拿同一份基准复核
+python3 tools/ui/test_invoke_wiring.py              # 每个按钮那句 invoke 真对得上 Rust 命令与形参（stub 对拍页测不出这类错，DESIGN §9.37）
 ```
 
 **这几条腿不保证都在这台机器上跑得起来**：本机没有 `node` 可执行文件（Qoder 自带运行时不暴露）。0.4.5 这轮大地换成真实高程后 `ore_golden.json` 必须重生成，而 `test_ore_v1.py` 缺 node 时**仍按 python 侧写盘**、只在 JS 那条腿报 FAIL——所以这轮的 JS 侧改用浏览器页跑同一份 `tools/world/world.js` + `ui/earth-height.js`，与重生成后的基准逐位比对，**10 个用例 0 差异**，Rust 再拿同一份基准复核通过。`test_first_person.js` 的 DOM/WebGL 桩腿没有 node 就跑不了，本轮由浏览器里抓的真实帧替代（那是画面证据，不等于几何断言）。
