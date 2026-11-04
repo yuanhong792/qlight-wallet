@@ -6,8 +6,9 @@ name: gates
 #   ③ tools/world/test_docs_parity —— 官网与钱包共用同一份星球网格（逐字节）
 #   ④ tools/ui/test_invoke_wiring  —— 每个按钮那句 invoke 对得上 Rust 命令与形参
 #   ⑥ tools/world/test_rules_v3    —— 同一条链在任何机器上算出同一片地（像素指纹）
+#   ⑦ tools/ui/test_asset_refs     —— 包与官网被引用的文件真存在（少一个不是报错，是白屏）
 # ⑤ 不是闸，是两条已经真犯过的错：对拍临时页混进发行包、版本号两处字面量各说各话。
-# 编号按各道闸"被抓到"的时间排，不重排——⑤ 先落地、⑥ 后加，跑过的日志里就是这个号。
+# 编号按各道闸"被抓到"的时间排，不重排——⑤ 先落地、⑥⑦ 后加，跑过的日志里就是这个号。
 
 on:
   push:
@@ -71,3 +72,6 @@ jobs:
 
       - name: ⑥ 世界规则指纹闸（同一条链必须算出同一片地）
         run: python3 tools/world/test_rules_v3.py
+
+      - name: ⑦ 资源引用闸（包与官网被引用的文件必须真存在）
+        run: python3 tools/ui/test_asset_refs.py
