@@ -179,15 +179,16 @@ zsh scripts/build-windows.sh    # → build/QLight-Wallet-Windows.zip（macOS �
 - 打包脚本会**自己校验导入表**：除系统 DLL 外若冒出第三个非系统依赖就直接失败退出——"三文件同目录"是可验断言，不是文档传说。
 - 交叉编译需要 llvm-mingw（脚本自动找 `~/qlx-tools/llvm-mingw-*`，或显式 `MINGW_HOME=/path`）。
 - **编译输出必须放内置盘**（脚本已固定）：外置 exFAT 卷会生成 `._*` 资源叉，既破坏构建也会污染发布用的 zip。
-- **五步验证闸钉在 CI 上，不再靠人记得跑**：`.github/workflows/gates.yml` 在 push 到 main 与 PR 时自动执行，本地按同样口径跑一遍即可复现——
+- **六步验证闸钉在 CI 上，不再靠人记得跑**：`.github/workflows/gates.yml` 在 push 到 main 与 PR 时自动执行，本地按同样口径跑一遍即可复现——
   ```bash
   (cd desktop-wallet && cargo test --release)        # ① 共识/账本/发行/网络 166 项
   python3 tools/wording/test_wording.py              # ② 口径闸：8 语言 × 7 字典同构 + 禁词 0 命中
   python3 tools/world/test_docs_parity.py            # ③ 文档对拍闸：官网那份网格与钱包逐字节相同
   python3 tools/ui/test_invoke_wiring.py             # ④ 接线闸：那句 invoke 对得上 Rust 命令与形参
   find desktop-wallet/ui -name '__*' -print -quit    # ⑤ 打包前置：对拍临时页不许进发行包
+  python3 tools/world/test_rules_v3.py               # ⑥ 世界规则指纹闸：同一条链算出同一片地
   ```
-  ⑤ 的后半句是 `Cargo.toml` 与 `tauri.conf.json` 必须报同一个版本号。**CI 不打包**：五步全是验证，DMG/EXE 仍然只在 macOS 上交叉出，Linux runner 没装打包要的那套东西。
+  ⑤ 的后半句是 `Cargo.toml` 与 `tauri.conf.json` 必须报同一个版本号。编号按各道闸被抓到的时间排，⑤ 先落地、⑥ 后加。**CI 不打包**：六步全是验证，DMG/EXE 仍然只在 macOS 上交叉出，Linux runner 没装打包要的那套东西。
 
 ## 📄 许可与免责
 

@@ -1,11 +1,13 @@
 name: gates
 
-# 这四道闸在本地跑了一年多，靠的是"有人记得跑"。钉在这儿，push 就执行。
+# 这几道闸在本地跑了一年多，靠的是"有人记得跑"。钉在这儿，push 就执行。
 #   ① cargo test --release        —— 共识、账本、发行、网络（166 项）
 #   ② tools/wording               —— 8 语言 × 7 字典键集同构 + 禁词 0 命中
 #   ③ tools/world/test_docs_parity —— 官网与钱包共用同一份星球网格（逐字节）
 #   ④ tools/ui/test_invoke_wiring  —— 每个按钮那句 invoke 对得上 Rust 命令与形参
-# 最后一步不是闸，是两条已经真犯过的错：对拍临时页混进发行包、版本号两处字面量各说各话。
+#   ⑥ tools/world/test_rules_v3    —— 同一条链在任何机器上算出同一片地（像素指纹）
+# ⑤ 不是闸，是两条已经真犯过的错：对拍临时页混进发行包、版本号两处字面量各说各话。
+# 编号按各道闸"被抓到"的时间排，不重排——⑤ 先落地、⑥ 后加，跑过的日志里就是这个号。
 
 on:
   push:
@@ -66,3 +68,6 @@ jobs:
           grep -q "\"version\": \"$V\"" desktop-wallet/tauri.conf.json \
             || { echo "tauri.conf.json 里没有 Cargo.toml 那个版本 $V——两处字面量各说各话"; exit 1; }
           echo "临时页 0 处 · 版本单一口径 $V"
+
+      - name: ⑥ 世界规则指纹闸（同一条链必须算出同一片地）
+        run: python3 tools/world/test_rules_v3.py
