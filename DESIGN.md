@@ -1057,7 +1057,7 @@ H[j*2048+i] ≥ 128（陆地码）即取，否则换下一轮哈希再试；4096
 | `build/QLight-Wallet-Windows.zip` | **13,179,505 B**（exe 21 MB + 两个 DLL + README.txt） | PE 导入表：全部 29 个 DLL 里非系统依赖只有 `WebView2Loader.dll` 与 `libunwind.dll`；zip 内 `README.txt` 第 42 行是改过的分段写法 |
 | sha256 | DMG `a8c286ce6ee031b47bf15f48b4f7204e7d51819d52ec1a0410891da4fb13cead`<br>ZIP `e4df95cc7e6b52595b20b0f6601ee14068260254907a4798b2401b038a9d7ca0` | 上传 release 时这两个值直接进说明 |
 
-**"包里到底是不是这份代码"不能用 `strings` 验**（UI 资源进包是压缩的，旧包新包都搜不到任何 UI 串——这条坑 §9.29 记过）。所以换成**跑它一次**：直接执行包内的二进制 `build/QLight.app/Contents/MacOS/qlight-wallet --node --send 坏地址 1`，回话是 `[QLight] 收款地址不合法：bech32 解码失败: parse failed`。这句只能由本轮新加的 `--node --send` 分发路径念出来（`main.rs` / `node::send_once`），`eb4b189` 打的那个包根本不认 `--send`——**产物级证据，不靠搜索二进制里的字符串**。
+**"包里到底是不是这份代码"不能用 `strings` 验**（UI 资源进包是压缩的，旧包新包都搜不到任何 UI 串。这句原本写的是"这条坑 §9.29 记过"——**引用编错了**：全文检索下来只有本句记它，§9.29 通篇没提 `strings`。2026-11-04 复核交叉引用时发现，见 §9.40 末。留原文因为坑是真的，假的是它的出处。）。所以换成**跑它一次**：直接执行包内的二进制 `build/QLight.app/Contents/MacOS/qlight-wallet --node --send 坏地址 1`，回话是 `[QLight] 收款地址不合法：bech32 解码失败: parse failed`。这句只能由本轮新加的 `--node --send` 分发路径念出来（`main.rs` / `node::send_once`），`eb4b189` 打的那个包根本不认 `--send`——**产物级证据，不靠搜索二进制里的字符串**。
 
 **官网线上复核（#67）：数据侧证到了，画面侧这台网络证不了。** ① 取回的 `index.html` 与仓库 `HEAD` **逐字节一致**（42,549 B），Pages 确实跟着 main 走；② 页面引用资源逐个对 sha：`earth-map.js` / `earth-grid.js` / `world.js` / `earth-height.js` 四个（2–91 KB）**全部一致**；③ 那张 2 MiB 全球网格在本机链路上**被截断**——整对象 GET 只回来 815,466 B / 660,001 B，而 `HEAD` 报 `content-length: 2097152`、`etag "6ae80fff-200000"`（`0x200000` = 2 MiB），改用 `Range: -64` 取尾部 64 字节拿到 **206** 且与本地文件逐字节相同 → **Pages 上那份文件是完整的，断的是这台机器的出口链路**（与 §9.34 记的 GitHub 443 偶发超时同源）。后果：浏览器打开线上站在 30 秒内起不来（它要先取这 2 MiB 再跑 WebGL），所以**"线上渲染出来的样子"这一半仍然没被真帧验到**，#67 不关。（这条下一轮被 §9.36 关掉：分块重试一次就取全了 2,097,152 B，sha 与仓库一致；帧也用无头 Chrome 抓到了。）
 
@@ -1145,7 +1145,7 @@ H[j*2048+i] ≥ 128（陆地码）即取，否则换下一轮哈希再试；4096
 
 复现口径：每块 `curl -sSL -r start-end` 取回、尺寸不对就重试，拼完 `shasum -a 256`，对 `gh api repos/…/releases/tags/v0.5.1 --jq '.assets[].digest'`。
 
-### 9.40 第 ⑥⑦ 道闸：跨平台的像素指纹，和一道专抓"白屏"的引用闸
+### 9.40 第 ⑥⑦⑧ 道闸：跨平台的像素指纹、专抓白屏的引用闸，和一条管文档自己的闸
 
 **⑥ `tools/world/test_rules_v3.py` 上 CI（run `41847528484`，绿）。** 它在 Linux runner 上报出的三个值和这台 Mac 逐字符相同：`earth-height.bin` 的 SHA `805868b90a88e3df…4248f8`、只有创世 + 240 个确定性 VRF 时的像素指纹 `55349f5fa2465335`、规则常量 `0x50d296e0` 加一之后的 `60280b6d8d158dc3`。这顺带把"**同一条链在不同操作系统上算出同一片地**"从推理变成了每趟 CI 都重跑一遍的实测——纯标准库（`hashlib`/`struct`/`zlib`），runner 上没有 node 也照跑。那句"规则常量 +1 必须换脸"就是这道闸自己的反向对照：它不是"什么都对得上所以全绿"，而是改一个常量就当场红。
 
@@ -1153,11 +1153,54 @@ H[j*2048+i] ≥ 128（陆地码）即取，否则换下一轮哈希再试；4096
 
 **⑦ `tools/ui/test_asset_refs.py`：被引用的文件必须真在包里。** 接线闸（④）管"按钮那句 invoke 对得上 Rust 命令"，管不到**取数路径**。而钱包的世界是这么起来的：`index.html` 一串 `<script src>`、JS 里 `import("./planet-view.js")`、`fetch('earth-global-h.bin')`、CSS 里 `url("assets/world-gate-v1.png")`。路径写错或文件被挪走，真 GUI 里的表现不是弹窗报错，是**一片空白的世界**——访客从官网下回去、装好、点「启动挖矿」看到黑屏，而前面六步闸一路全绿。这道闸扫四层（HTML 的 `src`/`href`、顶层 `*.js` 的 `import()`/`fetch()`/`new URL()`/裸字面量、`style.css` 的 `url()`、Rust 侧 `include_bytes!` 的那两份），两个根都查：`desktop-wallet/ui/`（发行包）与 `docs/`（官网，家人第一眼看到的是那页）。本机实跑 **43 条引用全解析得到**（ui 16 个入口文件 + docs 6 个），星球网格与前端 fetch 的那份同一尺寸 ✓。
 
-反向对照做了两层：`earth-global-h.bin` 与 `planet-view.js` 各改一个名（`.typo.`）必须都判缺失；再往临时目录里**真注入一份 HTML**——两条好引用 + 两条断引用，管线必须恰好报出断的那两条。**第二层当场把我自己抓了出来**：我漏在临时目录里放 `style.css`，于是 `href="style.css"` 也被判为缺失，实得 3 条断裂——那不是闸的 bug，是闸是对的，我的预期错了。补齐文件后 4 条核对 / 2 条断裂，全报出 ✓。
+反向对照做了两层：`earth-global-h.bin` 与 `planet-view.js` 各改一个名（`.typo.`）必须都判缺失；再往临时目录里**真注入一份 HTML**——两条好引用 + 两条断引用，管线必须恰好报出断的那两条。**第二层当场把我自己抓了出来**：我漏在临时目录里放 `style.css`，于是 `href="style.css"` 也被判为缺失，实得 3 条断裂——那不是闸的 bug，是闸是对的，我的预期错了。补齐文件后 4 条核对 / 2 条断裂，全报出 ✓。**同一套"引用要落回实物"挪到文档自己身上一条不放过**，当场抓到 3 处错引用：本轮新写的 §9.40 有两处把"网格存两份"记成 §9.34、把"不能用 `strings` 验包"记成 §9.27，实际都在 §9.26 与 §9.35；还有一处更早的——§9.35 写"这条坑 §9.29 记过"，全文检索只有它自己这句记过这件事，**那个引用是我编的**（§9.29 通篇没提 `strings`），已在原句里标出来、不悄悄改掉。
 
 **写这道闸的当场还抓到自己的盲区**：只扫 HTML 与 JS 的第一版跑出来一片绿，而包里**最大那张图**（`assets/world-gate-v1.png`，2,480,190 B，黄昏封面）唯一的引用点在 `style.css` 的 `url()` 里——差一点这道闸就绿着漏掉了它最想防的那类错。加 CSS 那一层是必需的，不是锦上添花。
 
 **这道闸还报出一件没人知道的事：16 个文件 / 178,346 B 随包分发却没有任何引用**——`assets/coin-face-obverse.png`（160,291 B）、`assets/world-tiles/` 那 13 张贴图（共 15,160 B）、`coin_gold.svg`、`mark_circle.svg`。`index.html` 六处 `<img>` **用的全是反面** `coin-face-reverse.png`，正面那张一次都没挂上。这是**业主的素材，怎么处理归他**（§9 立的规矩：他的贴图不自绘也不擅自删），所以闸只报数不判红；但"正面是设计如此还是漏挂"要他拍板。孤儿资产合计不到 180 KB，占 DMG 的 0.9%，不是体积问题，是**"包里有东西没人用"这件事以前根本没人看得见**。
+
+**顺着 ⑦ 的清单去发行包的产物字节里逐个对，把 §9.26 那句"存两份"钉到平台级**。先声明这两行数的是**本机产物，CI 复现不了**：`desktop-wallet/build/` 在 `.gitignore` 第 2 行，exe 与 `.app` 都不进仓库，所以这张表是一次性的观测记录，不是每趟 push 都重跑的闸。要自己重数一遍，先跑这段守卫——三条 `test -f` 全过才有资格谈下面那两个数（本机当场全过，`stat -f %z` 念出的字节与表里体积一致，`shasum -a 256` 念出的两个哈希与表中最后一列逐字符相同）：
+
+```sh
+# 新克隆的机器上 build/ 里什么都没有：这三条 test -f 就是"这数复现得了吗"的开关
+test -f desktop-wallet/build/QLight-Wallet-Windows/qlight-wallet.exe && echo "Windows exe 在场" || echo "缺！先跑 scripts/build-windows.sh"
+test -f desktop-wallet/build/QLight.app/Contents/MacOS/qlight-wallet && echo "macOS 二进制在场" || echo "缺！先跑 scripts/build-macos.sh"
+test -f desktop-wallet/ui/earth-global-h.bin && echo "被测网格在场（sha256 见下表）" || echo "缺！这份在仓库里，缺了是仓库坏了"
+python3 -c "d=open('desktop-wallet/build/QLight-Wallet-Windows/qlight-wallet.exe','rb').read(); \
+g=open('desktop-wallet/ui/earth-global-h.bin','rb').read(); print('exe 里这张网格原文出现', d.count(g), '次 / exe', len(d), 'B')"
+find desktop-wallet/build/QLight.app -type f ! -name '._*'    # → 4 个，全列表见下
+```
+
+（下面这两份就是 §9.39 用服务端 digest 逐字符核对过的那两个 0.5.1 包。）
+
+| 产物 | 体积 | `earth-global-h.bin` 整份原文出现次数 | 这份二进制自己的 sha256 |
+| --- | --- | --- | --- |
+| `QLight.app/Contents/MacOS/qlight-wallet` | 24,641,008 B | **1** | `56f8b85aee31bee878aad82210726a271eb99f42a1b7d866ae9a66aeb2d250d1` |
+| `QLight-Wallet-Windows/qlight-wallet.exe` | 22,454,272 B | **2** | `c1614f700e6e0c75a68e384f0213ab7356a1ca3d15245b03a8e889eb6d6aa610` |
+
+加 sha256 那一列是因为"次数"绑在**这一份字节**上：包一旦重打，编译器对齐与压缩选择都会变，没有哈希就没人能确认数的还是同一份。被数的那份网格 `ui/earth-global-h.bin` = 2,097,152 B、sha256 `5050a85cedfb82808a8a1d76f38b20e5263c36eae553a03468718ecf3e4d84e1`（与 `docs/` 那份同一个哈希，§9.29 的对拍闸钉着）。
+
+`.app` 里没有散落的 `ui/` 文件（下面逐条列出那 4 个），所以 mac 侧第二份不可能以原文形式存在于别处。**没证到的**：它是不是被压缩进去了——本机没有 brotli（`import brotli` 失败，也没有 `brotli` 命令），只排除了 zlib / raw-deflate / gzip 三种（各自压缩结果在 exe 里出现 0 次），所以"mac 只有一份"要说成"**只数到一份原文**"，不能说"mac 少付了 2 MiB"。§9.26 当年记的就是 Windows 的 exe 出现两次，这次给那句补上平台限定。同类核对的老毛病照旧（§9.35 记的"不能用 `strings` 验包"）：JS / CSS / HTML 在两个 exe 里都数不到原文，它们是压缩内嵌的，**数不到不等于不在包里**——所以这里只对二进制资产下结论；`assets/world-gate-v1.png`（2,480,190 B）与 `earth-global.jpg` 都数不到原文，同样只能说明"被压过"，不能说明"没进包"。
+
+`.app` 里那 4 个文件是：`Contents/MacOS/qlight-wallet`（24,641,008 B）、`Contents/Resources/icon.icns`（3,706,375 B）、`Contents/_CodeSignature/CodeResources`（2,440 B）、`Contents/Info.plist`（837 B）——**没有任何散落的 `ui/` 文件**，所以 mac 侧第二份不可能以原文形式存在于别处。这三条断言各配一条当场跑过的命令，谁都能在打完包的机器上重跑：
+
+```sh
+find desktop-wallet/build/QLight.app -type f ! -name '._*' | wc -l     # → 4
+test -f desktop-wallet/build/QLight.app/Contents/Info.plist \
+  && plutil -extract CFBundleShortVersionString raw desktop-wallet/build/QLight.app/Contents/Info.plist   # → 0.5.1
+test -d desktop-wallet/build/QLight.app/Contents/_CodeSignature \
+  && codesign -dv desktop-wallet/build/QLight.app 2>&1 | grep -E 'Identifier|flags'   # → net.qlight.wallet / flags=0x2(adhoc) / TeamIdentifier=not set
+```随附两条断言也是当场跑的：`plutil -extract CFBundleShortVersionString raw …/Info.plist` 念 **0.5.1**，`codesign -dv QLight.app` 回 `Identifier=net.qlight.wallet`、`flags=0x2(adhoc)`——**ad-hoc 签名，没有 Apple 开发者证书**，与打包脚本自己念的一致（`scripts/build-macos.sh:58` 那句「③ ad-hoc 签名」用的是 `codesign --force --sign -`），也与对外文案一致：`docs/index.html:403` 和 `README.md:161` 都写的是「未做公证的普通提示，右键 → 打开」。这三处口径互为对照，谁改成"已公证"都会被另外两处打脸。每趟 push 真能重跑的是仓库里那两份源文件在场且尺寸一致（⑦ 对 `ui/earth-global-h.bin` 与 `include_bytes!` 指向做 `isfile` + 尺寸比对），以及包里的字节与服务端 digest 相同（那次记在 §9.39）。想在 CI 里数产物原文，得先让 workflow 打包——那是另一件事，本轮不做，也别把这张表当成有闸。
+
+**我自己刚写的那句也被这次实测打穿了**：把官网那句"v0.4.7 比上一版大 2.7 MB"改掉时，我换成了"那张网格在**包里**存了两份"——对 Windows 成立，对 macOS 数不到两份。已改成带数字、带平台限定的说法（`docs/index.html`）。这是同一类错的第五次，而且这次是**修过期句子的过程中新写的句子又越了界**：写"包里 / 两份 / 最新版"这种话，得先去产物字节里数一遍再说。
+
+**⑧ `tools/wording/test_design_refs.py`：文中每个 `§小节号` 都得指得到真小节。** 这条管的是文档自己。DESIGN 是编年记录，§9.x 就是它的地址；地址会漂——删一节、并一节、或者手写一个压根没存在的号。本机实跑：扫 25 个文件（DESIGN + README + 官网 + `tools/**`）里的 **232 条 `§` 引用，全部解析到 DESIGN.md 真存在的小节**（DESIGN 自身 156 条，其余 76 条在 README / 官网 / 各闸的说明里）；DESIGN 自身 77 个小节，`### 9.x` 那 41 节**编号连续无重复**。反向对照往临时副本注入一条假引用（小节号 9.99）和一条重复的 `### 9.0`，两条都当场报出 ✓。
+
+这道闸自己也踩了一次老毛病：**第一跑它红在自己身上**——4 条"断引用"全来自它自己的源码，因为报错文案与探针字面量里写着完整的「§」加数字，被自己扫到了。改法是探针号用字符串拼出来，不写整串；**判"这闸有没有在干活"之前，先确认它没把自己的反向对照当成缺陷**。
+
+**紧接着第二跑，反向对照翻过来说它自己没干活**——查出来是接线传错：`negative_control` 要的是"小节号集合"，我传进去的是整篇 DESIGN 文本，于是那句 `n not in heads` 退化成了**子串判断**（只要文里任何地方出现过 `9.99` 这串字符，注入的假引用就被当成"合法"）。也就是说**第一跑那次"对照通过"是假绿**，它一直没在测它声称在测的东西。露馅的原因很讽刺：我在正文里写了"小节号 9.99"这句解释，那串字符进了文本，子串判断才第一次判错。改成传集合后，闸立刻抓到我自己在同一段里举的反面例子（引了一个当时还不存在的号）——那条例子已改成不含具体号的说法，**闸不冤枉人，但它也不放过写闸的人**。这一条记进 §9.22 那串"对照能过不代表对照在干活"的老账，这是第五次。
+
+**⑧ 拦不住什么，写在这**：它只保证"这一节存在"，不保证"这一节讲的就是那句话"。今晚修掉的三处错引用——`§9.34`（真存在，讲的是四进程跑真链）、`§9.27`（真存在，讲的是配色）、`§9.29`（真存在，讲的是官网那颗地球）——**全是指到一个存在但内容不相干的小节，⑧ 一条都抓不到**。它管的是另一半：将来删一节、并一节、或手写一个压根不存在的号——**这句原本要写成"9 加到 9.40 之后有人引 9.41 那一节"，写上门牌号 ⑧ 当场把这句自己判成断引用**（那会儿 9.41 确实不存在；这里刻意不写 § 号，写了闸就红，这不是钻闸的空子，是它按设计该红）。真出现那种悬空，它连文件名带行号报出来。所以文档里的 §引用还是要人来核语义，闸只兜"指到一个根本没有的小节"。
 
 **⑦ 不证明的东西也要写清**：它只保证静态引用解析得到文件，不保证真渲染出来——`img` 有没有 0 尺寸、WebGL 起不起来、按钮在真窗口里点下去什么反应，仍然欠着（#68）。`assets/world-tiles/` 那 13 张以前是给谁用的，这道闸也不知道，它只说"现在没人引用"。
 
