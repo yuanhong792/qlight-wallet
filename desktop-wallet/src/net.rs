@@ -499,7 +499,9 @@ fn verify_peers_ad(
 #[derive(NetworkBehaviour)]
 pub struct QlBehaviour {
     pub gossipsub: gossipsub::Behaviour,
-    pub mdns: libp2p::mdns::tokio::Behaviour,
+    /// 组播发现。`Toggle::with_disabled` = 这台机器只靠种子名单 / 地址 gossip /
+    /// 引导注册表找人（中继闸门要的就是这个：`tests/relay_node.rs`、DESIGN.md §9.39）。
+    pub mdns: libp2p::swarm::behaviour::toggle::Toggle<libp2p::mdns::tokio::Behaviour>,
 }
 
 // ---------------------------------------------------------------- 引导注册表
@@ -809,6 +811,8 @@ pub struct Net {
     boot_path: PathBuf,
     /// 固定监听端口（0 = 交给系统分配）
     listen_port: u16,
+    /// 是否开启 mDNS 组播发现（`QL_DISABLE_MDNS` 关掉；关掉后同机进程只靠种子/gossip 相识）
+    use_mdns: bool,
     /// libp2p 身份密钥落盘位置：重启后还是同一个 PeerId，种子名单才写得死
     identity_path: PathBuf,
     /// 种子节点：(对端 PeerId, 去掉 `/p2p` 的可拨地址)
@@ -904,6 +908,8 @@ pub struct NodeOpts {
     pub listen_port: u16,
     /// 要对外公布的地址（`QL_ADVERTISE`，逗号分隔）
     pub announce: Vec<String>,
+    /// 开启 mDNS 组播发现（中继闸门关掉它，见 `use_mdns`）
+    pub use_mdns: bool,
 }
 
 /// 环境变量里的多地址列表：逗号 / 空格 / 换行都算分隔
@@ -1097,6 +1103,7 @@ impl Net {
             my_rules: crate::simchain::rules_tag(),
             boot_path: opts.registry_path,
             listen_port: opts.listen_port,
+            use_mdns: opts.use_mdns,
             identity_path: opts.data_dir.join(IDENTITY_FILE),
             seeds,
             announce,
@@ -2587,6 +2594,7 @@ fn emit_status(app: &Sink, net: &Net, chain: &Arc<SimChain>) {
 fn build_swarm(
     kp: libp2p::identity::Keypair,
     port: u16,
+    use_mdns: bool,
 ) -> Result<libp2p::Swarm<QlBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
     // 端口复用策略在 libp2p 0.56 起由连接层自动处理（Config 留默认即可）
     let tcp_cfg = libp2p::tcp::Config::default();
@@ -2611,15 +2619,21 @@ fn build_swarm(
                 .message_id_fn(|m| gossipsub::MessageId::from(&m.data[..]))
                 .build()?;
             let gossipsub = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gs_cfg)?;
-            let mdns = libp2p::mdns::tokio::Behaviour::new(
-                {
-                    // 本地网：10s 重查一次（默认 5 分钟太久，丢包/防火墙场景恢复慢）
-                    let mut c = libp2p::mdns::Config::default();
-                    c.query_interval = Duration::from_secs(10);
-                    c
-                },
-                libp2p::PeerId::from(key.public()),
-            )?;
+            // `Toggle` 由 `Option<Behaviour>` 转换而来：None = 这个行为整体不装载
+            let mdns = libp2p::swarm::behaviour::toggle::Toggle::from(if use_mdns {
+                Some(libp2p::mdns::tokio::Behaviour::new(
+                    {
+                        // 本地网：10s 重查一次（默认 5 分钟太久，丢包/防火墙场景恢复慢）
+                        let mut c = libp2p::mdns::Config::default();
+                        c.query_interval = Duration::from_secs(10);
+                        c
+                    },
+                    libp2p::PeerId::from(key.public()),
+                )?)
+            } else {
+                // 关掉组播：同机进程之间不再互相"看一眼就认识"
+                None
+            });
             Ok(QlBehaviour { gossipsub, mdns })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -2649,7 +2663,7 @@ fn build_swarm(
 /// swarm 主循环：事件 / 指令 / 状态机节拍 三路 select
 async fn run_swarm(app: Sink, net: Arc<Net>, mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NetCmd>) {
     let keypair = load_or_create_identity(&net.identity_path);
-    let mut swarm = match build_swarm(keypair.clone(), net.listen_port) {
+    let mut swarm = match build_swarm(keypair.clone(), net.listen_port, net.use_mdns) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[QLight] 联邦网络不可用：{e} —— 退回单机出块模式（账本与验签不受影响）");

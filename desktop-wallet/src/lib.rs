@@ -74,6 +74,8 @@ pub fn run() {
                         .and_then(|v| v.trim().parse::<u16>().ok())
                         .unwrap_or(net::DEFAULT_LISTEN_PORT),
                     announce: net::env_list("QL_ADVERTISE"),
+                    // 界面这台永远开局播：家人之间把钱包放到同一个局域网就自动相识
+                    use_mdns: true,
                 },
                 chain.clone(),
                 entities.clone(),

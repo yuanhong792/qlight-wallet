@@ -4,7 +4,9 @@
 //!
 //! 这里没有测试运行器之外的假设：端口现取现用（避免与本机正在跑的钱包抢 47410），
 //! 邻居之间只靠种子地址相识；每个进程的数据目录各自独立，同机引导注册表
-//! （`peers-registry.json`）因此帮不上忙——连上了就只能是种子/地址 gossip 的功劳。
+//! （`peers-registry.json`）因此帮不上忙；组播也关掉（`QL_DISABLE_MDNS=1`）——
+//! Linux runner 上同机进程靠 mDNS 就能互相看见，那会把"连上了只能是
+//! 种子/地址 gossip 的功劳"这个前提直接抹掉（DESIGN.md §9.39）。
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -32,6 +34,7 @@ impl Node {
             .env("QL_DATA_DIR", &dir)
             .env("QL_LISTEN_PORT", port.to_string())
             .env("QL_SEEDS", seeds.join(","))
+            .env("QL_DISABLE_MDNS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(logfile))

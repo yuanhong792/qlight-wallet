@@ -329,6 +329,10 @@ fn start_net(
             registry_path: data_dir.join("peers-registry.json"),
             listen_port: env_port(),
             announce: net::env_list("QL_ADVERTISE"),
+            // `QL_DISABLE_MDNS=1`：只靠种子名单与地址 gossip 找人。中继闸门
+            // （tests/relay_node.rs）要证明的就是这条路，组播在 Linux runner 上
+            // 会让同机进程先相识，把前提抹掉（DESIGN.md §9.39）。
+            use_mdns: std::env::var("QL_DISABLE_MDNS").is_err(),
         },
         store.chain.clone(),
         store.entities.clone(),
