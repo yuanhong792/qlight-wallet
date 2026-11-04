@@ -1107,6 +1107,7 @@ H[j*2048+i] ≥ 128（陆地码）即取，否则换下一轮哈希再试；4096
 **完整性这条比"再下载一次"更硬**：`gh api …/releases/tags/v0.5.1` 回的是 **GitHub 服务端自己算的 digest**——`QLight-Wallet.dmg` **19,972,118 B / sha256 `a8c286ce…`**、`QLight-Wallet-Windows.zip` **13,179,505 B / sha256 `e4df95cc…`**，与 §9.35 记的两个值逐字符相同，`state=uploaded`。它证的是"**存进对象存储的那份字节，就是本机打出来的那份**"，与走哪条链路下载无关。
 
 **但"访客下得下来"这一条仍然没验到，不写成交卷**：release 资产**不支持 Range**——`-r -1024` 两次都回 **501**（470 字节的错误页），拿不到尾部对照；整对象 GET 在这台机器的出口上按实测 `assets/coin.png` 582,122 B / 34.9 s ≈ **17 KB/s** 算，20 MB 要几十分钟，第一次 60 秒连一个字节都没回来。所以下载链路只证到"服务端存的那份是对的"，没证到"这条路上谁都能拿走"。
+> **本节这一段已被 §9.39 推翻，留原文是因为它记的是当时真的信过的前提。** 两处错：①"不支持 Range"是拿错了地址（API 资产 URL 不带 `Accept: application/octet-stream` 回的是 JSON，签名直链才回 501）；②由此得出的"下不下来"未验，下一轮已经真下完并逐个比对 sha256，两个包都过了。
 
 **发布时又抓到一句自己写的假话（这是第三次同类）**：官网下载按钮写着「`.dmg · 21 MB`」——**21,230,649 B 是 v0.5.0 那个包的体积**，0.5.1 是 19,972,118 B（`#79` 把 v6 之前块里那张 10.5 KB 门票载体撤掉之后缩的）。改成 20 MB（`3bad5e6`）。这类错的共同点：**体积、版本、"本版起"这种话都是会过期的**，写的时候要带上它是照着哪一次实测写的。
 
@@ -1115,6 +1116,34 @@ H[j*2048+i] ≥ 128（陆地码）即取，否则换下一轮哈希再试；4096
 **v0.5.0 的说明没有改写**：它是历史记录，那句「本版包内的 UI 文案是从 `eb4b189` 打出来的」对 0.5.0 来说是真话。v0.5.1 的说明里把"文档跑到包前面"这件事本身列成第一条，而不是偷偷抹掉。
 
 **说明里指名道姓没做到的五条**（照旧写，不缩）：跨真实公网一次没跑过、本版**不自带任何公网种子地址**；两台机器同时挖时发行几乎冻住（59 块只收 2 张凭据、全进一台，#82 **已实测未修**）；一个钱包就是一张票，没有质押与罚没；GUI 那几下点击仍未在真窗口验过（接线层已有闸）；每张门票与每笔交易 10.5 KB 的载体成本（#72）。
+
+### 9.39 四道闸钉进 CI：第一趟就红，红在一处只有换平台才暴露的前提
+
+`.github/workflows/gates.yml`：push 到 main / PR / 手动都触发，跑 ubuntu-24.04，先装 Tauri 在 Linux 上的系统依赖（webkit2gtk-4.1 / libsoup-3.0 / librsvg 等），按 `desktop-wallet/Cargo.lock` 缓存 `~/.cargo` 与 `target`，然后五步——① `cargo test --release` ② 口径闸 ③ 文档对拍闸 ④ 接线闸 ⑤ 打包前置（`ui/` 里不许有对拍临时页、`Cargo.toml` 与 `tauri.conf.json` 的版本必须是同一个）。
+
+**落地本身先卡了一道**：gh 那把 OAuth 令牌没有 `workflow` scope，`git push` 被 `refusing to allow an OAuth App to create or update workflow .github/workflows/gates.yml` 直接拒；走 Contents API 是同一个拦截，只是换了张脸（回 404，而 `repos/…` 明明报 `push:true`）。业主跑 `gh auth refresh -s workflow` 授权后一次过——顺带记一句：这台机器的 443 抖了两次（第一次令牌交换 `TLS handshake timeout`、第二次看门 `gh run watch` 中途超时），**都不是一趟没成就能定性的失败**。
+
+**第一趟：run `41841904466`，5m39s，红在 ①** `seed_node_relay_grows_the_mesh`（CI 报 `tests/relay_node.rs:135`，60.46s 超时）。
+
+**根因不是 CI 慢，是这道闸的前提换个平台就不成立。** C 的日志先打出了 `mDNS 发现邻居：12D3KooWKKB…`——那就是 B。runner 上有 10.1.0.81 这块网卡，同机进程之间组播是通的，三个测试进程"看一眼"就互相认识了；`adopt_peer` 撞上 `seen.contains(&pid)` 直接早退（`desktop-wallet/src/net.rs:1373`），于是那句当裁判的"地址gossip发现邻居"永远等不到。这道闸在 macOS 上绿了一年多，绿的实际是"**这台机器上组播不通**，所以连上只能是种子/gossip 的功劳"——前提的下半句属于操作系统，不属于代码。
+
+**修法**：`QlBehaviour.mdns` 换成 libp2p 的 `Toggle`（`desktop-wallet/src/net.rs:504`；`Option<Behaviour>` 不实现 `NetworkBehaviour`，`Toggle` 才有，而它的 `ToEvent` 就是原事件，所以事件分支一行没动）。**界面那台永远开组播**——家人把钱包放进同一个局域网就该自动相识，这是产品行为，不能为了测试绿去动它；只有无头节点读 `QL_DISABLE_MDNS`（`desktop-wallet/src/node.rs:335`），闸门起的三个进程都带上它，让"只有种子和地址 gossip 两条路"这个前提在 Linux 上同样成立。
+
+**第二趟：run `41844712982`，5m12s，全绿。** Linux 上的实际数字：150 + 3 + 1 + 1 + 5 + 2 + 4 = **166 项测试通过**（中继闸门本身 7.81s）、口径闸 7 字典 × 8 语言 56 个语言块同构且禁词 0 命中、文档对拍闸 20 项、接线闸 40 命令 / 43 调用点 0 告警、打包前置回「临时页 0 处 · 版本单一口径 0.5.1」。本机也在推之前复跑过同一套，全绿才交的。
+
+**这道闸从此不再证明的东西，也要写下来**：关掉组播后，中继闸门只证「种子名单 + 地址 gossip 能把第三台机器接进网」，mDNS 本身好不好用它不管了——讽刺的是，这趟红恰好是 mDNS 在 Linux 上可用的直接证据（§9.32 那次本机实测里它根本没参与）。CI 也**不打包**：五步全是验证，出 DMG/EXE 仍然只在两台目标机器上做。
+
+**#84 关掉：两个包真下载了一遍，sha256 与服务端 digest 逐字符相同。**
+上一轮 §9.38 那句"下载链路没验到（501 / 17 KB/s）"里，**501 那半句是用错地址造成的假结论**：API 的资产地址不带 `Accept: application/octet-stream` 时返回的是 JSON（实测 `http=200 size=1694`），对手写签名直链加 Range 才回 501。正规的 `releases/download/v0.5.1/…` 走 302 到对象存储，Range 完全可用——`206`、`content-range: bytes 0-1023/19972118`。于是照 §9.36 那套「分块 + 逐块重试」（每块 1 MiB、最多 10 次）真下了一遍 33 MB：
+
+| 包 | 落地字节 | sha256 | 对服务端 digest |
+| --- | --- | --- | --- |
+| `QLight-Wallet.dmg` | 19,972,118 | `a8c286ce6ee031b4…4fb13cead` | 逐字符相同 ✓ |
+| `QLight-Wallet-Windows.zip` | 13,179,505 | `e4df95cc7e6b5259…38a9d7ca0` | 逐字符相同 ✓ |
+
+**这证到哪**：访客（含这台出口经常抖的机器）走公网那条链路能拿到**完整、未被改动**的包，两个包的字节就是本机打进对象存储的那一份。**没证到**：Windows 包在 Windows 上跑不跑得起来——`scripts/build-windows.sh:55` 只读 PE 导入表（非系统依赖只有 `WebView2Loader.dll` 与 `libunwind.dll`），从不执行 exe；第一次真机双击仍是那项检验本身，且 Tauri 要 WebView2 运行时（Win11 自带，老 Win10 可能要装）。§9.35 那句"只验到嵌进包里的资源串"**照旧成立**。
+
+复现口径：每块 `curl -sSL -r start-end` 取回、尺寸不对就重试，拼完 `shasum -a 256`，对 `gh api repos/…/releases/tags/v0.5.1 --jq '.assets[].digest'`。
 
 ---
 
