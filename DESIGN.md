@@ -1208,6 +1208,18 @@ test -d desktop-wallet/build/QLight.app/Contents/_CodeSignature \
 
 ---
 
+### 9.41 走进我的席位：席位坐标交给 arnis，生成一张 Minecraft 存档明信片
+
+**做了什么。** 席位面板加一个按钮「走进我的席位」。Rust 新模块 `src/seat_export.rs`（`QL-SEAT-EXPORT-v1`）：`seat_bbox` 把席位中心换算成 ±500 米的 bbox（经度跨度按 cos(lat) 放宽，东西向不随纬度缩水）；`run_export` 不依赖 Tauri——spawn 随包 arnis 无头 CLI（`--progress json`），逐行解析进度转发成 `seat_export_progress` 事件，结束后**只认开工之后落盘**的存档（out_root 里可能躺着玩家自己的旧世界）。command 两个：`export_seat_world`（复用 `seat_of`，未解锁/缺组件/算不出席位都当场中文报错）、`reveal_path`（只接受真实存在的路径，用户主动点才弹文件管理器）。一把全局并发锁，RAII 释放，中途任何 `?` 都不留锁。UI 一个按钮 + 一行折叠进度 + 一行结果，5 键 × 8 语言。arnis（Apache-2.0）无头 exe 62 MB **随包不进 git**：打包机自备，路径走 `ARNIS_WIN_EXE`，缺了它 `build-windows.sh` 当场报错、运行时按钮当场中文报错，两条路都不静默。
+
+**边界。** 存档是本地"明信片"：不写链、不参共识、不进 `entity_root`，矿脉铁律一寸不动。它比 DEM 烘焙还弱一等——DEM 至少钉了哈希进规则串，arnis 产物连共识侧都不进。生成需联网（现拉 OSM 与高程瓦片），UI 文案与包内 README 都写明了，不许诺离线。席位一格 19.6 公里 arnis 吃不下，默认 1 公里窗是设计决定不是缺陷。
+
+**证据。** `cargo test --lib` 154 项全绿（新增 4：bbox 双向各 1 公里含四个纬度、bbox 参数序即 arnis 序、并发锁拒第二次、缺组件中文报错且锁已释放）。ignored 的无头 e2e 手动跑一遍（`ARNIS_EXE` 指真 arnis）：退出 0、1.49 秒（全热缓存），断言收到进度事件且新存档有 level.dat 与 region；该存档离线解析 999×999 方块 / 3969 区块 / DataVersion 4189（MC 1.21.4）——正是 `seat_bbox` 算出的 1 公里窗。闸 ②④⑦⑧ 本机全绿（接线闸自动罩住两个新 invoke 含反向对照；口径闸确认 8 语言键集同构），③ 20 项绿。同日 spike：崂山 1 km² 含拉网 <2 分钟、青岛老城 600 m² 热缓存 7 秒，俯视 PNG 证据在 `D:\arnis-spike`（本机产物，不进仓库）。
+
+**顺手记的坑。** Windows GBK 控制台跑各闸会在总结 print 的 ✓ 上 UnicodeEncodeError——检查本身已跑完，加 `PYTHONIOENCODING=utf-8` 退出码才真实（CI 的 ubuntu 不受影响）。bash 里用 printf 写 bat 会把 `\a` 转义成响铃符致 9009，bat 一律用文件写工具落盘。
+
+**没做的。** mac 交叉包不带 arnis（mac 上按钮报缺组件，钱包其余照常）；本轮不发 release，官网体积文案仍描述 0.5.1，发布时一起改；真 GUI 点按钮与进 Minecraft 走一圈留给小袁本人一次做完；8.96 公里全窗口内存未试。版本 0.6.0。
+
 ## 10. 数据可用性
 
 | Phase | DA 方案 | 备注 |

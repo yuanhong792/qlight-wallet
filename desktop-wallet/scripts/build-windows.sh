@@ -61,6 +61,12 @@ test -z "$EXTRA" || { echo "意外的非系统依赖：$EXTRA"; exit 1 }
 echo "④ 组装绿色版目录（经 /tmp 中转，避开外置盘的 ._ 资源叉）..."
 mkdir -p "$STAGING/$BUNDLE_NAME"
 cp "$EXE" "$WV2" "$UNWIND" "$STAGING/$BUNDLE_NAME/"
+# ④b 随包 arnis 无头版（「走进我的席位」，QL-SEAT-EXPORT-v1）。62 MB 不进 git：
+# 打包机自备一份，路径走 ARNIS_WIN_EXE。缺了它按钮会当场中文报错，不会静默废掉。
+ARNIS_WIN_EXE=${ARNIS_WIN_EXE:-$HOME/qlx-tools/arnis.exe}
+test -f "$ARNIS_WIN_EXE" \
+  || { echo "找不到 arnis.exe：设 ARNIS_WIN_EXE=/path/to/arnis.exe 再跑（无头版：arnis 仓库 cargo build --release --no-default-features）"; exit 1; }
+cp "$ARNIS_WIN_EXE" "$STAGING/$BUNDLE_NAME/arnis.exe"
 sed "s/{VERSION}/$VER/g" scripts/windows-bundle-README.txt > "$STAGING/$BUNDLE_NAME/README.txt"
 find "$STAGING" -name '._*' -delete
 (cd "$STAGING" && rm -f "$BUNDLE_NAME.zip" && zip -X -r -q "$BUNDLE_NAME.zip" "$BUNDLE_NAME")

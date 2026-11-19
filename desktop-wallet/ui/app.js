@@ -97,6 +97,38 @@ listen("net_peers", (ev) => {
 listen("net_versions", (ev) => applyNet(ev.payload));
 invoke("net_status").then(applyNet).catch(() => {});
 
+// ---------------------------------------------------------------- 走进我的席位
+// 一个按钮、一行折叠进度、一行结果。存档是本地明信片：不进链、不参共识。
+let seatExportBusy = false;
+let seatExportPath = "";
+listen("seat_export_progress", (ev) => {
+  if (!seatExportBusy) return;
+  const p = ev.payload || {};
+  $("seat-export-status").textContent = t("world.seat.export.progress", {
+    pct: p.pct == null ? 0 : p.pct, msg: p.msg || "",
+  });
+});
+$("seat-export-btn").addEventListener("click", async () => {
+  if (seatExportBusy) return;
+  seatExportBusy = true;
+  const btn = $("seat-export-btn"), st = $("seat-export-status"), op = $("seat-export-open");
+  btn.disabled = true; op.hidden = true; st.hidden = false;
+  st.textContent = t("world.seat.export.running");
+  try {
+    const r = await invoke("export_seat_world");
+    seatExportPath = r.world_dir;
+    st.textContent = t("world.seat.export.done", { path: r.world_dir });
+    op.hidden = false;
+  } catch (e) {
+    st.textContent = String(e && e.message ? e.message : e);
+  }
+  btn.disabled = false;
+  seatExportBusy = false;
+});
+$("seat-export-open").addEventListener("click", () => {
+  if (seatExportPath) invoke("reveal_path", { path: seatExportPath }).catch(() => {});
+});
+
 // ---------------------------------------------------------------- 页面路由（侧边导航）
 
 const pages = ["asset", "mine", "history", "world", "about"];

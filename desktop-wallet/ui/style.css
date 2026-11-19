@@ -337,6 +337,9 @@ body {
   display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
   margin: 8px 2px 0; font-size: 12px; color: var(--muted, #9fb4c6);
 }
+/* 走进我的席位：一个按钮 + 一行状态，不另开板块 */
+.seat-export { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 2px 0; }
+.seat-export .muted { flex-basis: 100%; margin-top: 0; word-break: break-all; }
 .earth-legend b { color: #f0d69e; font-weight: 600; }
 .earth-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 /* 可去之处的图例：圈里写的是"已解锁几处"，与清单同一个数——两处不一样就是数据源分了家 */

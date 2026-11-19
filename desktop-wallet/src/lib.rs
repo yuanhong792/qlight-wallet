@@ -15,6 +15,7 @@ pub mod keystore;
 pub mod net;
 pub mod node;
 pub mod prefs;
+pub mod seat_export;
 pub mod simchain;
 pub mod tx;
 pub mod world;
@@ -140,6 +141,8 @@ pub fn run() {
             commands::diag_report,
             commands::feedback_write,
             commands::export_share,
+            commands::export_seat_world,
+            commands::reveal_path,
         ])
         .run(tauri::generate_context!())
         .expect("QLight Wallet 启动失败");

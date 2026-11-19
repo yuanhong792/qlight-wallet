@@ -1864,3 +1864,80 @@ pub fn pool_swap(
         other => Err(format!("未知的兑换方向：{other}")),
     }
 }
+
+// ---------------------------------------------------------------- 席位导出
+
+/// 「走进我的席位」的返回值：存档目录 + 这次用的中心坐标（UI 只显示路径）。
+#[derive(serde::Serialize)]
+pub struct SeatExportInfo {
+    pub world_dir: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// 席位中心 → 随包 arnis 无头 CLI → Minecraft 存档。存档不进链、不参共识。
+/// 进度走 `seat_export_progress` 事件（{pct, msg}），UI 折叠成一行。
+#[tauri::command]
+pub fn export_seat_world(state: AppCtx, app: AppHandle) -> Result<SeatExportInfo, String> {
+    let address = state
+        .core
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.address.clone())
+        .unwrap_or_default();
+    if address.is_empty() {
+        return Err("还没有解锁的钱包，没有席位可走进".into());
+    }
+    let seat = world::earth_local::seat_of(
+        &address,
+        &simchain::genesis_hash_hex(),
+        world::earth_local::GLOBAL,
+    )
+    .ok_or_else(|| "席位算不出来（地址落点重试耗尽）".to_string())?;
+    let arnis = crate::seat_export::arnis_path()?;
+    let out_root = crate::seat_export::default_out_root();
+    let ev_app = app.clone();
+    let world_dir = crate::seat_export::run_export(&arnis, seat.lat, seat.lon, &out_root, move |pct, msg| {
+        let _ = ev_app.emit(
+            "seat_export_progress",
+            serde_json::json!({ "pct": pct, "msg": msg }),
+        );
+    })?;
+    Ok(SeatExportInfo {
+        world_dir: world_dir.display().to_string(),
+        lat: seat.lat,
+        lon: seat.lon,
+    })
+}
+
+/// 在系统文件管理器里定位一个路径（用户主动点「打开目录」才调）。
+/// 只接受真实存在的路径，不拿用户输入拼 shell。
+#[tauri::command]
+pub fn reveal_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径不存在：{path}"));
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer.exe");
+        c.arg(format!("/select,{}", p.display()));
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg("-R").arg(p);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(p.parent().unwrap_or(p));
+        c
+    };
+    cmd.spawn()
+        .map_err(|e| format!("打开文件管理器失败：{e}"))?;
+    Ok(())
+}
